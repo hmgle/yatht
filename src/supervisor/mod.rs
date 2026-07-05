@@ -671,12 +671,22 @@ fn read_iovecs(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<u8>> {
 }
 
 fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
+    if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
+        let ty = socket_type_from_fd(duplicated);
+        close_fd(duplicated);
+        return ty;
+    }
+
     let file = File::open(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    socket_type_from_fd(file.as_raw_fd())
+}
+
+fn socket_type_from_fd(fd: RawFd) -> Option<i32> {
     let mut ty: libc::c_int = 0;
     let mut len = std::mem::size_of_val(&ty) as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
-            file.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_TYPE,
             (&mut ty as *mut libc::c_int).cast(),
@@ -809,7 +819,13 @@ struct TargetFdFlags {
 fn read_target_fd_flags(pid: u32, fd: RawFd) -> TargetFdFlags {
     let mut flags = TargetFdFlags::default();
 
-    if let Ok(file) = File::open(format!("/proc/{pid}/fd/{fd}")) {
+    if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
+        let rc = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+        if rc >= 0 {
+            flags.status_flags = rc;
+        }
+        close_fd(duplicated);
+    } else if let Ok(file) = File::open(format!("/proc/{pid}/fd/{fd}")) {
         let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         if rc >= 0 {
             flags.status_flags = rc;
@@ -867,15 +883,15 @@ fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<RawFd> {
     let mut raw = [0_u8; std::mem::size_of::<RawFd>()];
     read_exact_fd(sock, &mut raw)?;
     let child_listener_fd = RawFd::from_ne_bytes(raw);
-    duplicate_child_fd(child_pid, child_listener_fd)
+    duplicate_remote_fd(child_pid, child_listener_fd)
 }
 
-fn duplicate_child_fd(child_pid: u32, child_fd: RawFd) -> io::Result<RawFd> {
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<RawFd> {
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if pidfd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, child_fd, 0) };
+    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0) };
     let saved = if duplicated < 0 {
         Some(io::Error::last_os_error())
     } else {
