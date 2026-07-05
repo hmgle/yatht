@@ -3,4 +3,7 @@ connect_timeout = "10s"
 bypass_local = true
 bypass_cidrs = []
 proxy_cidrs = []
+enable_dns = false
+enable_udp = false
+dns_server = "1.1.1.1:53"
 debug = false

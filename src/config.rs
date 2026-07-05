@@ -14,7 +14,7 @@ use url::Url;
 #[command(
     name = "seccomp-unotify-proxy",
     version,
-    about = "Run a command with TCP connect(2) transparently proxied through SOCKS5 or HTTP CONNECT"
+    about = "Run a command with TCP and UDP traffic transparently proxied with seccomp user notification"
 )]
 pub struct Cli {
     #[arg(long)]
@@ -35,6 +35,15 @@ pub struct Cli {
     #[arg(long)]
     pub connect_timeout: Option<String>,
 
+    #[arg(long, help = "Redirect UDP/53 through DNS-over-TCP")]
+    pub enable_dns: bool,
+
+    #[arg(long, help = "Redirect generic UDP through SOCKS5 UDP ASSOCIATE")]
+    pub enable_udp: bool,
+
+    #[arg(long, help = "DNS-over-TCP upstream for --enable-dns")]
+    pub dns_server: Option<String>,
+
     #[arg(long)]
     pub debug: bool,
 
@@ -49,6 +58,9 @@ pub struct EffectiveConfig {
     pub bypass_cidrs: Vec<IpNet>,
     pub proxy_cidrs: Vec<IpNet>,
     pub connect_timeout: Duration,
+    pub enable_dns: bool,
+    pub enable_udp: bool,
+    pub dns_server: String,
     pub debug: bool,
     pub command: Vec<OsString>,
 }
@@ -72,6 +84,9 @@ struct FileConfig {
     bypass_local: Option<bool>,
     bypass_cidrs: Option<Vec<IpNet>>,
     proxy_cidrs: Option<Vec<IpNet>>,
+    enable_dns: Option<bool>,
+    enable_udp: Option<bool>,
+    dns_server: Option<String>,
     debug: Option<bool>,
 }
 
@@ -121,6 +136,12 @@ impl EffectiveConfig {
             bypass_cidrs,
             proxy_cidrs,
             connect_timeout,
+            enable_dns: cli.enable_dns || file_cfg.enable_dns.unwrap_or(false),
+            enable_udp: cli.enable_udp || file_cfg.enable_udp.unwrap_or(false),
+            dns_server: cli
+                .dns_server
+                .or(file_cfg.dns_server)
+                .unwrap_or_else(|| "1.1.1.1:53".to_string()),
             debug: cli.debug || file_cfg.debug.unwrap_or(false),
             command: cli.command,
         })
@@ -242,6 +263,9 @@ mod tests {
             bypass_cidrs: vec![IpNet::from_str("203.0.113.0/24").unwrap()],
             proxy_cidrs: vec![],
             connect_timeout: Duration::from_secs(10),
+            enable_dns: false,
+            enable_udp: false,
+            dns_server: "1.1.1.1:53".to_string(),
             debug: false,
             command: vec![OsString::from("true")],
         };
@@ -264,6 +288,9 @@ mod tests {
             bypass_cidrs: vec![],
             proxy_cidrs: vec![IpNet::from_str("198.51.100.0/24").unwrap()],
             connect_timeout: Duration::from_secs(10),
+            enable_dns: false,
+            enable_udp: false,
+            dns_server: "1.1.1.1:53".to_string(),
             debug: false,
             command: vec![OsString::from("true")],
         };

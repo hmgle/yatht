@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,6 +26,99 @@ pub fn dial(proxy: &ProxyConfig, dest: Destination, timeout: Duration) -> Result
     }
 }
 
+pub fn dns_over_tcp(
+    proxy: &ProxyConfig,
+    dns_server: Destination,
+    query: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    if query.len() > u16::MAX as usize {
+        bail!("DNS query is too large");
+    }
+
+    let mut stream = dial(proxy, dns_server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(&(query.len() as u16).to_be_bytes())?;
+    stream.write_all(query)?;
+
+    let mut len_buf = [0_u8; 2];
+    stream.read_exact(&mut len_buf)?;
+    let response_len = u16::from_be_bytes(len_buf) as usize;
+    let mut response = vec![0_u8; response_len];
+    stream.read_exact(&mut response)?;
+    Ok(response)
+}
+
+pub struct Socks5UdpAssociation {
+    _control: TcpStream,
+    udp: UdpSocket,
+}
+
+impl Socks5UdpAssociation {
+    pub fn connect(proxy: &ProxyConfig, timeout: Duration) -> Result<Self> {
+        let ProxyConfig::Socks5 {
+            addr,
+            username,
+            password,
+        } = proxy
+        else {
+            bail!("generic UDP redirection requires a SOCKS5 proxy");
+        };
+
+        let mut control = connect_with_timeout(addr, timeout)
+            .with_context(|| format!("connect SOCKS5 proxy {addr}"))?;
+        control.set_read_timeout(Some(timeout))?;
+        control.set_write_timeout(Some(timeout))?;
+        socks5_greet(&mut control, username.as_deref(), password.as_deref())?;
+
+        control.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
+        let relay = read_socks5_reply_addr(&mut control)?;
+        let relay = normalize_relay_addr(relay, control.peer_addr()?);
+        let bind = if relay.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let udp = UdpSocket::bind(bind)?;
+        udp.connect(relay)?;
+        udp.set_read_timeout(Some(timeout))?;
+        udp.set_write_timeout(Some(timeout))?;
+
+        Ok(Self {
+            _control: control,
+            udp,
+        })
+    }
+
+    pub fn send_datagram(
+        &mut self,
+        dest: Destination,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        let packet = encode_socks5_udp(dest, payload)?;
+        self.udp.set_read_timeout(Some(timeout))?;
+        self.udp.set_write_timeout(Some(timeout))?;
+        self.udp.send(&packet)?;
+
+        let mut buf = vec![0_u8; 65_535];
+        match self.udp.recv(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(decode_socks5_udp_payload(&buf)?.to_vec()))
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
 fn dial_socks5(
     proxy_addr: &str,
     username: Option<&str>,
@@ -37,25 +132,7 @@ fn dial_socks5(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    let methods: &[u8] = if username.is_some() || password.is_some() {
-        &[0x02]
-    } else {
-        &[0x00]
-    };
-    stream.write_all(&[0x05, methods.len() as u8])?;
-    stream.write_all(methods)?;
-
-    let mut method_resp = [0_u8; 2];
-    stream.read_exact(&mut method_resp)?;
-    if method_resp[0] != 0x05 {
-        bail!("bad SOCKS5 method response version {}", method_resp[0]);
-    }
-    match method_resp[1] {
-        0x00 => {}
-        0x02 => authenticate_socks5(&mut stream, username.unwrap_or(""), password.unwrap_or(""))?,
-        0xff => bail!("SOCKS5 proxy rejected all authentication methods"),
-        method => bail!("SOCKS5 proxy selected unsupported method {method:#x}"),
-    }
+    socks5_greet(&mut stream, username, password)?;
 
     let mut req = vec![0x05, 0x01, 0x00];
     match dest.ip {
@@ -71,31 +148,39 @@ fn dial_socks5(
     req.extend_from_slice(&dest.port.to_be_bytes());
     stream.write_all(&req)?;
 
-    let mut head = [0_u8; 4];
-    stream.read_exact(&mut head)?;
-    if head[0] != 0x05 {
-        bail!("bad SOCKS5 connect response version {}", head[0]);
-    }
-    if head[1] != 0x00 {
-        bail!("SOCKS5 connect failed with reply code {:#x}", head[1]);
-    }
-    let addr_len = match head[3] {
-        0x01 => 4,
-        0x03 => {
-            let mut len = [0_u8; 1];
-            stream.read_exact(&mut len)?;
-            len[0] as usize
-        }
-        0x04 => 16,
-        atyp => bail!("bad SOCKS5 bind address type {atyp:#x}"),
-    };
-    let mut discard = vec![0_u8; addr_len + 2];
-    stream.read_exact(&mut discard)?;
+    let _ = read_socks5_reply_addr(&mut stream)?;
 
     let remaining = deadline.saturating_duration_since(Instant::now());
     stream.set_read_timeout(Some(remaining.max(Duration::from_secs(1))))?;
     stream.set_write_timeout(Some(remaining.max(Duration::from_secs(1))))?;
     Ok(stream)
+}
+
+fn socks5_greet(
+    stream: &mut TcpStream,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    let methods: &[u8] = if username.is_some() || password.is_some() {
+        &[0x02]
+    } else {
+        &[0x00]
+    };
+    stream.write_all(&[0x05, methods.len() as u8])?;
+    stream.write_all(methods)?;
+
+    let mut method_resp = [0_u8; 2];
+    stream.read_exact(&mut method_resp)?;
+    if method_resp[0] != 0x05 {
+        bail!("bad SOCKS5 method response version {}", method_resp[0]);
+    }
+    match method_resp[1] {
+        0x00 => {}
+        0x02 => authenticate_socks5(stream, username.unwrap_or(""), password.unwrap_or(""))?,
+        0xff => bail!("SOCKS5 proxy rejected all authentication methods"),
+        method => bail!("SOCKS5 proxy selected unsupported method {method:#x}"),
+    }
+    Ok(())
 }
 
 fn authenticate_socks5(stream: &mut TcpStream, username: &str, password: &str) -> Result<()> {
@@ -113,6 +198,99 @@ fn authenticate_socks5(stream: &mut TcpStream, username: &str, password: &str) -
         bail!("SOCKS5 username/password authentication failed");
     }
     Ok(())
+}
+
+fn read_socks5_reply_addr(stream: &mut TcpStream) -> Result<SocketAddr> {
+    let mut head = [0_u8; 4];
+    stream.read_exact(&mut head)?;
+    if head[0] != 0x05 {
+        bail!("bad SOCKS5 response version {}", head[0]);
+    }
+    if head[1] != 0x00 {
+        bail!("SOCKS5 request failed with reply code {:#x}", head[1]);
+    }
+
+    let ip = match head[3] {
+        0x01 => {
+            let mut octets = [0_u8; 4];
+            stream.read_exact(&mut octets)?;
+            IpAddr::V4(Ipv4Addr::from(octets))
+        }
+        0x03 => {
+            let mut len = [0_u8; 1];
+            stream.read_exact(&mut len)?;
+            let mut name = vec![0_u8; len[0] as usize];
+            stream.read_exact(&mut name)?;
+            let host = String::from_utf8(name).context("SOCKS5 relay domain is not UTF-8")?;
+            let mut port_buf = [0_u8; 2];
+            stream.read_exact(&mut port_buf)?;
+            let port = u16::from_be_bytes(port_buf);
+            return (host.as_str(), port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| anyhow!("SOCKS5 relay domain resolved to no addresses"));
+        }
+        0x04 => {
+            let mut octets = [0_u8; 16];
+            stream.read_exact(&mut octets)?;
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+        atyp => bail!("bad SOCKS5 bind address type {atyp:#x}"),
+    };
+    let mut port = [0_u8; 2];
+    stream.read_exact(&mut port)?;
+    Ok(SocketAddr::new(ip, u16::from_be_bytes(port)))
+}
+
+fn normalize_relay_addr(relay: SocketAddr, proxy_peer: SocketAddr) -> SocketAddr {
+    if relay.ip().is_unspecified() {
+        SocketAddr::new(proxy_peer.ip(), relay.port())
+    } else {
+        relay
+    }
+}
+
+fn encode_socks5_udp(dest: Destination, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(4 + 18 + payload.len());
+    out.extend_from_slice(&[0, 0, 0]);
+    match dest.ip {
+        IpAddr::V4(ip) => {
+            out.push(0x01);
+            out.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            out.push(0x04);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(&dest.port.to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn decode_socks5_udp_payload(packet: &[u8]) -> Result<&[u8]> {
+    if packet.len() < 4 {
+        bail!("short SOCKS5 UDP packet");
+    }
+    if packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
+        bail!("fragmented SOCKS5 UDP packets are not supported");
+    }
+    let addr_len = match packet[3] {
+        0x01 => 4,
+        0x03 => {
+            if packet.len() < 5 {
+                bail!("short SOCKS5 UDP domain packet");
+            }
+            1 + packet[4] as usize
+        }
+        0x04 => 16,
+        atyp => bail!("bad SOCKS5 UDP address type {atyp:#x}"),
+    };
+    let payload_offset = 4 + addr_len + 2;
+    if packet.len() < payload_offset {
+        bail!("short SOCKS5 UDP packet");
+    }
+    Ok(&packet[payload_offset..])
 }
 
 fn dial_http_connect(proxy_addr: &str, dest: Destination, timeout: Duration) -> Result<TcpStream> {
@@ -211,5 +389,19 @@ mod tests {
         .unwrap();
         drop(stream);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn socks5_udp_header_round_trips_payload() {
+        let payload = b"hello";
+        let packet = encode_socks5_udp(
+            Destination {
+                ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                port: 5300,
+            },
+            payload,
+        )
+        .unwrap();
+        assert_eq!(decode_socks5_udp_payload(&packet).unwrap(), payload);
     }
 }

@@ -3,7 +3,7 @@ name = "seccomp-unotify-proxy"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Transparent TCP proxying with seccomp user notification and ADDFD"
+description = "Transparent TCP and UDP proxying with seccomp user notification and ADDFD"
 
 [dependencies]
 anyhow = "1.0"

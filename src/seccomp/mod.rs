@@ -110,7 +110,7 @@ pub fn query_notif_sizes() -> io::Result<SeccompNotifSizes> {
 }
 
 pub fn install_listener() -> io::Result<RawFd> {
-    let mut filter = connect_filter();
+    let mut filter = socket_filter();
     let mut prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_mut_ptr(),
@@ -130,6 +130,21 @@ pub fn install_listener() -> io::Result<RawFd> {
     }
 }
 
+pub fn socket_filter() -> Vec<libc::sock_filter> {
+    vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_connect as u32, 3, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendto as u32, 2, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendmsg as u32, 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+    ]
+}
+
+#[cfg(test)]
 pub fn connect_filter() -> Vec<libc::sock_filter> {
     vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
@@ -190,6 +205,16 @@ pub fn send_errno(fd: RawFd, id: u64, errno: i32) {
         id,
         val: -1,
         error: errno,
+        flags: 0,
+    };
+    let _ = notif_send(fd, &mut resp);
+}
+
+pub fn send_value(fd: RawFd, id: u64, value: i64) {
+    let mut resp = SeccompNotifResp {
+        id,
+        val: value,
+        error: 0,
         flags: 0,
     };
     let _ = notif_send(fd, &mut resp);
@@ -285,5 +310,16 @@ mod tests {
         assert_eq!(filter[4].jt, 1);
         assert_eq!(filter[5].k, SECCOMP_RET_ALLOW);
         assert_eq!(filter[6].k, SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn socket_filter_traps_udp_senders() {
+        let filter = socket_filter();
+        assert_eq!(filter.len(), 9);
+        assert_eq!(filter[4].k, libc::SYS_connect as u32);
+        assert_eq!(filter[5].k, libc::SYS_sendto as u32);
+        assert_eq!(filter[6].k, libc::SYS_sendmsg as u32);
+        assert_eq!(filter[7].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[8].k, SECCOMP_RET_USER_NOTIF);
     }
 }
