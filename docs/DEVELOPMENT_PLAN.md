@@ -54,8 +54,9 @@ is `socks5://127.0.0.1:1080`.
   filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`, writes the listener fd number
   to the parent, then `execve`s the requested target after the parent
   acknowledges receipt.
-- The filter kills non-x86_64 ABIs, traps `connect(2)`, `sendto(2)`, and
-  `sendmsg(2)` with `SECCOMP_RET_USER_NOTIF`, and allows all other syscalls.
+- The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
+  send/receive syscalls only when DNS or generic UDP redirection is enabled.
+  All other syscalls are allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.

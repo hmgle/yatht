@@ -72,6 +72,88 @@ pub struct SeccompNotifAddfd {
     pub newfd_flags: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrapSet {
+    pub connect: bool,
+    pub sendto: bool,
+    pub sendmsg: bool,
+    pub recvfrom: bool,
+    pub recvmsg: bool,
+}
+
+impl TrapSet {
+    pub fn tcp_only() -> Self {
+        Self {
+            connect: true,
+            sendto: false,
+            sendmsg: false,
+            recvfrom: false,
+            recvmsg: false,
+        }
+    }
+
+    pub fn with_udp() -> Self {
+        Self {
+            connect: true,
+            sendto: true,
+            sendmsg: true,
+            recvfrom: true,
+            recvmsg: true,
+        }
+    }
+
+    pub fn encode(self) -> String {
+        let mut bits = 0_u8;
+        if self.connect {
+            bits |= 1 << 0;
+        }
+        if self.sendto {
+            bits |= 1 << 1;
+        }
+        if self.sendmsg {
+            bits |= 1 << 2;
+        }
+        if self.recvfrom {
+            bits |= 1 << 3;
+        }
+        if self.recvmsg {
+            bits |= 1 << 4;
+        }
+        bits.to_string()
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        let bits = raw.parse::<u8>().ok()?;
+        Some(Self {
+            connect: bits & (1 << 0) != 0,
+            sendto: bits & (1 << 1) != 0,
+            sendmsg: bits & (1 << 2) != 0,
+            recvfrom: bits & (1 << 3) != 0,
+            recvmsg: bits & (1 << 4) != 0,
+        })
+    }
+
+    fn syscalls(self) -> Vec<u32> {
+        let mut nrs = Vec::new();
+        if self.connect {
+            nrs.push(libc::SYS_connect as u32);
+        }
+        if self.sendto {
+            nrs.push(libc::SYS_sendto as u32);
+        }
+        if self.sendmsg {
+            nrs.push(libc::SYS_sendmsg as u32);
+        }
+        if self.recvfrom {
+            nrs.push(libc::SYS_recvfrom as u32);
+        }
+        if self.recvmsg {
+            nrs.push(libc::SYS_recvmsg as u32);
+        }
+        nrs
+    }
+}
+
 pub fn query_notif_sizes() -> io::Result<SeccompNotifSizes> {
     let mut sizes = SeccompNotifSizes::default();
     let rc = unsafe {
@@ -109,8 +191,8 @@ pub fn query_notif_sizes() -> io::Result<SeccompNotifSizes> {
     Ok(sizes)
 }
 
-pub fn install_listener() -> io::Result<RawFd> {
-    let mut filter = socket_filter();
+pub fn install_listener(traps: TrapSet) -> io::Result<RawFd> {
+    let mut filter = socket_filter(traps);
     let mut prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_mut_ptr(),
@@ -130,33 +212,24 @@ pub fn install_listener() -> io::Result<RawFd> {
     }
 }
 
-pub fn socket_filter() -> Vec<libc::sock_filter> {
-    vec![
+pub fn socket_filter(traps: TrapSet) -> Vec<libc::sock_filter> {
+    let nrs = traps.syscalls();
+    let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
         jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_connect as u32, 5, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendto as u32, 4, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendmsg as u32, 3, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_recvfrom as u32, 2, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_recvmsg as u32, 1, 0),
+    ];
+    for (index, nr) in nrs.iter().enumerate() {
+        let remaining = nrs.len() - 1 - index;
+        let jump_to_user_notif = (remaining + 1) as u8;
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *nr, jump_to_user_notif, 0));
+    }
+    filter.extend([
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-    ]
-}
-
-#[cfg(test)]
-pub fn connect_filter() -> Vec<libc::sock_filter> {
-    vec![
-        stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
-        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-        stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_connect as u32, 1, 0),
-        stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-    ]
+    ]);
+    filter
 }
 
 pub fn notif_recv(fd: RawFd) -> io::Result<SeccompNotif> {
@@ -304,7 +377,7 @@ mod tests {
 
     #[test]
     fn connect_filter_shape() {
-        let filter = connect_filter();
+        let filter = socket_filter(TrapSet::tcp_only());
         assert_eq!(filter.len(), 7);
         assert_eq!(filter[1].k, AUDIT_ARCH_X86_64);
         assert_eq!(filter[2].k, SECCOMP_RET_KILL_PROCESS);
@@ -316,7 +389,7 @@ mod tests {
 
     #[test]
     fn socket_filter_traps_udp_senders() {
-        let filter = socket_filter();
+        let filter = socket_filter(TrapSet::with_udp());
         assert_eq!(filter.len(), 11);
         assert_eq!(filter[4].k, libc::SYS_connect as u32);
         assert_eq!(filter[5].k, libc::SYS_sendto as u32);
@@ -325,5 +398,13 @@ mod tests {
         assert_eq!(filter[8].k, libc::SYS_recvmsg as u32);
         assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
         assert_eq!(filter[10].k, SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn trap_set_round_trips() {
+        assert_eq!(
+            TrapSet::decode(&TrapSet::with_udp().encode()),
+            Some(TrapSet::with_udp())
+        );
     }
 }

@@ -22,6 +22,7 @@ use crate::seccomp::{self, SeccompNotif, SeccompNotifAddfd};
 const CHILD_STAGE_ENV: &str = "SUP_CHILD_STAGE";
 const TARGET_PATH_ENV: &str = "SUP_TARGET_PATH";
 const TARGET_ARGV_ENV: &str = "SUP_TARGET_ARGV";
+const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
 
@@ -52,6 +53,11 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let target_path = resolve_target(&cfg.command[0])?;
     let argv = cfg.command.clone();
     let (parent_sock, child_sock) = socketpair().context("create control socketpair")?;
+    let trap_set = if cfg.enable_dns || cfg.enable_udp {
+        seccomp::TrapSet::with_udp()
+    } else {
+        seccomp::TrapSet::tcp_only()
+    };
 
     let mut command = Command::new(std::env::current_exe().context("resolve current executable")?);
     command
@@ -60,7 +66,8 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
             TARGET_PATH_ENV,
             encode_os(&target_path.as_os_str().to_os_string())?,
         )
-        .env(TARGET_ARGV_ENV, encode_os_list(&argv)?);
+        .env(TARGET_ARGV_ENV, encode_os_list(&argv)?)
+        .env(TRAP_SET_ENV, trap_set.encode());
 
     let child_fd = child_sock;
     let parent_fd = parent_sock;
@@ -127,9 +134,15 @@ pub fn run_child_stage() -> Result<i32> {
             .context("child stage missing target argv")?
             .as_str(),
     )?;
+    let trap_set = seccomp::TrapSet::decode(
+        std::env::var(TRAP_SET_ENV)
+            .context("child stage missing trap set")?
+            .as_str(),
+    )
+    .context("child stage has invalid trap set")?;
 
     set_no_new_privs().context("set PR_SET_NO_NEW_PRIVS")?;
-    let listener_fd = seccomp::install_listener().context("install seccomp listener")?;
+    let listener_fd = seccomp::install_listener(trap_set).context("install seccomp listener")?;
     write_all_fd(CONTROL_FD, &listener_fd.to_ne_bytes()).context("send listener fd number")?;
 
     let mut ack = [0_u8; 1];
