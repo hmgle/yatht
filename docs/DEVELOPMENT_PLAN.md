@@ -71,6 +71,8 @@ is `socks5://127.0.0.1:1080`.
   `connect() = 0`.
 - TCP proxy failures are fail-closed and return `ECONNREFUSED`; they do not
   fall back to direct connections.
+- Notifications are dispatched to a bounded worker pool so slow proxy dials do
+  not block unrelated syscalls without creating one OS thread per notification.
 - UDP redirection injects a connected loopback datagram socket into the target
   and runs a supervisor relay. Explicit `sendto(2)` / `sendmsg(2)` destinations
   are forwarded by the notification handler; connected UDP sends are read by the

@@ -24,6 +24,7 @@ const TARGET_ARGV_ENV: &str = "SUP_TARGET_ARGV";
 const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
+const MAX_NOTIFICATION_WORKERS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Destination {
@@ -153,12 +154,24 @@ pub fn run_child_stage() -> Result<i32> {
 }
 
 fn notification_loop(listener_fd: RawFd, cfg: Arc<EffectiveConfig>, relays: Arc<UdpRelayRegistry>) {
+    let (tx, rx) = mpsc::channel::<SeccompNotif>();
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..notification_worker_count() {
+        let worker_rx = Arc::clone(&rx);
+        let worker_cfg = Arc::clone(&cfg);
+        let worker_relays = Arc::clone(&relays);
+        thread::spawn(move || {
+            notification_worker(listener_fd, worker_rx, worker_cfg, worker_relays)
+        });
+    }
+
     loop {
         match seccomp::notif_recv(listener_fd) {
             Ok(notif) => {
-                let cfg = Arc::clone(&cfg);
-                let relays = Arc::clone(&relays);
-                thread::spawn(move || handle_notification(listener_fd, notif, cfg, relays));
+                if tx.send(notif).is_err() {
+                    close_fd(listener_fd);
+                    return;
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
@@ -170,6 +183,31 @@ fn notification_loop(listener_fd: RawFd, cfg: Arc<EffectiveConfig>, relays: Arc<
             }
         }
     }
+}
+
+fn notification_worker(
+    listener_fd: RawFd,
+    rx: Arc<Mutex<mpsc::Receiver<SeccompNotif>>>,
+    cfg: Arc<EffectiveConfig>,
+    relays: Arc<UdpRelayRegistry>,
+) {
+    loop {
+        let notif = {
+            let rx = rx.lock().expect("notification worker receiver poisoned");
+            rx.recv()
+        };
+        let Ok(notif) = notif else {
+            return;
+        };
+        handle_notification(listener_fd, notif, Arc::clone(&cfg), Arc::clone(&relays));
+    }
+}
+
+fn notification_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(4)
+        .clamp(4, MAX_NOTIFICATION_WORKERS)
 }
 
 fn handle_notification(
