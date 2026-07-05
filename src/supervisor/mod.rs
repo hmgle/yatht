@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -208,39 +208,62 @@ fn handle_connect(
         }
     };
 
-    if socket_type(notif.pid, target_fd) == Some(libc::SOCK_DGRAM) {
-        if udp_route_for(&cfg, dest).is_some() {
-            if cfg.debug {
-                eprintln!(
-                    "seccomp-unotify-proxy: UDP connect relay {} for pid={} fd={}",
-                    dest.authority(),
+    match socket_type(notif.pid, target_fd) {
+        Some(libc::SOCK_DGRAM) => {
+            if udp_route_for(&cfg, dest).is_some() {
+                if cfg.debug {
+                    eprintln!(
+                        "seccomp-unotify-proxy: UDP connect relay {} for pid={} fd={}",
+                        dest.authority(),
+                        notif.pid,
+                        target_fd
+                    );
+                }
+                match relays.ensure(
+                    listener_fd,
+                    &cfg,
+                    notif.id,
                     notif.pid,
-                    target_fd
-                );
-            }
-            match relays.ensure(
-                listener_fd,
-                &cfg,
-                notif.id,
-                notif.pid,
-                target_fd,
-                Some(dest),
-            ) {
-                Ok(_) => {
-                    seccomp::send_success(listener_fd, notif.id);
-                }
-                Err(err) => {
-                    if cfg.debug {
-                        eprintln!("seccomp-unotify-proxy: UDP relay setup failed: {err:#}");
+                    target_fd,
+                    Some(dest),
+                ) {
+                    Ok(_) => {
+                        seccomp::send_success(listener_fd, notif.id);
                     }
-                    seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+                    Err(err) => {
+                        if cfg.debug {
+                            eprintln!("seccomp-unotify-proxy: UDP relay setup failed: {err:#}");
+                        }
+                        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+                    }
                 }
+                return;
             }
+
+            seccomp::send_continue(listener_fd, notif.id);
             return;
         }
-
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
+        Some(libc::SOCK_STREAM) => {}
+        Some(other) => {
+            if cfg.debug {
+                eprintln!(
+                    "seccomp-unotify-proxy: unsupported socket type {} for pid={} fd={}",
+                    other, notif.pid, target_fd
+                );
+            }
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        None => {
+            if cfg.debug {
+                eprintln!(
+                    "seccomp-unotify-proxy: cannot inspect socket type for pid={} fd={}",
+                    notif.pid, target_fd
+                );
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            return;
+        }
     }
 
     if cfg.route_for(dest.ip) == Route::Direct {
@@ -446,6 +469,7 @@ struct UdpRelayRegistry {
 #[derive(Clone)]
 struct UdpRelayHandle {
     tx: mpsc::Sender<UdpJob>,
+    default_dest: Arc<Mutex<Option<Destination>>>,
 }
 
 struct UdpJob {
@@ -475,6 +499,9 @@ impl UdpRelayRegistry {
     ) -> Result<UdpRelayHandle> {
         let key = RelayKey { pid, fd };
         if let Some(handle) = self.inner.lock().unwrap().get(&key).cloned() {
+            if let Some(dest) = default_dest {
+                handle.set_default_dest(dest);
+            }
             return Ok(handle);
         }
 
@@ -510,6 +537,10 @@ impl UdpRelayRegistry {
 }
 
 impl UdpRelayHandle {
+    fn set_default_dest(&self, dest: Destination) {
+        *self.default_dest.lock().unwrap() = Some(dest);
+    }
+
     fn send(&self, dest: Destination, payload: Vec<u8>) -> Result<()> {
         self.tx
             .send(UdpJob { dest, payload })
@@ -524,20 +555,23 @@ fn start_udp_relay(
 ) -> UdpRelayHandle {
     let socket = Arc::new(relay_socket);
     let (tx, rx) = mpsc::channel::<UdpJob>();
+    let default_dest = Arc::new(Mutex::new(default_dest));
 
-    if let Some(dest) = default_dest {
-        let read_socket = Arc::clone(&socket);
-        let read_tx = tx.clone();
-        thread::spawn(move || {
-            let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
-            while let Ok(n) = read_socket.recv(&mut buf) {
-                let payload = buf[..n].to_vec();
-                if read_tx.send(UdpJob { dest, payload }).is_err() {
-                    break;
-                }
+    let read_socket = Arc::clone(&socket);
+    let read_tx = tx.clone();
+    let read_default_dest = Arc::clone(&default_dest);
+    thread::spawn(move || {
+        let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
+        while let Ok(n) = read_socket.recv(&mut buf) {
+            let Some(dest) = *read_default_dest.lock().unwrap() else {
+                continue;
+            };
+            let payload = buf[..n].to_vec();
+            if read_tx.send(UdpJob { dest, payload }).is_err() {
+                break;
             }
-        });
-    }
+        }
+    });
 
     thread::spawn(move || {
         let mut socks_udp = None;
@@ -556,7 +590,7 @@ fn start_udp_relay(
         }
     });
 
-    UdpRelayHandle { tx }
+    UdpRelayHandle { tx, default_dest }
 }
 
 fn forward_udp_job(
@@ -672,9 +706,7 @@ fn read_iovecs(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<u8>> {
 
 fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
     if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
-        let ty = socket_type_from_fd(duplicated);
-        close_fd(duplicated);
-        return ty;
+        return socket_type_from_fd(duplicated.as_raw_fd());
     }
 
     let file = File::open(format!("/proc/{pid}/fd/{fd}")).ok()?;
@@ -820,11 +852,10 @@ fn read_target_fd_flags(pid: u32, fd: RawFd) -> TargetFdFlags {
     let mut flags = TargetFdFlags::default();
 
     if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
-        let rc = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+        let rc = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFL) };
         if rc >= 0 {
             flags.status_flags = rc;
         }
-        close_fd(duplicated);
     } else if let Ok(file) = File::open(format!("/proc/{pid}/fd/{fd}")) {
         let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         if rc >= 0 {
@@ -883,24 +914,29 @@ fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<RawFd> {
     let mut raw = [0_u8; std::mem::size_of::<RawFd>()];
     read_exact_fd(sock, &mut raw)?;
     let child_listener_fd = RawFd::from_ne_bytes(raw);
-    duplicate_remote_fd(child_pid, child_listener_fd)
+    Ok(duplicate_remote_fd(child_pid, child_listener_fd)?.into_raw_fd())
 }
 
-fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<RawFd> {
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if pidfd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0) };
-    let saved = if duplicated < 0 {
-        Some(io::Error::last_os_error())
-    } else {
-        None
+fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
+    let pidfd = match pidfd_open(pid, libc::PIDFD_THREAD) {
+        Ok(pidfd) => pidfd,
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => pidfd_open(pid, 0)?,
+        Err(err) => return Err(err),
     };
-    close_fd(pidfd as RawFd);
-    match saved {
-        Some(err) => Err(err),
-        None => Ok(duplicated as RawFd),
+    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    if duplicated < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated as RawFd) })
+    }
+}
+
+fn pidfd_open(pid: u32, flags: libc::c_uint) -> io::Result<OwnedFd> {
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, flags) };
+    if pidfd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) })
     }
 }
 
