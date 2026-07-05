@@ -5,7 +5,6 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::FileExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
@@ -1111,8 +1110,7 @@ fn read_proc_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     if len == 0 {
         return Ok(raw);
     }
-    let mem = File::open(format!("/proc/{pid}/mem"))?;
-    mem.read_exact_at(&mut raw, addr)?;
+    process_vm_read(pid, addr, &mut raw)?;
     Ok(raw)
 }
 
@@ -1120,11 +1118,8 @@ fn write_proc_bytes(pid: u32, mut addr: u64, mut buf: &[u8]) -> io::Result<()> {
     if buf.is_empty() {
         return Ok(());
     }
-    let mem = File::options()
-        .write(true)
-        .open(format!("/proc/{pid}/mem"))?;
     while !buf.is_empty() {
-        let written = mem.write_at(buf, addr)?;
+        let written = process_vm_write(pid, addr, buf)?;
         if written == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
         }
@@ -1132,6 +1127,58 @@ fn write_proc_bytes(pid: u32, mut addr: u64, mut buf: &[u8]) -> io::Result<()> {
         buf = &buf[written..];
     }
     Ok(())
+}
+
+fn process_vm_read(pid: u32, mut addr: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let local = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: addr as usize as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let rc = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short process_vm_readv",
+            ));
+        }
+        let read = rc as usize;
+        addr += read as u64;
+        buf = &mut buf[read..];
+    }
+    Ok(())
+}
+
+fn process_vm_write(pid: u32, addr: u64, buf: &[u8]) -> io::Result<usize> {
+    let local = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as usize as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    loop {
+        let rc = unsafe { libc::process_vm_writev(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
+        if rc >= 0 {
+            return Ok(rc as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 fn parse_destination_addr(raw: &str) -> Result<Destination> {

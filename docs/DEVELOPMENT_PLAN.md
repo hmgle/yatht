@@ -60,8 +60,9 @@ is `socks5://127.0.0.1:1080`.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
-- For each notification the supervisor reads the target `sockaddr` from
-  `/proc/<pid>/mem`, validates the notification id, and applies routing policy.
+- For each notification the supervisor reads target memory with
+  `process_vm_readv(2)`, validates the notification id, and applies routing
+  policy. Simulated UDP receives write results back with `process_vm_writev(2)`.
 - Direct routes respond with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, letting the
   original `connect` run unchanged.
 - Proxied routes complete the SOCKS5/HTTP CONNECT handshake in the supervisor,
