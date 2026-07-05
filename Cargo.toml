@@ -1,0 +1,20 @@
+[package]
+name = "seccomp-unotify-proxy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Transparent TCP proxying with seccomp user notification and ADDFD"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+humantime = "2.1"
+ipnet = { version = "2.11", features = ["serde"] }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.15"

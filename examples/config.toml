@@ -1,0 +1,6 @@
+proxy = "socks5://127.0.0.1:1080"
+connect_timeout = "10s"
+bypass_local = true
+bypass_cidrs = []
+proxy_cidrs = []
+debug = false
