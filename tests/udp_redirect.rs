@@ -163,6 +163,51 @@ fn redirects_threaded_connected_dns_udp_over_tcp_proxy() {
 }
 
 #[test]
+fn rewrites_dns_recvmsg_source_to_original_destination() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_recvmsg_source_probe();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let dns_server = SocketAddr::from((Ipv4Addr::LOCALHOST, 53534));
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = socks.accept().unwrap();
+        socks5_greet(&mut client);
+        let _dest = read_socks5_request(&mut client);
+        client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+
+        let mut len = [0_u8; 2];
+        client.read_exact(&mut len).unwrap();
+        let query_len = u16::from_be_bytes(len) as usize;
+        let mut query = vec![0_u8; query_len];
+        client.read_exact(&mut query).unwrap();
+        assert_eq!(query, b"dns-query");
+        client.write_all(&6_u16.to_be_bytes()).unwrap();
+        client.write_all(b"dns-ok").unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+        .arg("--proxy")
+        .arg(format!("socks5://{socks_addr}"))
+        .arg("--enable-dns")
+        .arg("--dns-server")
+        .arg(dns_server.to_string())
+        .arg("--debug")
+        .arg("--")
+        .arg(&probe)
+        .arg("127.0.0.1:53")
+        .arg("dns-query")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "dns-ok");
+    socks_thread.join().unwrap();
+}
+
+#[test]
 fn redirects_generic_udp_over_socks5_associate() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -382,6 +427,89 @@ fn main() {
     )
     .unwrap();
     let status = Command::new("rustc")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_recvmsg_source_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("recvmsg_source_probe.c");
+    let bin = dir.path().join("recvmsg_source_probe");
+    fs::write(
+        &src,
+        r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+
+    char dest_arg[64];
+    snprintf(dest_arg, sizeof(dest_arg), "%s", argv[1]);
+    char *colon = strrchr(dest_arg, ':');
+    if (!colon) return 3;
+    *colon = '\0';
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((unsigned short)atoi(colon + 1));
+    if (inet_pton(AF_INET, dest_arg, &dest.sin_addr) != 1) return 4;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return 5;
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) return 6;
+
+    size_t payload_len = strlen(argv[2]);
+    ssize_t sent = sendto(fd, argv[2], payload_len, MSG_NOSIGNAL,
+                          (struct sockaddr *)&dest, sizeof(dest));
+    if (sent != (ssize_t)payload_len) return 7;
+
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    if (poll(&pfd, 1, 5000) <= 0) return 8;
+
+    char buf[2048];
+    struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    struct sockaddr_in peer;
+    struct msghdr msg;
+    memset(&peer, 0, sizeof(peer));
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &peer;
+    msg.msg_namelen = sizeof(peer);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    ssize_t n = recvmsg(fd, &msg, 0);
+    if (n < 0) return 9;
+    if (peer.sin_family != AF_INET ||
+        peer.sin_port != dest.sin_port ||
+        peer.sin_addr.s_addr != dest.sin_addr.s_addr) {
+        return 10;
+    }
+    if (write(STDOUT_FILENO, buf, (size_t)n) != n) return 11;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
         .arg(&src)
         .arg("-o")
         .arg(&bin)

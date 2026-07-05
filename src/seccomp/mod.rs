@@ -136,9 +136,11 @@ pub fn socket_filter() -> Vec<libc::sock_filter> {
         jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_connect as u32, 3, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendto as u32, 2, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendmsg as u32, 1, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_connect as u32, 5, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendto as u32, 4, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_sendmsg as u32, 3, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_recvfrom as u32, 2, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_recvmsg as u32, 1, 0),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
     ]
@@ -204,7 +206,7 @@ pub fn send_errno(fd: RawFd, id: u64, errno: i32) {
     let mut resp = SeccompNotifResp {
         id,
         val: -1,
-        error: errno,
+        error: -errno,
         flags: 0,
     };
     let _ = notif_send(fd, &mut resp);
@@ -315,11 +317,13 @@ mod tests {
     #[test]
     fn socket_filter_traps_udp_senders() {
         let filter = socket_filter();
-        assert_eq!(filter.len(), 9);
+        assert_eq!(filter.len(), 11);
         assert_eq!(filter[4].k, libc::SYS_connect as u32);
         assert_eq!(filter[5].k, libc::SYS_sendto as u32);
         assert_eq!(filter[6].k, libc::SYS_sendmsg as u32);
-        assert_eq!(filter[7].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[8].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[7].k, libc::SYS_recvfrom as u32);
+        assert_eq!(filter[8].k, libc::SYS_recvmsg as u32);
+        assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[10].k, SECCOMP_RET_USER_NOTIF);
     }
 }

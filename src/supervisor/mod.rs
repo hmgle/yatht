@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
@@ -170,6 +170,8 @@ fn handle_notification(
         libc::SYS_connect => handle_connect(listener_fd, notif, cfg, relays),
         libc::SYS_sendto => handle_sendto(listener_fd, notif, cfg, relays),
         libc::SYS_sendmsg => handle_sendmsg(listener_fd, notif, cfg, relays),
+        libc::SYS_recvfrom => handle_recvfrom(listener_fd, notif, relays),
+        libc::SYS_recvmsg => handle_recvmsg(listener_fd, notif, relays),
         _ => seccomp::send_continue(listener_fd, notif.id),
     }
 }
@@ -449,6 +451,130 @@ fn handle_sendmsg(
     }
 }
 
+fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let target_fd = notif.data.args[0] as RawFd;
+    let buf_ptr = notif.data.args[1];
+    let len = notif.data.args[2] as usize;
+    let flags = notif.data.args[3] as i32;
+    let src_addr = notif.data.args[4];
+    let addr_len_ptr = notif.data.args[5];
+
+    let Some(handle) = relays.get(notif.pid, target_fd) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if len > MAX_UDP_PAYLOAD {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    let addr_len = if src_addr != 0 && addr_len_ptr != 0 {
+        match read_socklen(notif.pid, addr_len_ptr) {
+            Ok(addr_len) => Some(addr_len),
+            Err(_) => {
+                seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+
+    match recv_from_relay_fd(notif.pid, target_fd, len, flags) {
+        Ok(payload) => {
+            if let Err(err) = write_proc_bytes(notif.pid, buf_ptr, &payload) {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    seccomp::send_errno(listener_fd, notif.id, libc::EINTR);
+                } else {
+                    seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+                }
+                return;
+            }
+            if let Some(addr_len) = addr_len {
+                if let Some(source) = handle.response_source(flags) {
+                    if write_sockaddr_result(notif.pid, src_addr, addr_len_ptr, addr_len, source)
+                        .is_err()
+                    {
+                        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+                        return;
+                    }
+                }
+            } else if flags & libc::MSG_PEEK == 0 {
+                let _ = handle.response_source(flags);
+            }
+            seccomp::send_value(listener_fd, notif.id, payload.len() as i64);
+        }
+        Err(err) => seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err)),
+    }
+}
+
+fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let target_fd = notif.data.args[0] as RawFd;
+    let msg_ptr = notif.data.args[1];
+    let flags = notif.data.args[2] as i32;
+
+    let Some(handle) = relays.get(notif.pid, target_fd) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if msg_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let msg = match read_msghdr(notif.pid, msg_ptr) {
+        Ok(msg) => msg,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => iovecs,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    let capacity = iovecs
+        .iter()
+        .try_fold(0_usize, |acc, iov| acc.checked_add(iov.len))
+        .filter(|len| *len <= MAX_UDP_PAYLOAD)
+        .unwrap_or(MAX_UDP_PAYLOAD);
+
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+
+    match recv_msg_from_relay_fd(notif.pid, target_fd, capacity, flags) {
+        Ok(received) => {
+            if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
+                || write_proc_bytes(notif.pid, msg_ptr + 48, &received.msg_flags.to_ne_bytes())
+                    .is_err()
+            {
+                seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+                return;
+            }
+            if msg.name != 0 {
+                if let Some(source) = handle.response_source(flags) {
+                    if write_sockaddr_to_msghdr(notif.pid, msg_ptr, msg.name, msg.name_len, source)
+                        .is_err()
+                    {
+                        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+                        return;
+                    }
+                }
+            } else if flags & libc::MSG_PEEK == 0 {
+                let _ = handle.response_source(flags);
+            }
+            seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
+        }
+        Err(err) => seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err)),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UdpRouteKind {
     Dns,
@@ -470,6 +596,7 @@ struct UdpRelayRegistry {
 struct UdpRelayHandle {
     tx: mpsc::Sender<UdpJob>,
     default_dest: Arc<Mutex<Option<Destination>>>,
+    pending_sources: Arc<Mutex<VecDeque<Destination>>>,
 }
 
 struct UdpJob {
@@ -534,6 +661,14 @@ impl UdpRelayRegistry {
         self.inner.lock().unwrap().insert(key, handle.clone());
         Ok(handle)
     }
+
+    fn get(&self, pid: u32, fd: RawFd) -> Option<UdpRelayHandle> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&RelayKey { pid, fd })
+            .cloned()
+    }
 }
 
 impl UdpRelayHandle {
@@ -546,6 +681,15 @@ impl UdpRelayHandle {
             .send(UdpJob { dest, payload })
             .map_err(|_| anyhow!("UDP relay worker exited"))
     }
+
+    fn response_source(&self, flags: i32) -> Option<Destination> {
+        let mut pending = self.pending_sources.lock().unwrap();
+        if flags & libc::MSG_PEEK != 0 {
+            pending.front().copied()
+        } else {
+            pending.pop_front()
+        }
+    }
 }
 
 fn start_udp_relay(
@@ -556,6 +700,7 @@ fn start_udp_relay(
     let socket = Arc::new(relay_socket);
     let (tx, rx) = mpsc::channel::<UdpJob>();
     let default_dest = Arc::new(Mutex::new(default_dest));
+    let pending_sources = Arc::new(Mutex::new(VecDeque::new()));
 
     let read_socket = Arc::clone(&socket);
     let read_tx = tx.clone();
@@ -573,12 +718,18 @@ fn start_udp_relay(
         }
     });
 
+    let write_pending_sources = Arc::clone(&pending_sources);
     thread::spawn(move || {
         let mut socks_udp = None;
         for job in rx {
+            let source = job.dest;
             match forward_udp_job(&cfg, &mut socks_udp, job) {
                 Ok(Some(response)) => {
-                    let _ = socket.send(&response);
+                    let mut pending = write_pending_sources.lock().unwrap();
+                    pending.push_back(source);
+                    if socket.send(&response).is_err() {
+                        let _ = pending.pop_back();
+                    }
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -590,7 +741,11 @@ fn start_udp_relay(
         }
     });
 
-    UdpRelayHandle { tx, default_dest }
+    UdpRelayHandle {
+        tx,
+        default_dest,
+        pending_sources,
+    }
 }
 
 fn forward_udp_job(
@@ -704,6 +859,161 @@ fn read_iovecs(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+#[derive(Clone, Copy)]
+struct TargetIovec {
+    base: u64,
+    len: usize,
+}
+
+struct RelayRecvmsg {
+    payload: Vec<u8>,
+    result_len: usize,
+    msg_flags: i32,
+}
+
+fn read_iovec_targets(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<TargetIovec>> {
+    if iov_len > 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many iovecs",
+        ));
+    }
+    let mut iovecs = Vec::with_capacity(iov_len as usize);
+    for index in 0..iov_len {
+        let raw = read_proc_bytes(pid, iov_ptr + index * 16, 16)?;
+        let base = u64::from_ne_bytes(raw[0..8].try_into().unwrap());
+        let len = u64::from_ne_bytes(raw[8..16].try_into().unwrap()) as usize;
+        iovecs.push(TargetIovec { base, len });
+    }
+    Ok(iovecs)
+}
+
+fn recv_from_relay_fd(pid: u32, fd: RawFd, len: usize, flags: i32) -> io::Result<Vec<u8>> {
+    let duplicated = duplicate_remote_fd(pid, fd)?;
+    let mut payload = vec![0_u8; len];
+    loop {
+        let rc = unsafe {
+            libc::recv(
+                duplicated.as_raw_fd(),
+                payload.as_mut_ptr().cast(),
+                payload.len(),
+                flags,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        payload.truncate(rc as usize);
+        return Ok(payload);
+    }
+}
+
+fn recv_msg_from_relay_fd(
+    pid: u32,
+    fd: RawFd,
+    capacity: usize,
+    flags: i32,
+) -> io::Result<RelayRecvmsg> {
+    let duplicated = duplicate_remote_fd(pid, fd)?;
+    let mut payload = vec![0_u8; capacity];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+
+    loop {
+        let rc = unsafe { libc::recvmsg(duplicated.as_raw_fd(), &mut msg, flags) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let copied_len = (rc as usize).min(payload.len());
+        payload.truncate(copied_len);
+        return Ok(RelayRecvmsg {
+            payload,
+            result_len: rc as usize,
+            msg_flags: msg.msg_flags,
+        });
+    }
+}
+
+fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::Result<()> {
+    let mut offset = 0;
+    for iov in iovecs {
+        if offset >= payload.len() {
+            break;
+        }
+        let len = (payload.len() - offset).min(iov.len);
+        write_proc_bytes(pid, iov.base, &payload[offset..offset + len])?;
+        offset += len;
+    }
+    Ok(())
+}
+
+fn read_socklen(pid: u32, addr: u64) -> io::Result<u32> {
+    let raw = read_proc_bytes(pid, addr, std::mem::size_of::<libc::socklen_t>())?;
+    Ok(u32::from_ne_bytes(raw.try_into().unwrap()))
+}
+
+fn write_sockaddr_result(
+    pid: u32,
+    addr: u64,
+    addr_len_ptr: u64,
+    addr_len: u32,
+    source: Destination,
+) -> io::Result<()> {
+    let raw = sockaddr_bytes(source);
+    let write_len = (addr_len as usize).min(raw.len());
+    write_proc_bytes(pid, addr, &raw[..write_len])?;
+    write_proc_bytes(pid, addr_len_ptr, &(raw.len() as u32).to_ne_bytes())
+}
+
+fn write_sockaddr_to_msghdr(
+    pid: u32,
+    msg_ptr: u64,
+    addr: u64,
+    addr_len: u32,
+    source: Destination,
+) -> io::Result<()> {
+    let raw = sockaddr_bytes(source);
+    let write_len = (addr_len as usize).min(raw.len());
+    write_proc_bytes(pid, addr, &raw[..write_len])?;
+    write_proc_bytes(pid, msg_ptr + 8, &(raw.len() as u32).to_ne_bytes())
+}
+
+fn sockaddr_bytes(dest: Destination) -> Vec<u8> {
+    match dest.ip {
+        IpAddr::V4(ip) => {
+            let mut raw = vec![0_u8; 16];
+            raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+            raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
+            raw[4..8].copy_from_slice(&ip.octets());
+            raw
+        }
+        IpAddr::V6(ip) => {
+            let mut raw = vec![0_u8; 28];
+            raw[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+            raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
+            raw[8..24].copy_from_slice(&ip.octets());
+            raw
+        }
+    }
+}
+
+fn errno_from_io(err: &io::Error) -> i32 {
+    err.raw_os_error().unwrap_or(libc::EIO)
+}
+
 fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
     if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
         return socket_type_from_fd(duplicated.as_raw_fd());
@@ -791,6 +1101,24 @@ fn read_proc_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     let mem = File::open(format!("/proc/{pid}/mem"))?;
     mem.read_exact_at(&mut raw, addr)?;
     Ok(raw)
+}
+
+fn write_proc_bytes(pid: u32, mut addr: u64, mut buf: &[u8]) -> io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let mem = File::options()
+        .write(true)
+        .open(format!("/proc/{pid}/mem"))?;
+    while !buf.is_empty() {
+        let written = mem.write_at(buf, addr)?;
+        if written == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
+        addr += written as u64;
+        buf = &buf[written..];
+    }
+    Ok(())
 }
 
 fn parse_destination_addr(raw: &str) -> Result<Destination> {
