@@ -124,6 +124,9 @@ impl TrapSet {
 
     pub fn decode(raw: &str) -> Option<Self> {
         let bits = raw.parse::<u8>().ok()?;
+        if bits & !0b1_1111 != 0 {
+            return None;
+        }
         Some(Self {
             connect: bits & (1 << 0) != 0,
             sendto: bits & (1 << 1) != 0,
@@ -406,5 +409,10 @@ mod tests {
             TrapSet::decode(&TrapSet::with_udp().encode()),
             Some(TrapSet::with_udp())
         );
+    }
+
+    #[test]
+    fn trap_set_rejects_unknown_bits() {
+        assert_eq!(TrapSet::decode("32"), None);
     }
 }

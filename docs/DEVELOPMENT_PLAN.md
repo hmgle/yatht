@@ -61,8 +61,9 @@ is `socks5://127.0.0.1:1080`.
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
 - For each notification the supervisor reads target memory with
-  `process_vm_readv(2)`, validates the notification id, and applies routing
-  policy. Simulated UDP receives write results back with `process_vm_writev(2)`.
+  `process_vm_readv(2)`, batching target iovecs when possible, validates the
+  notification id, and applies routing policy. Simulated UDP receives write
+  results back with `process_vm_writev(2)`.
 - Direct routes respond with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, letting the
   original `connect` run unchanged.
 - Proxied routes complete the SOCKS5/HTTP CONNECT handshake in the supervisor,
@@ -71,8 +72,10 @@ is `socks5://127.0.0.1:1080`.
   `connect() = 0`.
 - TCP proxy failures are fail-closed and return `ECONNREFUSED`; they do not
   fall back to direct connections.
-- Notifications are dispatched to a bounded worker pool so slow proxy dials do
-  not block unrelated syscalls without creating one OS thread per notification.
+- Notifications are dispatched through a bounded queue to a bounded worker pool
+  so slow proxy dials apply backpressure without creating one OS thread per
+  notification. Blocking UDP receive notifications run outside that pool so they
+  cannot exhaust workers needed by send/connect notifications.
 - UDP redirection injects a connected loopback datagram socket into the target
   and runs a supervisor relay. Explicit `sendto(2)` / `sendmsg(2)` destinations
   are forwarded by the notification handler; connected UDP sends are read by the

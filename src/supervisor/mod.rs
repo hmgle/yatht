@@ -25,6 +25,7 @@ const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
+const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Destination {
@@ -154,9 +155,12 @@ pub fn run_child_stage() -> Result<i32> {
 }
 
 fn notification_loop(listener_fd: RawFd, cfg: Arc<EffectiveConfig>, relays: Arc<UdpRelayRegistry>) {
-    let (tx, rx) = mpsc::channel::<SeccompNotif>();
+    let worker_count = notification_worker_count();
+    let (tx, rx) = mpsc::sync_channel::<SeccompNotif>(
+        worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
+    );
     let rx = Arc::new(Mutex::new(rx));
-    for _ in 0..notification_worker_count() {
+    for _ in 0..worker_count {
         let worker_rx = Arc::clone(&rx);
         let worker_cfg = Arc::clone(&cfg);
         let worker_relays = Arc::clone(&relays);
@@ -168,6 +172,12 @@ fn notification_loop(listener_fd: RawFd, cfg: Arc<EffectiveConfig>, relays: Arc<
     loop {
         match seccomp::notif_recv(listener_fd) {
             Ok(notif) => {
+                if is_blocking_recv_notification(&notif) {
+                    let cfg = Arc::clone(&cfg);
+                    let relays = Arc::clone(&relays);
+                    thread::spawn(move || handle_notification(listener_fd, notif, cfg, relays));
+                    continue;
+                }
                 if tx.send(notif).is_err() {
                     close_fd(listener_fd);
                     return;
@@ -208,6 +218,13 @@ fn notification_worker_count() -> usize {
         .map(|count| count.get().saturating_mul(2))
         .unwrap_or(4)
         .clamp(4, MAX_NOTIFICATION_WORKERS)
+}
+
+fn is_blocking_recv_notification(notif: &SeccompNotif) -> bool {
+    matches!(
+        notif.data.nr as libc::c_long,
+        libc::SYS_recvfrom | libc::SYS_recvmsg
+    )
 }
 
 fn handle_notification(
@@ -887,26 +904,9 @@ fn read_msghdr(pid: u32, msg_ptr: u64) -> io::Result<TargetMsghdr> {
 }
 
 fn read_iovecs(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<u8>> {
-    if iov_len > 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "too many iovecs",
-        ));
-    }
-    let mut payload = Vec::new();
-    for index in 0..iov_len {
-        let raw = read_proc_bytes(pid, iov_ptr + index * 16, 16)?;
-        let base = u64::from_ne_bytes(raw[0..8].try_into().unwrap());
-        let len = u64::from_ne_bytes(raw[8..16].try_into().unwrap()) as usize;
-        if payload.len().saturating_add(len) > MAX_UDP_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP payload too large",
-            ));
-        }
-        payload.extend_from_slice(&read_proc_bytes(pid, base, len)?);
-    }
-    Ok(payload)
+    let iovecs = read_iovec_targets(pid, iov_ptr, iov_len)?;
+    let total = iovec_total_len(&iovecs)?;
+    read_iovec_payload(pid, &iovecs, total)
 }
 
 #[derive(Clone, Copy)]
@@ -936,6 +936,39 @@ fn read_iovec_targets(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<Ta
         iovecs.push(TargetIovec { base, len });
     }
     Ok(iovecs)
+}
+
+fn iovec_total_len(iovecs: &[TargetIovec]) -> io::Result<usize> {
+    iovecs.iter().try_fold(0_usize, |acc, iov| {
+        acc.checked_add(iov.len)
+            .filter(|len| *len <= MAX_UDP_PAYLOAD)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "UDP payload too large"))
+    })
+}
+
+fn read_iovec_payload(pid: u32, iovecs: &[TargetIovec], total_len: usize) -> io::Result<Vec<u8>> {
+    let mut payload = vec![0_u8; total_len];
+    if total_len == 0 {
+        return Ok(payload);
+    }
+
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
+    let mut offset = 0;
+    for iov in iovecs.iter().copied().filter(|iov| iov.len > 0) {
+        local.push(libc::iovec {
+            iov_base: unsafe { payload.as_mut_ptr().add(offset) }.cast(),
+            iov_len: iov.len,
+        });
+        remote.push(libc::iovec {
+            iov_base: iov.base as usize as *mut libc::c_void,
+            iov_len: iov.len,
+        });
+        offset += iov.len;
+    }
+
+    process_vm_readv_all(pid, &mut local, &mut remote)?;
+    Ok(payload)
 }
 
 fn recv_from_relay_fd(pid: u32, fd: RawFd, len: usize, flags: i32) -> io::Result<Vec<u8>> {
@@ -998,16 +1031,30 @@ fn recv_msg_from_relay_fd(
 }
 
 fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::Result<()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
     let mut offset = 0;
-    for iov in iovecs {
+    for iov in iovecs.iter().copied().filter(|iov| iov.len > 0) {
         if offset >= payload.len() {
             break;
         }
         let len = (payload.len() - offset).min(iov.len);
-        write_proc_bytes(pid, iov.base, &payload[offset..offset + len])?;
+        local.push(libc::iovec {
+            iov_base: payload[offset..offset + len].as_ptr() as *mut libc::c_void,
+            iov_len: len,
+        });
+        remote.push(libc::iovec {
+            iov_base: iov.base as usize as *mut libc::c_void,
+            iov_len: len,
+        });
         offset += len;
     }
-    Ok(())
+
+    process_vm_writev_all(pid, &mut local, &mut remote)
 }
 
 fn read_socklen(pid: u32, addr: u64) -> io::Result<u32> {
@@ -1105,7 +1152,10 @@ fn exec_target(target_path: PathBuf, argv: Vec<OsString>) -> Result<i32> {
 
     let env = std::env::vars_os()
         .filter(|(key, _)| {
-            key != CHILD_STAGE_ENV && key != TARGET_PATH_ENV && key != TARGET_ARGV_ENV
+            key != CHILD_STAGE_ENV
+                && key != TARGET_PATH_ENV
+                && key != TARGET_ARGV_ENV
+                && key != TRAP_SET_ENV
         })
         .collect::<Vec<_>>();
     command.env_clear().envs(env);
@@ -1215,6 +1265,101 @@ fn process_vm_write(pid: u32, addr: u64, buf: &[u8]) -> io::Result<usize> {
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);
+        }
+    }
+}
+
+fn process_vm_readv_all(
+    pid: u32,
+    local: &mut [libc::iovec],
+    remote: &mut [libc::iovec],
+) -> io::Result<()> {
+    let mut local_start = 0;
+    let mut remote_start = 0;
+    let mut remaining = iovecs_len(local);
+    while remaining > 0 {
+        let rc = unsafe {
+            libc::process_vm_readv(
+                pid as libc::pid_t,
+                local[local_start..].as_ptr(),
+                (local.len() - local_start) as libc::c_ulong,
+                remote[remote_start..].as_ptr(),
+                (remote.len() - remote_start) as libc::c_ulong,
+                0,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short process_vm_readv",
+            ));
+        }
+        let read = (rc as usize).min(remaining);
+        advance_iovecs(local, &mut local_start, read);
+        advance_iovecs(remote, &mut remote_start, read);
+        remaining -= read;
+    }
+    Ok(())
+}
+
+fn process_vm_writev_all(
+    pid: u32,
+    local: &mut [libc::iovec],
+    remote: &mut [libc::iovec],
+) -> io::Result<()> {
+    let mut local_start = 0;
+    let mut remote_start = 0;
+    let mut remaining = iovecs_len(local);
+    while remaining > 0 {
+        let rc = unsafe {
+            libc::process_vm_writev(
+                pid as libc::pid_t,
+                local[local_start..].as_ptr(),
+                (local.len() - local_start) as libc::c_ulong,
+                remote[remote_start..].as_ptr(),
+                (remote.len() - remote_start) as libc::c_ulong,
+                0,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
+        let written = (rc as usize).min(remaining);
+        advance_iovecs(local, &mut local_start, written);
+        advance_iovecs(remote, &mut remote_start, written);
+        remaining -= written;
+    }
+    Ok(())
+}
+
+fn iovecs_len(iovecs: &[libc::iovec]) -> usize {
+    iovecs.iter().map(|iov| iov.iov_len).sum()
+}
+
+fn advance_iovecs(iovecs: &mut [libc::iovec], start: &mut usize, mut bytes: usize) {
+    while bytes > 0 {
+        let iov = &mut iovecs[*start];
+        if bytes >= iov.iov_len {
+            bytes -= iov.iov_len;
+            *start += 1;
+        } else {
+            iov.iov_base = unsafe { (iov.iov_base as *mut u8).add(bytes) }.cast();
+            iov.iov_len -= bytes;
+            bytes = 0;
         }
     }
 }
