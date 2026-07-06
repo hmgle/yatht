@@ -102,7 +102,6 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     if let Err(err) = write_all_fd(parent_sock, b"G") {
         let _ = child.kill();
         let _ = child.wait();
-        close_fd(listener_fd);
         close_fd(parent_sock);
         return Err(err).context("ack child stage");
     }
@@ -110,6 +109,7 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
 
     let cfg = Arc::new(cfg);
     let relays = Arc::new(UdpRelayRegistry::default());
+    let listener_fd = Arc::new(listener_fd);
     let loop_cfg = Arc::clone(&cfg);
     let loop_relays = Arc::clone(&relays);
     thread::spawn(move || notification_loop(listener_fd, loop_cfg, loop_relays));
@@ -154,32 +154,56 @@ pub fn run_child_stage() -> Result<i32> {
     exec_target(target_path.into(), argv)
 }
 
-fn notification_loop(listener_fd: RawFd, cfg: Arc<EffectiveConfig>, relays: Arc<UdpRelayRegistry>) {
+fn notification_loop(
+    listener_fd: Arc<OwnedFd>,
+    cfg: Arc<EffectiveConfig>,
+    relays: Arc<UdpRelayRegistry>,
+) {
     let worker_count = notification_worker_count();
     let (tx, rx) = mpsc::sync_channel::<SeccompNotif>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
+    let (blocking_tx, blocking_rx) = mpsc::sync_channel::<SeccompNotif>(
+        worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
+    );
     let rx = Arc::new(Mutex::new(rx));
+    let blocking_rx = Arc::new(Mutex::new(blocking_rx));
     for _ in 0..worker_count {
         let worker_rx = Arc::clone(&rx);
+        let worker_listener_fd = Arc::clone(&listener_fd);
         let worker_cfg = Arc::clone(&cfg);
         let worker_relays = Arc::clone(&relays);
         thread::spawn(move || {
-            notification_worker(listener_fd, worker_rx, worker_cfg, worker_relays)
+            notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
+        });
+    }
+    for _ in 0..worker_count {
+        let worker_rx = Arc::clone(&blocking_rx);
+        let worker_listener_fd = Arc::clone(&listener_fd);
+        let worker_cfg = Arc::clone(&cfg);
+        let worker_relays = Arc::clone(&relays);
+        thread::spawn(move || {
+            notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
         });
     }
 
     loop {
-        match seccomp::notif_recv(listener_fd) {
+        let listener_raw_fd = listener_fd.as_raw_fd();
+        match seccomp::notif_recv(listener_raw_fd) {
             Ok(notif) => {
                 if is_blocking_recv_notification(&notif) {
-                    let cfg = Arc::clone(&cfg);
-                    let relays = Arc::clone(&relays);
-                    thread::spawn(move || handle_notification(listener_fd, notif, cfg, relays));
+                    if !try_queue_notification(
+                        &blocking_tx,
+                        listener_raw_fd,
+                        notif,
+                        cfg.debug,
+                        "blocking recv",
+                    ) {
+                        return;
+                    }
                     continue;
                 }
-                if tx.send(notif).is_err() {
-                    close_fd(listener_fd);
+                if !try_queue_notification(&tx, listener_raw_fd, notif, cfg.debug, "notification") {
                     return;
                 }
             }
@@ -188,15 +212,40 @@ fn notification_loop(listener_fd: RawFd, cfg: Arc<EffectiveConfig>, relays: Arc<
                 if cfg.debug {
                     eprintln!("seccomp-unotify-proxy: notification loop stopped: {err}");
                 }
-                close_fd(listener_fd);
                 return;
             }
         }
     }
 }
 
-fn notification_worker(
+fn try_queue_notification(
+    tx: &mpsc::SyncSender<SeccompNotif>,
     listener_fd: RawFd,
+    notif: SeccompNotif,
+    debug: bool,
+    queue_name: &str,
+) -> bool {
+    match tx.try_send(notif) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(notif)) => {
+            if debug {
+                eprintln!("seccomp-unotify-proxy: {queue_name} queue full");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+            true
+        }
+        Err(mpsc::TrySendError::Disconnected(notif)) => {
+            if debug {
+                eprintln!("seccomp-unotify-proxy: {queue_name} workers stopped");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            false
+        }
+    }
+}
+
+fn notification_worker(
+    listener_fd: Arc<OwnedFd>,
     rx: Arc<Mutex<mpsc::Receiver<SeccompNotif>>>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
@@ -209,7 +258,12 @@ fn notification_worker(
         let Ok(notif) = notif else {
             return;
         };
-        handle_notification(listener_fd, notif, Arc::clone(&cfg), Arc::clone(&relays));
+        handle_notification(
+            listener_fd.as_raw_fd(),
+            notif,
+            Arc::clone(&cfg),
+            Arc::clone(&relays),
+        );
     }
 }
 
@@ -1481,11 +1535,11 @@ fn socketpair() -> io::Result<(RawFd, RawFd)> {
     }
 }
 
-fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<RawFd> {
+fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<OwnedFd> {
     let mut raw = [0_u8; std::mem::size_of::<RawFd>()];
     read_exact_fd(sock, &mut raw)?;
     let child_listener_fd = RawFd::from_ne_bytes(raw);
-    Ok(duplicate_remote_fd(child_pid, child_listener_fd)?.into_raw_fd())
+    duplicate_remote_fd(child_pid, child_listener_fd)
 }
 
 fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
