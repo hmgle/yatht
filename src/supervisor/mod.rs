@@ -634,7 +634,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    let Some(handle) = relays.get(notif.pid, target_fd) else {
+    let Some((handle, relay_fd)) = relays.get_with_fd(notif.pid, target_fd) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
@@ -661,7 +661,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
         return;
     }
 
-    match recv_from_relay_fd(listener_fd, notif.id, notif.pid, target_fd, len, flags) {
+    match recv_from_relay_fd(listener_fd, notif.id, relay_fd.as_raw_fd(), len, flags) {
         Ok(received) => {
             let source = handle.response_source(flags);
             if let Err(err) = write_proc_bytes(notif.pid, buf_ptr, &received.payload) {
@@ -696,7 +696,7 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    let Some(handle) = relays.get(notif.pid, target_fd) else {
+    let Some((handle, relay_fd)) = relays.get_with_fd(notif.pid, target_fd) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
@@ -731,7 +731,7 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
         return;
     }
 
-    match recv_msg_from_relay_fd(listener_fd, notif.id, notif.pid, target_fd, capacity, flags) {
+    match recv_msg_from_relay_fd(listener_fd, notif.id, relay_fd.as_raw_fd(), capacity, flags) {
         Ok(received) => {
             let source = handle.response_source(flags);
             if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
@@ -897,10 +897,21 @@ impl UdpRelayRegistry {
         Ok(handle)
     }
 
-    fn get(&self, pid: u32, fd: RawFd) -> Option<UdpRelayHandle> {
+    /// Looks up the relay while reusing the single fd duplication for both the
+    /// identity check and the caller's subsequent recv. Avoids duplicating the
+    /// target fd twice (pidfd_open + pidfd_getfd + fstat) per datagram.
+    fn get_with_fd(&self, pid: u32, fd: RawFd) -> Option<(UdpRelayHandle, OwnedFd)> {
+        let duplicated = duplicate_remote_fd(pid, fd).ok()?;
+        let identity = fd_identity(duplicated.as_raw_fd()).ok()?;
         let key = relay_key(pid, fd);
         let mut relays = self.inner.lock().unwrap();
-        valid_relay_locked(&mut relays, key, pid, fd)
+        let handle = relays.get(&key).cloned()?;
+        if handle.target_identity == identity {
+            Some((handle, duplicated))
+        } else {
+            relays.remove(&key);
+            None
+        }
     }
 }
 
@@ -1149,13 +1160,11 @@ fn read_iovec_payload(pid: u32, iovecs: &[TargetIovec], total_len: usize) -> io:
 fn recv_from_relay_fd(
     listener_fd: RawFd,
     notif_id: u64,
-    pid: u32,
-    fd: RawFd,
+    relay_fd: RawFd,
     len: usize,
     flags: i32,
 ) -> io::Result<RelayRecvfrom> {
-    let duplicated = duplicate_remote_fd(pid, fd)?;
-    let nonblocking = recv_is_nonblocking(duplicated.as_raw_fd(), flags);
+    let nonblocking = recv_is_nonblocking(relay_fd, flags);
     let mut payload = vec![0_u8; len];
     loop {
         if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
@@ -1163,7 +1172,7 @@ fn recv_from_relay_fd(
         }
         let rc = unsafe {
             libc::recv(
-                duplicated.as_raw_fd(),
+                relay_fd,
                 payload.as_mut_ptr().cast(),
                 payload.len(),
                 flags | libc::MSG_DONTWAIT,
@@ -1175,7 +1184,7 @@ fn recv_from_relay_fd(
                 continue;
             }
             if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
-                wait_for_relay_readable(listener_fd, notif_id, duplicated.as_raw_fd())?;
+                wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
                 continue;
             }
             return Err(err);
@@ -1192,13 +1201,11 @@ fn recv_from_relay_fd(
 fn recv_msg_from_relay_fd(
     listener_fd: RawFd,
     notif_id: u64,
-    pid: u32,
-    fd: RawFd,
+    relay_fd: RawFd,
     capacity: usize,
     flags: i32,
 ) -> io::Result<RelayRecvmsg> {
-    let duplicated = duplicate_remote_fd(pid, fd)?;
-    let nonblocking = recv_is_nonblocking(duplicated.as_raw_fd(), flags);
+    let nonblocking = recv_is_nonblocking(relay_fd, flags);
     let mut payload = vec![0_u8; capacity];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
@@ -1212,15 +1219,14 @@ fn recv_msg_from_relay_fd(
         if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
         }
-        let rc =
-            unsafe { libc::recvmsg(duplicated.as_raw_fd(), &mut msg, flags | libc::MSG_DONTWAIT) };
+        let rc = unsafe { libc::recvmsg(relay_fd, &mut msg, flags | libc::MSG_DONTWAIT) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
-                wait_for_relay_readable(listener_fd, notif_id, duplicated.as_raw_fd())?;
+                wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
                 continue;
             }
             return Err(err);
