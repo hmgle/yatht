@@ -327,6 +327,80 @@ fn updates_connected_udp_destination_on_reconnect() {
     socks_thread.join().unwrap();
 }
 
+// A single unconnected UDP socket first sends to a proxied destination (which
+// turns the fd into an AF_UNIX relay socketpair), then reuses the same fd to
+// send to a direct-routed destination. The direct send must still reach its
+// peer -- the relay performs it -- rather than failing EINVAL on the AF_UNIX fd.
+#[test]
+fn direct_send_on_relayized_fd_reaches_peer() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_dual_dest_udp_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    // 127.0.0.0/8 is bypassed by default, so this destination routes direct.
+    let direct = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let direct_addr = direct.local_addr().unwrap();
+    let proxied_dest = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 4444));
+    let (dest_tx, dest_rx) = mpsc::channel();
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        let mut packet = vec![0_u8; 2048];
+        let (n, peer) = udp.recv_from(&mut packet).unwrap();
+        packet.truncate(n);
+        let (dest, _) = parse_udp_packet(&packet);
+        dest_tx.send(dest).unwrap();
+        let response = encode_udp_packet(dest, b"proxy-ok");
+        udp.send_to(&response, peer).unwrap();
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    // Plain UDP echo server standing in for the direct-routed peer.
+    let direct_thread = thread::spawn(move || {
+        let mut buf = vec![0_u8; 2048];
+        let (n, peer) = direct.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"direct-query");
+        direct.send_to(b"direct-ok", peer).unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--debug")
+        .arg("--")
+        .arg(&probe)
+        .arg(proxied_dest.to_string())
+        .arg("proxy-query")
+        .arg(direct_addr.to_string())
+        .arg("direct-query")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "proxy-ok:direct-ok");
+    assert_eq!(
+        dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        proxied_dest
+    );
+    socks_thread.join().unwrap();
+    direct_thread.join().unwrap();
+}
+
 fn build_udp_probe() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("udp_probe.rs");
@@ -346,6 +420,48 @@ fn main() {
     let mut buf = [0_u8; 2048];
     let (n, _) = socket.recv_from(&mut buf).unwrap();
     print!("{}", String::from_utf8_lossy(&buf[..n]));
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("rustc")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_dual_dest_udp_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("dual_dest_udp_probe.rs");
+    let bin = dir.path().join("dual_dest_udp_probe");
+    fs::write(
+        &src,
+        r#"
+use std::env;
+use std::net::UdpSocket;
+use std::time::Duration;
+
+fn main() {
+    let args = env::args().collect::<Vec<_>>();
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // First send goes to a proxied destination, turning the fd into a relay.
+    socket.send_to(args[2].as_bytes(), &args[1]).unwrap();
+    let mut buf = [0_u8; 2048];
+    let (n, _) = socket.recv_from(&mut buf).unwrap();
+    let first = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+    // Reuse the same fd for a direct-routed destination.
+    socket.send_to(args[4].as_bytes(), &args[3]).unwrap();
+    let (n, _) = socket.recv_from(&mut buf).unwrap();
+    let second = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+    print!("{first}:{second}");
 }
 "#,
     )

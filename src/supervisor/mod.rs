@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -348,6 +348,14 @@ fn handle_connect(
     };
 
     if direct_connect_can_continue_before_socket_type(&cfg, dest) {
+        // A direct route normally just continues, but if this fd was already
+        // turned into a relay socketpair the AF_UNIX socket cannot accept an
+        // AF_INET connect -- route the direct peer through the existing relay
+        // instead. A plain fd (including every TCP fd) has no relay entry and
+        // falls through to send_continue.
+        if direct_connect_through_relay(listener_fd, &notif, &relays, target_fd, dest) {
+            return;
+        }
         if cfg.debug {
             eprintln!(
                 "seccomp-unotify-proxy: direct {} for pid={} fd={}",
@@ -362,7 +370,7 @@ fn handle_connect(
 
     match socket_type(notif.pid, target_fd) {
         Some(libc::SOCK_DGRAM) => {
-            if udp_route_for(&cfg, dest).is_some() {
+            if let Some(kind) = udp_route_for(&cfg, dest) {
                 if !seccomp::notif_id_valid(listener_fd, notif.id) {
                     return;
                 }
@@ -380,7 +388,7 @@ fn handle_connect(
                     notif.id,
                     notif.pid,
                     target_fd,
-                    Some(dest),
+                    Some((dest, kind)),
                 ) {
                     Ok(_) => {
                         seccomp::send_success(listener_fd, notif.id);
@@ -395,6 +403,11 @@ fn handle_connect(
                 return;
             }
 
+            // Direct-routed UDP connect: reuse an existing relay for this fd if
+            // one exists (same AF_UNIX reason as above), else continue.
+            if direct_connect_through_relay(listener_fd, &notif, &relays, target_fd, dest) {
+                return;
+            }
             seccomp::send_continue(listener_fd, notif.id);
             return;
         }
@@ -505,10 +518,12 @@ fn handle_sendto(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    if udp_route_for(&cfg, dest).is_none() {
+    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest) else {
+        // Direct destination on a plain (non-relay) fd: the kernel socket is a
+        // real UDP socket, so let the syscall run unmodified.
         seccomp::send_continue(listener_fd, notif.id);
         return;
-    }
+    };
     if len > MAX_UDP_PAYLOAD {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
         return;
@@ -521,19 +536,84 @@ fn handle_sendto(
         return;
     }
 
-    match relays.ensure(listener_fd, &cfg, notif.id, notif.pid, target_fd, None) {
-        Ok(handle) => {
-            if handle.send(dest, payload).is_ok() {
-                seccomp::send_value(listener_fd, notif.id, len as i64);
-            } else {
-                seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
-            }
-        }
+    let handle = match relay_for_send(&cfg, &relays, listener_fd, &notif, target_fd, existing) {
+        Some(handle) => handle,
+        None => return,
+    };
+    if handle.send(dest, payload, route).is_ok() {
+        seccomp::send_value(listener_fd, notif.id, len as i64);
+    } else {
+        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+    }
+}
+
+/// Decides how a UDP send to `dest` must be handled.
+///
+/// A proxied/DNS destination always routes through a relay (created on demand).
+/// A direct destination only routes through a relay when the fd has *already*
+/// been turned into an AF_UNIX relay socketpair by an earlier proxied send or
+/// connect -- that fd can no longer carry an AF_INET sendto, so the relay must
+/// perform the direct send. On a plain fd a direct destination returns `None`,
+/// telling the caller to let the original syscall run.
+fn resolve_udp_send(
+    cfg: &EffectiveConfig,
+    relays: &UdpRelayRegistry,
+    pid: u32,
+    fd: RawFd,
+    dest: Destination,
+) -> Option<(Option<UdpRelayHandle>, UdpRouteKind)> {
+    match udp_route_for(cfg, dest) {
+        Some(kind) => Some((None, kind)),
+        None => relays
+            .lookup_handle(pid, fd, true)
+            .map(|handle| (Some(handle), UdpRouteKind::Direct)),
+    }
+}
+
+/// If `fd` already has a relay, records `dest` as the relay's default direct
+/// peer and emulates a successful connect (the injected AF_UNIX fd cannot accept
+/// an AF_INET connect itself). Returns `true` when it handled the notification.
+/// Returns `false` for a plain fd so the caller can continue the syscall.
+fn direct_connect_through_relay(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    relays: &UdpRelayRegistry,
+    fd: RawFd,
+    dest: Destination,
+) -> bool {
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        return false;
+    };
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return true;
+    }
+    handle.set_default_dest(dest, UdpRouteKind::Direct);
+    seccomp::send_success(listener_fd, notif.id);
+    true
+}
+
+/// Resolves the relay handle a send should use: an already-relay-ized fd reuses
+/// its existing handle, otherwise a relay is created (injecting the socketpair).
+/// Emits the seccomp error response itself on failure and returns `None`.
+fn relay_for_send(
+    cfg: &EffectiveConfig,
+    relays: &UdpRelayRegistry,
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    target_fd: RawFd,
+    existing: Option<UdpRelayHandle>,
+) -> Option<UdpRelayHandle> {
+    if let Some(handle) = existing {
+        return Some(handle);
+    }
+    match relays.ensure(listener_fd, cfg, notif.id, notif.pid, target_fd, None) {
+        Ok(handle) => Some(handle),
         Err(err) => {
             if cfg.debug {
                 eprintln!("seccomp-unotify-proxy: UDP relay setup failed: {err:#}");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            None
         }
     }
 }
@@ -578,10 +658,10 @@ fn handle_sendmsg(
             return;
         }
     };
-    if udp_route_for(&cfg, dest).is_none() {
+    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
-    }
+    };
 
     let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
@@ -611,20 +691,14 @@ fn handle_sendmsg(
     }
 
     let written = payload.len() as i64;
-    match relays.ensure(listener_fd, &cfg, notif.id, notif.pid, target_fd, None) {
-        Ok(handle) => {
-            if handle.send(dest, payload).is_ok() {
-                seccomp::send_value(listener_fd, notif.id, written);
-            } else {
-                seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
-            }
-        }
-        Err(err) => {
-            if cfg.debug {
-                eprintln!("seccomp-unotify-proxy: UDP relay setup failed: {err:#}");
-            }
-            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
-        }
+    let handle = match relay_for_send(&cfg, &relays, listener_fd, &notif, target_fd, existing) {
+        Some(handle) => handle,
+        None => return,
+    };
+    if handle.send(dest, payload, route).is_ok() {
+        seccomp::send_value(listener_fd, notif.id, written);
+    } else {
+        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
     }
 }
 
@@ -824,8 +898,15 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UdpRouteKind {
+    /// Resolve over the configured DNS-over-TCP proxy path.
     Dns,
+    /// Forward through the SOCKS5 UDP association.
     Generic,
+    /// Send straight to the destination on a plain UDP socket. Used when an fd
+    /// has already been turned into a relay socketpair but the target now sends
+    /// to a direct-routed destination: the injected AF_UNIX fd cannot carry an
+    /// AF_INET sendto/connect, so the relay must perform the direct send itself.
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -865,7 +946,7 @@ struct UdpRelayRegistry {
 #[derive(Clone)]
 struct UdpRelayHandle {
     tx: mpsc::Sender<UdpJob>,
-    default_dest: Arc<Mutex<Option<Destination>>>,
+    default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     relay_fd: Arc<OwnedFd>,
     target_identity: FdIdentity,
@@ -875,14 +956,13 @@ struct UdpRelayHandle {
 struct UdpJob {
     dest: Destination,
     payload: Vec<u8>,
+    route: UdpRouteKind,
 }
 
 #[derive(Clone)]
 struct UdpRelayConfig {
     proxy: crate::config::ProxyConfig,
     dns_server: Destination,
-    enable_dns: bool,
-    enable_udp: bool,
     timeout: Duration,
     debug: bool,
 }
@@ -929,8 +1009,6 @@ fn build_udp_relay_config(cfg: &EffectiveConfig) -> Result<UdpRelayConfig> {
     Ok(UdpRelayConfig {
         proxy: cfg.proxy.clone(),
         dns_server,
-        enable_dns: cfg.enable_dns,
-        enable_udp: cfg.enable_udp,
         timeout: cfg.connect_timeout,
         debug: cfg.debug,
     })
@@ -944,13 +1022,13 @@ impl UdpRelayRegistry {
         notif_id: u64,
         pid: u32,
         fd: RawFd,
-        default_dest: Option<Destination>,
+        default_dest: Option<(Destination, UdpRouteKind)>,
     ) -> Result<UdpRelayHandle> {
         // Fast path: reuse an existing relay. This still validates the target
         // fd identity, but it no longer returns an unused duplicate to ensure().
         if let Some(handle) = self.lookup_handle(pid, fd, true) {
-            if let Some(dest) = default_dest {
-                handle.set_default_dest(dest);
+            if let Some((dest, route)) = default_dest {
+                handle.set_default_dest(dest, route);
             }
             return Ok(handle);
         }
@@ -967,8 +1045,8 @@ impl UdpRelayRegistry {
             let mut relays = self.inner.lock().unwrap();
             loop {
                 if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
-                    if let Some(dest) = default_dest {
-                        handle.set_default_dest(dest);
+                    if let Some((dest, route)) = default_dest {
+                        handle.set_default_dest(dest, route);
                     }
                     return Ok(handle);
                 }
@@ -1156,13 +1234,17 @@ impl Drop for CreatingGuard<'_> {
 }
 
 impl UdpRelayHandle {
-    fn set_default_dest(&self, dest: Destination) {
-        *self.default_dest.lock().unwrap() = Some(dest);
+    fn set_default_dest(&self, dest: Destination, route: UdpRouteKind) {
+        *self.default_dest.lock().unwrap() = Some((dest, route));
     }
 
-    fn send(&self, dest: Destination, payload: Vec<u8>) -> Result<()> {
+    fn send(&self, dest: Destination, payload: Vec<u8>, route: UdpRouteKind) -> Result<()> {
         self.tx
-            .send(UdpJob { dest, payload })
+            .send(UdpJob {
+                dest,
+                payload,
+                route,
+            })
             .map_err(|_| anyhow!("UDP relay worker exited"))
     }
 
@@ -1195,7 +1277,7 @@ impl UdpRelayHandle {
 fn start_udp_relay(
     cfg: UdpRelayConfig,
     relay_socket: OwnedFd,
-    default_dest: Option<Destination>,
+    default_dest: Option<(Destination, UdpRouteKind)>,
     target_identity: FdIdentity,
 ) -> UdpRelayHandle {
     let relay_fd = Arc::new(relay_socket);
@@ -1222,11 +1304,18 @@ fn start_udp_relay(
             if read_shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            let Some(dest) = *read_default_dest.lock().unwrap() else {
+            let Some((dest, route)) = *read_default_dest.lock().unwrap() else {
                 continue;
             };
             let payload = buf[..n].to_vec();
-            if read_tx.send(UdpJob { dest, payload }).is_err() {
+            if read_tx
+                .send(UdpJob {
+                    dest,
+                    payload,
+                    route,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -1237,12 +1326,13 @@ fn start_udp_relay(
     let write_shutdown = Arc::clone(&shutdown);
     thread::spawn(move || {
         let mut socks_udp = None;
+        let mut direct_udp = None;
         for job in rx {
             if write_shutdown.load(Ordering::SeqCst) {
                 break;
             }
             let source = job.dest;
-            match forward_udp_job(&cfg, &mut socks_udp, job) {
+            match forward_udp_job(&cfg, &mut socks_udp, &mut direct_udp, job) {
                 Ok(Some(response)) => {
                     let mut pending = write_pending_sources.lock().unwrap();
                     // Drop the response if the target is not draining fast
@@ -1321,13 +1411,17 @@ fn send_relay_response(fd: RawFd, response: &[u8]) -> bool {
 fn forward_udp_job(
     cfg: &UdpRelayConfig,
     socks_udp: &mut Option<proxy::Socks5UdpAssociation>,
+    direct_udp: &mut Option<UdpSocket>,
     job: UdpJob,
 ) -> Result<Option<Vec<u8>>> {
-    match udp_route_for_relay(cfg, job.dest) {
-        Some(UdpRouteKind::Dns) => {
+    // The route was decided by the notification handler, which has the full
+    // routing table. Honour it verbatim so a datagram bound for a direct route
+    // is never accidentally tunnelled through the proxy (and vice versa).
+    match job.route {
+        UdpRouteKind::Dns => {
             proxy::dns_over_tcp(&cfg.proxy, cfg.dns_server, &job.payload, cfg.timeout).map(Some)
         }
-        Some(UdpRouteKind::Generic) => {
+        UdpRouteKind::Generic => {
             if socks_udp.is_none() {
                 *socks_udp = Some(proxy::Socks5UdpAssociation::connect(
                     &cfg.proxy,
@@ -1339,7 +1433,54 @@ fn forward_udp_job(
                 .expect("SOCKS5 UDP association initialized")
                 .send_datagram(job.dest, &job.payload, cfg.timeout)
         }
-        None => Ok(None),
+        UdpRouteKind::Direct => forward_direct_udp(direct_udp, job.dest, &job.payload, cfg.timeout),
+    }
+}
+
+/// Sends a datagram straight to its destination on a plain UDP socket, reusing a
+/// cached socket across jobs and rebinding only when the address family changes.
+/// Mirrors the single request/response model of the proxy paths: one datagram is
+/// read back (within the timeout) so the connected-UDP return path stays fed.
+fn forward_direct_udp(
+    direct_udp: &mut Option<UdpSocket>,
+    dest: Destination,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Option<Vec<u8>>> {
+    let family_matches = direct_udp
+        .as_ref()
+        .and_then(|sock| sock.local_addr().ok())
+        .map(|addr| addr.is_ipv4() == dest.ip.is_ipv4())
+        .unwrap_or(false);
+    if !family_matches {
+        let bind = if dest.ip.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let sock = UdpSocket::bind(bind)?;
+        sock.set_read_timeout(Some(timeout))?;
+        sock.set_write_timeout(Some(timeout))?;
+        *direct_udp = Some(sock);
+    }
+    let sock = direct_udp
+        .as_ref()
+        .expect("direct UDP socket initialized above");
+    sock.send_to(payload, SocketAddr::new(dest.ip, dest.port))?;
+
+    let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
+    match sock.recv_from(&mut buf) {
+        Ok((n, _)) => {
+            buf.truncate(n);
+            Ok(Some(buf))
+        }
+        Err(err)
+            if err.kind() == io::ErrorKind::WouldBlock
+                || err.kind() == io::ErrorKind::TimedOut =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1358,16 +1499,6 @@ fn direct_connect_can_continue_before_socket_type(
     dest: Destination,
 ) -> bool {
     cfg.route_for(dest.ip) == Route::Direct && !(cfg.enable_dns && dest.port == 53)
-}
-
-fn udp_route_for_relay(cfg: &UdpRelayConfig, dest: Destination) -> Option<UdpRouteKind> {
-    if cfg.enable_dns && dest.port == 53 {
-        Some(UdpRouteKind::Dns)
-    } else if cfg.enable_udp {
-        Some(UdpRouteKind::Generic)
-    } else {
-        None
-    }
 }
 
 fn make_relay_pair() -> io::Result<(OwnedFd, OwnedFd)> {
