@@ -868,7 +868,6 @@ struct UdpRelayHandle {
     default_dest: Arc<Mutex<Option<Destination>>>,
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     relay_fd: Arc<OwnedFd>,
-    target_pidfd: Arc<OwnedFd>,
     target_identity: FdIdentity,
     shutdown: Arc<AtomicBool>,
 }
@@ -898,6 +897,7 @@ fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
 fn valid_relay_locked(
     relays: &mut HashMap<RelayKey, RelayState>,
     key: RelayKey,
+    pid: u32,
     fd: RawFd,
 ) -> Option<UdpRelayHandle> {
     let handle = match relays.get(&key) {
@@ -906,7 +906,7 @@ fn valid_relay_locked(
         // the condvar rather than treat this as a hit or a miss.
         Some(RelayState::Creating) | None => return None,
     };
-    if handle.target_fd_matches(fd) {
+    if handle.target_fd_matches(pid, fd) {
         Some(handle)
     } else {
         if let Some(RelayState::Ready(stale)) = relays.remove(&key) {
@@ -966,7 +966,7 @@ impl UdpRelayRegistry {
         {
             let mut relays = self.inner.lock().unwrap();
             loop {
-                if let Some(handle) = valid_relay_locked(&mut relays, key, fd) {
+                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
                     if let Some(dest) = default_dest {
                         handle.set_default_dest(dest);
                     }
@@ -996,7 +996,6 @@ impl UdpRelayRegistry {
         let relay_cfg = build_udp_relay_config(cfg)?;
         let (relay_socket, target_fd) =
             make_relay_pair().context("create UDP relay datagram socketpair")?;
-        let target_pidfd = pidfd_open(key.tgid, 0).context("open target pidfd")?;
         let target_flags = read_target_fd_flags(pid, fd);
         if target_flags.status_flags & libc::O_NONBLOCK != 0 {
             let _ = set_nonblocking(target_fd.as_raw_fd());
@@ -1014,13 +1013,7 @@ impl UdpRelayRegistry {
         seccomp::notif_addfd(listener_fd, &mut addfd).context("inject UDP relay fd")?;
         drop(target_fd);
 
-        let handle = start_udp_relay(
-            relay_cfg,
-            relay_socket,
-            default_dest,
-            target_identity,
-            target_pidfd,
-        );
+        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
         // Publish the ready relay and hand the marker off to Ready in one
         // critical section so waiters wake to a usable handle.
         guard.commit(RelayState::Ready(handle.clone()));
@@ -1056,7 +1049,7 @@ impl UdpRelayRegistry {
                 }
             }
         };
-        let duplicated = match handle.duplicate_target_fd(fd) {
+        let duplicated = match handle.duplicate_target_fd(pid, fd) {
             Ok(duplicated) => duplicated,
             Err(_) => {
                 self.remove_ready_if_current(key, handle.target_identity);
@@ -1095,7 +1088,7 @@ impl UdpRelayRegistry {
                 }
             }
         };
-        match handle.remote_fd_identity(fd) {
+        match handle.remote_fd_identity(pid, fd) {
             Ok(identity) if identity == handle.target_identity => Some(handle),
             _ => {
                 self.remove_ready_if_current(key, handle.target_identity);
@@ -1173,17 +1166,23 @@ impl UdpRelayHandle {
             .map_err(|_| anyhow!("UDP relay worker exited"))
     }
 
-    fn duplicate_target_fd(&self, fd: RawFd) -> io::Result<OwnedFd> {
-        duplicate_remote_fd_from_pidfd(self.target_pidfd.as_raw_fd(), fd)
+    /// Duplicates the target fd from the *currently notifying* thread rather than
+    /// a cached thread-group-leader pidfd. The leader can exit (becoming a zombie
+    /// with no accessible fd table) while worker threads keep using the relay, and
+    /// a thread may not share the leader's fd table at all; the notifying thread is
+    /// guaranteed alive for the duration of the seccomp stop, so its fd table is the
+    /// reliable source for the duplicate.
+    fn duplicate_target_fd(&self, pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
+        duplicate_remote_fd(pid, fd)
     }
 
-    fn remote_fd_identity(&self, fd: RawFd) -> io::Result<FdIdentity> {
-        let duplicated = self.duplicate_target_fd(fd)?;
+    fn remote_fd_identity(&self, pid: u32, fd: RawFd) -> io::Result<FdIdentity> {
+        let duplicated = self.duplicate_target_fd(pid, fd)?;
         fd_identity(duplicated.as_raw_fd())
     }
 
-    fn target_fd_matches(&self, fd: RawFd) -> bool {
-        matches!(self.remote_fd_identity(fd), Ok(identity) if identity == self.target_identity)
+    fn target_fd_matches(&self, pid: u32, fd: RawFd) -> bool {
+        matches!(self.remote_fd_identity(pid, fd), Ok(identity) if identity == self.target_identity)
     }
 
     fn shutdown(&self) {
@@ -1198,10 +1197,8 @@ fn start_udp_relay(
     relay_socket: OwnedFd,
     default_dest: Option<Destination>,
     target_identity: FdIdentity,
-    target_pidfd: OwnedFd,
 ) -> UdpRelayHandle {
     let relay_fd = Arc::new(relay_socket);
-    let target_pidfd = Arc::new(target_pidfd);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<UdpJob>();
     let default_dest = Arc::new(Mutex::new(default_dest));
@@ -1282,7 +1279,6 @@ fn start_udp_relay(
         default_dest,
         pending_sources,
         relay_fd,
-        target_pidfd,
         target_identity,
         shutdown,
     }
@@ -2443,7 +2439,6 @@ mod tests {
             default_dest: Arc::new(Mutex::new(None)),
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
-            target_pidfd: Arc::new(pidfd_open(std::process::id(), 0).unwrap()),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
