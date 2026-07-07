@@ -2,12 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -627,6 +628,48 @@ fn handle_sendmsg(
     }
 }
 
+fn lookup_relay_for_recv(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    relays: &UdpRelayRegistry,
+    target_fd: RawFd,
+    flags: i32,
+) -> Option<(UdpRelayHandle, OwnedFd)> {
+    match relays.lookup(notif.pid, target_fd, false) {
+        RelayLookup::Ready(handle, relay_fd) => Some((handle, relay_fd)),
+        RelayLookup::Missing => {
+            seccomp::send_continue(listener_fd, notif.id);
+            None
+        }
+        RelayLookup::Creating => match recv_request_is_nonblocking(notif.pid, target_fd, flags) {
+            Ok(true) => {
+                seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+                None
+            }
+            Ok(false) => match relays.lookup(notif.pid, target_fd, true) {
+                RelayLookup::Ready(handle, relay_fd) => Some((handle, relay_fd)),
+                RelayLookup::Missing => {
+                    seccomp::send_continue(listener_fd, notif.id);
+                    None
+                }
+                RelayLookup::Creating => unreachable!("waited lookup cannot return Creating"),
+            },
+            Err(err) => {
+                seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err));
+                None
+            }
+        },
+    }
+}
+
+fn recv_request_is_nonblocking(pid: u32, fd: RawFd, flags: i32) -> io::Result<bool> {
+    if flags & libc::MSG_DONTWAIT != 0 {
+        return Ok(true);
+    }
+    let duplicated = duplicate_remote_fd(pid, fd)?;
+    Ok(fd_status_flags(duplicated.as_raw_fd())? & libc::O_NONBLOCK != 0)
+}
+
 fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
     let target_fd = notif.data.args[0] as RawFd;
     let buf_ptr = notif.data.args[1];
@@ -638,8 +681,9 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    let Some((handle, relay_fd)) = relays.lookup(notif.pid, target_fd) else {
-        seccomp::send_continue(listener_fd, notif.id);
+    let Some((handle, relay_fd)) =
+        lookup_relay_for_recv(listener_fd, &notif, &relays, target_fd, flags)
+    else {
         return;
     };
     // A single UDP datagram never exceeds MAX_UDP_PAYLOAD, so cap the local
@@ -709,8 +753,9 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    let Some((handle, relay_fd)) = relays.lookup(notif.pid, target_fd) else {
-        seccomp::send_continue(listener_fd, notif.id);
+    let Some((handle, relay_fd)) =
+        lookup_relay_for_recv(listener_fd, &notif, &relays, target_fd, flags)
+    else {
         return;
     };
     if msg_ptr == 0 {
@@ -805,6 +850,12 @@ enum RelayState {
     Ready(UdpRelayHandle),
 }
 
+enum RelayLookup {
+    Ready(UdpRelayHandle, OwnedFd),
+    Creating,
+    Missing,
+}
+
 #[derive(Default)]
 struct UdpRelayRegistry {
     inner: Mutex<HashMap<RelayKey, RelayState>>,
@@ -816,7 +867,10 @@ struct UdpRelayHandle {
     tx: mpsc::Sender<UdpJob>,
     default_dest: Arc<Mutex<Option<Destination>>>,
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
+    relay_fd: Arc<OwnedFd>,
+    target_pidfd: Arc<OwnedFd>,
     target_identity: FdIdentity,
+    shutdown: Arc<AtomicBool>,
 }
 
 struct UdpJob {
@@ -844,7 +898,6 @@ fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
 fn valid_relay_locked(
     relays: &mut HashMap<RelayKey, RelayState>,
     key: RelayKey,
-    pid: u32,
     fd: RawFd,
 ) -> Option<UdpRelayHandle> {
     let handle = match relays.get(&key) {
@@ -853,10 +906,12 @@ fn valid_relay_locked(
         // the condvar rather than treat this as a hit or a miss.
         Some(RelayState::Creating) | None => return None,
     };
-    if handle.target_fd_matches(pid, fd) {
+    if handle.target_fd_matches(fd) {
         Some(handle)
     } else {
-        relays.remove(&key);
+        if let Some(RelayState::Ready(stale)) = relays.remove(&key) {
+            stale.shutdown();
+        }
         None
     }
 }
@@ -891,10 +946,9 @@ impl UdpRelayRegistry {
         fd: RawFd,
         default_dest: Option<Destination>,
     ) -> Result<UdpRelayHandle> {
-        // Fast path: reuse an existing relay. lookup() probes the map under the
-        // lock and only duplicates the target fd (for the identity check)
-        // outside the lock, so a hit does not serialize other lookups.
-        if let Some((handle, _fd)) = self.lookup(pid, fd) {
+        // Fast path: reuse an existing relay. This still validates the target
+        // fd identity, but it no longer returns an unused duplicate to ensure().
+        if let Some(handle) = self.lookup_handle(pid, fd, true) {
             if let Some(dest) = default_dest {
                 handle.set_default_dest(dest);
             }
@@ -904,15 +958,15 @@ impl UdpRelayRegistry {
         let key = relay_key(pid, fd);
 
         // Claim the key under the lock before building anything. Publishing a
-        // Creating marker keeps the expensive setup (two UDP binds, reading the
-        // target fd flags via pidfd + /proc, fstat) outside the lock -- so it
-        // never blocks lookups for unrelated keys -- while still making a
+        // Creating marker keeps the expensive setup (datagram socketpair,
+        // reading the target fd flags via pidfd + /proc, fstat) outside the lock
+        // -- so it never blocks lookups for unrelated keys -- while still making a
         // concurrent lookup for THIS key wait for the relay instead of missing
         // the empty map and continuing its recv on the original fd.
         {
             let mut relays = self.inner.lock().unwrap();
             loop {
-                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
+                if let Some(handle) = valid_relay_locked(&mut relays, key, fd) {
                     if let Some(dest) = default_dest {
                         handle.set_default_dest(dest);
                     }
@@ -940,10 +994,9 @@ impl UdpRelayRegistry {
         let mut guard = CreatingGuard::new(self, key);
 
         let relay_cfg = build_udp_relay_config(cfg)?;
-        let (relay_socket, target_fd) = make_udp_pair().context("create UDP relay socket pair")?;
-        // Own the raw target fd so it is closed on every exit path (injection
-        // failure or after a successful ADDFD copy).
-        let target_fd = unsafe { OwnedFd::from_raw_fd(target_fd) };
+        let (relay_socket, target_fd) =
+            make_relay_pair().context("create UDP relay datagram socketpair")?;
+        let target_pidfd = pidfd_open(key.tgid, 0).context("open target pidfd")?;
         let target_flags = read_target_fd_flags(pid, fd);
         if target_flags.status_flags & libc::O_NONBLOCK != 0 {
             let _ = set_nonblocking(target_fd.as_raw_fd());
@@ -961,7 +1014,13 @@ impl UdpRelayRegistry {
         seccomp::notif_addfd(listener_fd, &mut addfd).context("inject UDP relay fd")?;
         drop(target_fd);
 
-        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
+        let handle = start_udp_relay(
+            relay_cfg,
+            relay_socket,
+            default_dest,
+            target_identity,
+            target_pidfd,
+        );
         // Publish the ready relay and hand the marker off to Ready in one
         // critical section so waiters wake to a usable handle.
         guard.commit(RelayState::Ready(handle.clone()));
@@ -976,7 +1035,7 @@ impl UdpRelayRegistry {
     /// duplicating again. A stale entry (fd reused for a different socket) is
     /// removed, but only if the entry we saw is still the current one, so a
     /// concurrent insert of a fresh relay is never clobbered.
-    fn lookup(&self, pid: u32, fd: RawFd) -> Option<(UdpRelayHandle, OwnedFd)> {
+    fn lookup(&self, pid: u32, fd: RawFd, wait_creating: bool) -> RelayLookup {
         let key = relay_key(pid, fd);
         let handle = {
             let mut relays = self.inner.lock().unwrap();
@@ -988,23 +1047,75 @@ impl UdpRelayRegistry {
                     // the original fd and then block forever once the relay
                     // socket is injected.
                     Some(RelayState::Creating) => {
+                        if !wait_creating {
+                            return RelayLookup::Creating;
+                        }
+                        relays = self.created.wait(relays).unwrap();
+                    }
+                    None => return RelayLookup::Missing,
+                }
+            }
+        };
+        let duplicated = match handle.duplicate_target_fd(fd) {
+            Ok(duplicated) => duplicated,
+            Err(_) => {
+                self.remove_ready_if_current(key, handle.target_identity);
+                return RelayLookup::Missing;
+            }
+        };
+        let identity = match fd_identity(duplicated.as_raw_fd()) {
+            Ok(identity) => identity,
+            Err(_) => {
+                self.remove_ready_if_current(key, handle.target_identity);
+                return RelayLookup::Missing;
+            }
+        };
+        if handle.target_identity == identity {
+            RelayLookup::Ready(handle, duplicated)
+        } else {
+            self.remove_ready_if_current(key, handle.target_identity);
+            RelayLookup::Missing
+        }
+    }
+
+    fn lookup_handle(&self, pid: u32, fd: RawFd, wait_creating: bool) -> Option<UdpRelayHandle> {
+        let key = relay_key(pid, fd);
+        let handle = {
+            let mut relays = self.inner.lock().unwrap();
+            loop {
+                match relays.get(&key) {
+                    Some(RelayState::Ready(handle)) => break handle.clone(),
+                    Some(RelayState::Creating) => {
+                        if !wait_creating {
+                            return None;
+                        }
                         relays = self.created.wait(relays).unwrap();
                     }
                     None => return None,
                 }
             }
         };
-        let duplicated = duplicate_remote_fd(pid, fd).ok()?;
-        let identity = fd_identity(duplicated.as_raw_fd()).ok()?;
-        if handle.target_identity == identity {
-            Some((handle, duplicated))
-        } else {
-            let mut relays = self.inner.lock().unwrap();
-            if matches!(relays.get(&key), Some(RelayState::Ready(current)) if current.target_identity == handle.target_identity)
-            {
-                relays.remove(&key);
+        match handle.remote_fd_identity(fd) {
+            Ok(identity) if identity == handle.target_identity => Some(handle),
+            _ => {
+                self.remove_ready_if_current(key, handle.target_identity);
+                None
             }
-            None
+        }
+    }
+
+    fn remove_ready_if_current(&self, key: RelayKey, target_identity: FdIdentity) {
+        let removed = {
+            let mut relays = self.inner.lock().unwrap();
+            if matches!(relays.get(&key), Some(RelayState::Ready(current)) if current.target_identity == target_identity)
+            {
+                relays.remove(&key)
+            } else {
+                None
+            }
+        };
+        if let Some(RelayState::Ready(handle)) = removed {
+            handle.shutdown();
         }
     }
 }
@@ -1062,29 +1173,48 @@ impl UdpRelayHandle {
             .map_err(|_| anyhow!("UDP relay worker exited"))
     }
 
-    fn target_fd_matches(&self, pid: u32, fd: RawFd) -> bool {
-        matches!(remote_fd_identity(pid, fd), Ok(identity) if identity == self.target_identity)
+    fn duplicate_target_fd(&self, fd: RawFd) -> io::Result<OwnedFd> {
+        duplicate_remote_fd_from_pidfd(self.target_pidfd.as_raw_fd(), fd)
+    }
+
+    fn remote_fd_identity(&self, fd: RawFd) -> io::Result<FdIdentity> {
+        let duplicated = self.duplicate_target_fd(fd)?;
+        fd_identity(duplicated.as_raw_fd())
+    }
+
+    fn target_fd_matches(&self, fd: RawFd) -> bool {
+        matches!(self.remote_fd_identity(fd), Ok(identity) if identity == self.target_identity)
+    }
+
+    fn shutdown(&self) {
+        if !self.shutdown.swap(true, Ordering::SeqCst) {
+            let _ = unsafe { libc::shutdown(self.relay_fd.as_raw_fd(), libc::SHUT_RDWR) };
+        }
     }
 }
 
 fn start_udp_relay(
     cfg: UdpRelayConfig,
-    relay_socket: UdpSocket,
+    relay_socket: OwnedFd,
     default_dest: Option<Destination>,
     target_identity: FdIdentity,
+    target_pidfd: OwnedFd,
 ) -> UdpRelayHandle {
-    let socket = Arc::new(relay_socket);
+    let relay_fd = Arc::new(relay_socket);
+    let target_pidfd = Arc::new(target_pidfd);
+    let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<UdpJob>();
     let default_dest = Arc::new(Mutex::new(default_dest));
     let pending_sources = Arc::new(Mutex::new(VecDeque::new()));
 
-    let read_socket = Arc::clone(&socket);
+    let read_fd = Arc::clone(&relay_fd);
     let read_tx = tx.clone();
     let read_default_dest = Arc::clone(&default_dest);
+    let read_shutdown = Arc::clone(&shutdown);
     thread::spawn(move || {
         let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
         loop {
-            let n = match read_socket.recv(&mut buf) {
+            let n = match recv_relay_socket(read_fd.as_raw_fd(), &mut buf) {
                 Ok(n) => n,
                 // A signal can interrupt the blocking recv; retry rather than
                 // terminating the reader, which would silently break the
@@ -1092,6 +1222,9 @@ fn start_udp_relay(
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
+            if read_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
             let Some(dest) = *read_default_dest.lock().unwrap() else {
                 continue;
             };
@@ -1103,17 +1236,21 @@ fn start_udp_relay(
     });
 
     let write_pending_sources = Arc::clone(&pending_sources);
+    let write_fd = Arc::clone(&relay_fd);
+    let write_shutdown = Arc::clone(&shutdown);
     thread::spawn(move || {
         let mut socks_udp = None;
         for job in rx {
+            if write_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
             let source = job.dest;
             match forward_udp_job(&cfg, &mut socks_udp, job) {
                 Ok(Some(response)) => {
                     let mut pending = write_pending_sources.lock().unwrap();
                     // Drop the response if the target is not draining fast
-                    // enough: enqueuing past the cap only grows the source queue
-                    // while the kernel receive buffer would drop the datagram
-                    // anyway, desyncing sources from payloads.
+                    // enough. The socketpair send below uses MSG_DONTWAIT, so a
+                    // successful send means the datagram is actually queued.
                     if pending.len() >= MAX_PENDING_SOURCES {
                         if cfg.debug {
                             eprintln!(
@@ -1123,8 +1260,11 @@ fn start_udp_relay(
                         continue;
                     }
                     pending.push_back(source);
-                    if !send_relay_response(&socket, &response) {
+                    if !send_relay_response(write_fd.as_raw_fd(), &response) {
                         let _ = pending.pop_back();
+                        if write_shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -1141,20 +1281,44 @@ fn start_udp_relay(
         tx,
         default_dest,
         pending_sources,
+        relay_fd,
+        target_pidfd,
         target_identity,
+        shutdown,
     }
 }
 
-/// Sends the relay response back to the target, retrying on EINTR. A signal
-/// interrupting this blocking send would otherwise drop the response (mirrors
-/// the reader-side EINTR retry), leaving the target's recvfrom without data.
-fn send_relay_response(socket: &UdpSocket, response: &[u8]) -> bool {
+fn recv_relay_socket(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    let rc = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc as usize)
+    }
+}
+
+/// Sends the relay response back to the target without blocking. AF_UNIX
+/// datagram socketpairs report a full peer queue as EAGAIN instead of silently
+/// dropping the packet, so a successful send keeps pending_sources synchronized
+/// with the queued datagram stream.
+fn send_relay_response(fd: RawFd, response: &[u8]) -> bool {
     loop {
-        match socket.send(response) {
-            Ok(_) => return true,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+        let rc = unsafe {
+            libc::send(
+                fd,
+                response.as_ptr().cast(),
+                response.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if rc >= 0 {
+            return rc as usize == response.len();
         }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return false;
     }
 }
 
@@ -1210,13 +1374,21 @@ fn udp_route_for_relay(cfg: &UdpRelayConfig, dest: Destination) -> Option<UdpRou
     }
 }
 
-fn make_udp_pair() -> io::Result<(UdpSocket, RawFd)> {
-    let relay = UdpSocket::bind("127.0.0.1:0")?;
-    let target = UdpSocket::bind("127.0.0.1:0")?;
-    relay.connect(target.local_addr()?)?;
-    target.connect(relay.local_addr()?)?;
-    let target_fd = target.into_raw_fd();
-    Ok((relay, target_fd))
+fn make_relay_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    }
 }
 
 fn read_send_destination(pid: u32, addr: u64, addr_len: usize) -> Option<Destination> {
@@ -1630,11 +1802,6 @@ fn fd_identity(fd: RawFd) -> io::Result<FdIdentity> {
     }
 }
 
-fn remote_fd_identity(pid: u32, fd: RawFd) -> io::Result<FdIdentity> {
-    let duplicated = duplicate_remote_fd(pid, fd)?;
-    fd_identity(duplicated.as_raw_fd())
-}
-
 fn fd_status_flags(fd: RawFd) -> io::Result<i32> {
     let rc = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if rc < 0 {
@@ -2020,7 +2187,11 @@ fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
         Err(err) if err.raw_os_error() == Some(libc::EINVAL) => pidfd_open(pid, 0)?,
         Err(err) => return Err(err),
     };
-    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    duplicate_remote_fd_from_pidfd(pidfd.as_raw_fd(), fd)
+}
+
+fn duplicate_remote_fd_from_pidfd(pidfd: RawFd, fd: RawFd) -> io::Result<OwnedFd> {
+    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0) };
     if duplicated < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -2147,6 +2318,91 @@ mod tests {
     }
 
     #[test]
+    fn relay_lookup_reports_creating_without_waiting() {
+        let registry = UdpRelayRegistry::default();
+        let key = relay_key(std::process::id(), 9);
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .insert(key, RelayState::Creating);
+
+        assert!(matches!(
+            registry.lookup(std::process::id(), 9, false),
+            RelayLookup::Creating
+        ));
+    }
+
+    #[test]
+    fn relay_lookup_removes_stale_entry_when_dup_fails() {
+        let registry = UdpRelayRegistry::default();
+        let key = relay_key(std::process::id(), -1);
+        let handle = test_relay_handle();
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .insert(key, RelayState::Ready(handle.clone()));
+
+        assert!(matches!(
+            registry.lookup(std::process::id(), -1, false),
+            RelayLookup::Missing
+        ));
+        assert!(!registry.inner.lock().unwrap().contains_key(&key));
+        assert!(handle.shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_socketpair_send_reports_full_queue() {
+        let (relay, target) = make_relay_pair().unwrap();
+        let rcvbuf: libc::c_int = 4096;
+        let rc = unsafe {
+            libc::setsockopt(
+                target.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&rcvbuf as *const libc::c_int).cast(),
+                std::mem::size_of_val(&rcvbuf) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        let payload = vec![1_u8; 1400];
+        let mut sent = 0;
+        for _ in 0..10_000 {
+            if !send_relay_response(relay.as_raw_fd(), &payload) {
+                break;
+            }
+            sent += 1;
+        }
+        assert!(sent > 0);
+        assert!(sent < 10_000);
+
+        let mut received = 0;
+        let mut buf = vec![0_u8; 2048];
+        loop {
+            let rc = unsafe {
+                libc::recv(
+                    target.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                panic!("recv failed: {err}");
+            }
+            received += 1;
+        }
+
+        assert_eq!(received, sent);
+    }
+
+    #[test]
     fn direct_connect_fast_path_skips_socket_type_when_dns_disabled() {
         let cfg = test_config(false);
         let dest = Destination {
@@ -2177,6 +2433,20 @@ mod tests {
         let encoded = encode_os_list(&values).unwrap();
         let decoded = decode_os_list(&encoded).unwrap();
         assert_eq!(values, decoded);
+    }
+
+    fn test_relay_handle() -> UdpRelayHandle {
+        let (relay, target) = make_relay_pair().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        UdpRelayHandle {
+            tx,
+            default_dest: Arc::new(Mutex::new(None)),
+            pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+            relay_fd: Arc::new(relay),
+            target_pidfd: Arc::new(pidfd_open(std::process::id(), 0).unwrap()),
+            target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn test_config(enable_dns: bool) -> EffectiveConfig {
