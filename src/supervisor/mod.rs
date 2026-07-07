@@ -8,7 +8,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +24,10 @@ const TARGET_ARGV_ENV: &str = "SUP_TARGET_ARGV";
 const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
+// Upper bound on relay responses buffered ahead of the target's recv. Caps
+// memory when the target stops reading and keeps the source queue from growing
+// without limit; once full, further responses are dropped rather than enqueued.
+const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
 
@@ -638,10 +642,12 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    if len > MAX_UDP_PAYLOAD {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
-    }
+    // A single UDP datagram never exceeds MAX_UDP_PAYLOAD, so cap the local
+    // receive buffer instead of continuing the syscall on the relay fd: a plain
+    // send_continue would bypass source rewrite and leave pending_sources
+    // unpopped, desyncing the source queue from the datagram stream (mirrors
+    // the recvmsg capacity clamp below).
+    let capacity = len.min(MAX_UDP_PAYLOAD);
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
@@ -665,7 +671,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
         listener_fd,
         notif.id,
         relay_fd.as_raw_fd(),
-        len,
+        capacity,
         flags,
         &handle.pending_sources,
     ) {
@@ -789,9 +795,20 @@ struct FdIdentity {
     ino: libc::ino_t,
 }
 
+/// Relay slot state. `Creating` is a single-flight marker published under the
+/// lock while a relay's sockets/fd are built outside it; concurrent lookups for
+/// the same key wait for it to resolve rather than missing the (still empty)
+/// map and continuing a recv on the original fd -- which would then block
+/// forever once ADDFD swaps in the relay socket.
+enum RelayState {
+    Creating,
+    Ready(UdpRelayHandle),
+}
+
 #[derive(Default)]
 struct UdpRelayRegistry {
-    inner: Mutex<HashMap<RelayKey, UdpRelayHandle>>,
+    inner: Mutex<HashMap<RelayKey, RelayState>>,
+    created: Condvar,
 }
 
 #[derive(Clone)]
@@ -825,12 +842,17 @@ fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
 }
 
 fn valid_relay_locked(
-    relays: &mut HashMap<RelayKey, UdpRelayHandle>,
+    relays: &mut HashMap<RelayKey, RelayState>,
     key: RelayKey,
     pid: u32,
     fd: RawFd,
 ) -> Option<UdpRelayHandle> {
-    let handle = relays.get(&key).cloned()?;
+    let handle = match relays.get(&key) {
+        Some(RelayState::Ready(handle)) => handle.clone(),
+        // A relay under construction has no usable fd yet; callers must wait on
+        // the condvar rather than treat this as a hit or a miss.
+        Some(RelayState::Creating) | None => return None,
+    };
     if handle.target_fd_matches(pid, fd) {
         Some(handle)
     } else {
@@ -879,16 +901,48 @@ impl UdpRelayRegistry {
             return Ok(handle);
         }
 
-        // Build the relay resources outside the lock: binding two UDP sockets,
-        // reading the target fd flags (pidfd + /proc), and fstat are the
-        // expensive parts and must not block concurrent get()/ensure() for
-        // unrelated keys. The lock is only needed to serialize the fd injection
-        // and map insert (below), which is what actually prevents a double
-        // ADDFD race on the same key.
+        let key = relay_key(pid, fd);
+
+        // Claim the key under the lock before building anything. Publishing a
+        // Creating marker keeps the expensive setup (two UDP binds, reading the
+        // target fd flags via pidfd + /proc, fstat) outside the lock -- so it
+        // never blocks lookups for unrelated keys -- while still making a
+        // concurrent lookup for THIS key wait for the relay instead of missing
+        // the empty map and continuing its recv on the original fd.
+        {
+            let mut relays = self.inner.lock().unwrap();
+            loop {
+                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
+                    if let Some(dest) = default_dest {
+                        handle.set_default_dest(dest);
+                    }
+                    return Ok(handle);
+                }
+                match relays.get(&key) {
+                    // Another thread is building this relay: wait for it to
+                    // finish, then re-check (it may have become Ready, failed
+                    // and been removed, or turned stale).
+                    Some(RelayState::Creating) => {
+                        relays = self.created.wait(relays).unwrap();
+                    }
+                    // Free to claim: publish the marker and build below.
+                    _ => {
+                        relays.insert(key, RelayState::Creating);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // We own the Creating marker for `key`. The guard clears it and wakes
+        // waiters on every early return (build error, injection failure) so a
+        // failed attempt never strands lookups waiting forever.
+        let mut guard = CreatingGuard::new(self, key);
+
         let relay_cfg = build_udp_relay_config(cfg)?;
         let (relay_socket, target_fd) = make_udp_pair().context("create UDP relay socket pair")?;
-        // Own the raw target fd so it is closed on every exit path (racing
-        // loser, injection failure, or after a successful ADDFD copy).
+        // Own the raw target fd so it is closed on every exit path (injection
+        // failure or after a successful ADDFD copy).
         let target_fd = unsafe { OwnedFd::from_raw_fd(target_fd) };
         let target_flags = read_target_fd_flags(pid, fd);
         if target_flags.status_flags & libc::O_NONBLOCK != 0 {
@@ -896,20 +950,6 @@ impl UdpRelayRegistry {
         }
         let target_identity =
             fd_identity(target_fd.as_raw_fd()).context("stat UDP relay target socket")?;
-
-        let key = relay_key(pid, fd);
-        let mut relays = self.inner.lock().unwrap();
-        // Re-check under the lock: another thread may have created the relay for
-        // this key while we built ours. If so, drop our unused socket pair and
-        // reuse theirs -- injecting again would clobber the fd they installed.
-        // This re-check runs only on relay creation (cold path); the identity
-        // check under the lock here is not on the per-datagram hot path.
-        if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
-            if let Some(dest) = default_dest {
-                handle.set_default_dest(dest);
-            }
-            return Ok(handle);
-        }
 
         let mut addfd = SeccompNotifAddfd {
             id: notif_id,
@@ -922,7 +962,9 @@ impl UdpRelayRegistry {
         drop(target_fd);
 
         let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
-        relays.insert(key, handle.clone());
+        // Publish the ready relay and hand the marker off to Ready in one
+        // critical section so waiters wake to a usable handle.
+        guard.commit(RelayState::Ready(handle.clone()));
         Ok(handle)
     }
 
@@ -937,20 +979,74 @@ impl UdpRelayRegistry {
     fn lookup(&self, pid: u32, fd: RawFd) -> Option<(UdpRelayHandle, OwnedFd)> {
         let key = relay_key(pid, fd);
         let handle = {
-            let relays = self.inner.lock().unwrap();
-            relays.get(&key).cloned()
-        }?;
+            let mut relays = self.inner.lock().unwrap();
+            loop {
+                match relays.get(&key) {
+                    Some(RelayState::Ready(handle)) => break handle.clone(),
+                    // A relay is mid-creation for this key: wait for it rather
+                    // than reporting a miss, which would continue this recv on
+                    // the original fd and then block forever once the relay
+                    // socket is injected.
+                    Some(RelayState::Creating) => {
+                        relays = self.created.wait(relays).unwrap();
+                    }
+                    None => return None,
+                }
+            }
+        };
         let duplicated = duplicate_remote_fd(pid, fd).ok()?;
         let identity = fd_identity(duplicated.as_raw_fd()).ok()?;
         if handle.target_identity == identity {
             Some((handle, duplicated))
         } else {
             let mut relays = self.inner.lock().unwrap();
-            if matches!(relays.get(&key), Some(current) if current.target_identity == handle.target_identity)
+            if matches!(relays.get(&key), Some(RelayState::Ready(current)) if current.target_identity == handle.target_identity)
             {
                 relays.remove(&key);
             }
             None
+        }
+    }
+}
+
+/// Owns the single-flight `Creating` marker for one relay key. On drop it clears
+/// the marker (unless committed) and always wakes threads waiting in `lookup`/
+/// `ensure`, so a failed creation attempt can never strand a waiter.
+struct CreatingGuard<'a> {
+    registry: &'a UdpRelayRegistry,
+    key: RelayKey,
+    committed: bool,
+}
+
+impl<'a> CreatingGuard<'a> {
+    fn new(registry: &'a UdpRelayRegistry, key: RelayKey) -> Self {
+        CreatingGuard {
+            registry,
+            key,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self, state: RelayState) {
+        let mut relays = self.registry.inner.lock().unwrap();
+        relays.insert(self.key, state);
+        self.committed = true;
+        drop(relays);
+        self.registry.created.notify_all();
+    }
+}
+
+impl Drop for CreatingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut relays = self.registry.inner.lock().unwrap();
+            // Only remove our own Creating marker; never clobber a Ready relay
+            // (there is none we own) or another thread's later claim.
+            if matches!(relays.get(&self.key), Some(RelayState::Creating)) {
+                relays.remove(&self.key);
+            }
+            drop(relays);
+            self.registry.created.notify_all();
         }
     }
 }
@@ -1014,6 +1110,18 @@ fn start_udp_relay(
             match forward_udp_job(&cfg, &mut socks_udp, job) {
                 Ok(Some(response)) => {
                     let mut pending = write_pending_sources.lock().unwrap();
+                    // Drop the response if the target is not draining fast
+                    // enough: enqueuing past the cap only grows the source queue
+                    // while the kernel receive buffer would drop the datagram
+                    // anyway, desyncing sources from payloads.
+                    if pending.len() >= MAX_PENDING_SOURCES {
+                        if cfg.debug {
+                            eprintln!(
+                                "seccomp-unotify-proxy: UDP relay pending queue full, dropping response"
+                            );
+                        }
+                        continue;
+                    }
                     pending.push_back(source);
                     if !send_relay_response(&socket, &response) {
                         let _ = pending.pop_back();
@@ -1207,12 +1315,12 @@ fn recv_from_relay_fd(
     listener_fd: RawFd,
     notif_id: u64,
     relay_fd: RawFd,
-    len: usize,
+    capacity: usize,
     flags: i32,
     pending: &Mutex<VecDeque<Destination>>,
 ) -> io::Result<RelayRecvfrom> {
     let nonblocking = recv_is_nonblocking(relay_fd, flags);
-    let mut payload = vec![0_u8; len];
+    let mut payload = vec![0_u8; capacity];
     loop {
         if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
@@ -1295,10 +1403,9 @@ fn recv_msg_from_relay_fd(
         if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
         }
-        let (result, source) =
-            claim_datagram(pending, flags, || unsafe {
-                libc::recvmsg(relay_fd, &mut msg, flags | libc::MSG_DONTWAIT)
-            });
+        let (result, source) = claim_datagram(pending, flags, || unsafe {
+            libc::recvmsg(relay_fd, &mut msg, flags | libc::MSG_DONTWAIT)
+        });
         match result {
             Ok(rc) => {
                 let copied_len = (rc as usize).min(payload.len());
@@ -1367,7 +1474,8 @@ fn wait_for_relay_readable(listener_fd: RawFd, notif_id: u64, fd: RawFd) -> io::
         // EAGAIN (MSG_DONTWAIT) and spin us straight back into poll. Surface
         // the socket error instead so the caller can fail the syscall.
         if pollfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-            let err = socket_error(fd).unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET));
+            let err =
+                socket_error(fd).unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET));
             return Err(err);
         }
         return Ok(());
