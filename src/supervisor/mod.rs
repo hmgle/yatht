@@ -921,7 +921,15 @@ fn start_udp_relay(
     let read_default_dest = Arc::clone(&default_dest);
     thread::spawn(move || {
         let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
-        while let Ok(n) = read_socket.recv(&mut buf) {
+        loop {
+            let n = match read_socket.recv(&mut buf) {
+                Ok(n) => n,
+                // A signal can interrupt the blocking recv; retry rather than
+                // terminating the reader, which would silently break the
+                // connected-UDP return path (target recvfrom would hang).
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
             let Some(dest) = *read_default_dest.lock().unwrap() else {
                 continue;
             };
