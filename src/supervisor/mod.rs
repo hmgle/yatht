@@ -496,7 +496,7 @@ fn handle_sendto(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
-    let Some((dest, payload)) = read_udp_send(notif.pid, addr, addr_len, buf_ptr, len) else {
+    let Some(dest) = read_send_destination(notif.pid, addr, addr_len) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
@@ -504,6 +504,14 @@ fn handle_sendto(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
+    if len > MAX_UDP_PAYLOAD {
+        seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
+        return;
+    }
+    let Ok(payload) = read_proc_bytes(notif.pid, buf_ptr, len) else {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    };
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
@@ -570,7 +578,23 @@ fn handle_sendmsg(
         return;
     }
 
-    let payload = match read_iovecs(notif.pid, msg.iov, msg.iov_len) {
+    let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => iovecs,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    // Match the sendto path: an oversized datagram cannot be sent, so report
+    // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
+    let total = match iovec_total_len(&iovecs) {
+        Ok(total) => total,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
+            return;
+        }
+    };
+    let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
         Ok(payload) => payload,
         Err(_) => {
             seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
@@ -1032,20 +1056,9 @@ fn make_udp_pair() -> io::Result<(UdpSocket, RawFd)> {
     Ok((relay, target_fd))
 }
 
-fn read_udp_send(
-    pid: u32,
-    addr: u64,
-    addr_len: usize,
-    buf_ptr: u64,
-    len: usize,
-) -> Option<(Destination, Vec<u8>)> {
-    if len > MAX_UDP_PAYLOAD {
-        return None;
-    }
+fn read_send_destination(pid: u32, addr: u64, addr_len: usize) -> Option<Destination> {
     let raw_addr = read_sockaddr(pid, addr, addr_len).ok()?;
-    let dest = parse_sockaddr(&raw_addr).ok()?;
-    let payload = read_proc_bytes(pid, buf_ptr, len).ok()?;
-    Some((dest, payload))
+    parse_sockaddr(&raw_addr).ok()
 }
 
 #[derive(Debug)]
@@ -1064,12 +1077,6 @@ fn read_msghdr(pid: u32, msg_ptr: u64) -> io::Result<TargetMsghdr> {
         iov: u64::from_ne_bytes(raw[16..24].try_into().unwrap()),
         iov_len: u64::from_ne_bytes(raw[24..32].try_into().unwrap()),
     })
-}
-
-fn read_iovecs(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<u8>> {
-    let iovecs = read_iovec_targets(pid, iov_ptr, iov_len)?;
-    let total = iovec_total_len(&iovecs)?;
-    read_iovec_payload(pid, &iovecs, total)
 }
 
 #[derive(Clone, Copy)]
