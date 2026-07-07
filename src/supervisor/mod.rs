@@ -1266,10 +1266,41 @@ fn wait_for_relay_readable(listener_fd: RawFd, notif_id: u64, fd: RawFd) -> io::
         if rc == 0 {
             continue;
         }
+        // Data takes priority: if the socket is readable, let the caller's
+        // recv consume it even when an error/hangup is also reported.
+        if pollfd.revents & libc::POLLIN != 0 {
+            return Ok(());
+        }
         if pollfd.revents & libc::POLLNVAL != 0 {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
+        // POLLERR/POLLHUP without POLLIN: returning Ok would make recv report
+        // EAGAIN (MSG_DONTWAIT) and spin us straight back into poll. Surface
+        // the socket error instead so the caller can fail the syscall.
+        if pollfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            let err = socket_error(fd).unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET));
+            return Err(err);
+        }
         return Ok(());
+    }
+}
+
+fn socket_error(fd: RawFd) -> Option<io::Error> {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&err) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut err as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && err != 0 {
+        Some(io::Error::from_raw_os_error(err))
+    } else {
+        None
     }
 }
 
