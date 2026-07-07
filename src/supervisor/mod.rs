@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -163,9 +163,7 @@ fn notification_loop(
     let (tx, rx) = mpsc::sync_channel::<SeccompNotif>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
-    let (blocking_tx, blocking_rx) = mpsc::sync_channel::<SeccompNotif>(
-        worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
-    );
+    let (blocking_tx, blocking_rx) = mpsc::channel::<SeccompNotif>();
     let rx = Arc::new(Mutex::new(rx));
     let blocking_rx = Arc::new(Mutex::new(blocking_rx));
     for _ in 0..worker_count {
@@ -192,13 +190,8 @@ fn notification_loop(
         match seccomp::notif_recv(listener_raw_fd) {
             Ok(notif) => {
                 if is_blocking_recv_notification(&notif) {
-                    if !try_queue_notification(
-                        &blocking_tx,
-                        listener_raw_fd,
-                        notif,
-                        cfg.debug,
-                        "blocking recv",
-                    ) {
+                    if !queue_blocking_notification(&blocking_tx, listener_raw_fd, notif, cfg.debug)
+                    {
                         return;
                     }
                     continue;
@@ -237,6 +230,24 @@ fn try_queue_notification(
         Err(mpsc::TrySendError::Disconnected(notif)) => {
             if debug {
                 eprintln!("seccomp-unotify-proxy: {queue_name} workers stopped");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            false
+        }
+    }
+}
+
+fn queue_blocking_notification(
+    tx: &mpsc::Sender<SeccompNotif>,
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    debug: bool,
+) -> bool {
+    match tx.send(notif) {
+        Ok(()) => true,
+        Err(mpsc::SendError(notif)) => {
+            if debug {
+                eprintln!("seccomp-unotify-proxy: blocking recv workers stopped");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EIO);
             false
@@ -318,6 +329,10 @@ fn handle_connect(
             return;
         }
     };
+
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
 
     let dest = match parse_sockaddr(&raw) {
         Ok(dest) => dest,
@@ -592,12 +607,18 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     let src_addr = notif.data.args[4];
     let addr_len_ptr = notif.data.args[5];
 
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
     let Some(handle) = relays.get(notif.pid, target_fd) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
     if len > MAX_UDP_PAYLOAD {
         seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
     let addr_len = if src_addr != 0 && addr_len_ptr != 0 {
@@ -616,9 +637,10 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
         return;
     }
 
-    match recv_from_relay_fd(notif.pid, target_fd, len, flags) {
-        Ok(payload) => {
-            if let Err(err) = write_proc_bytes(notif.pid, buf_ptr, &payload) {
+    match recv_from_relay_fd(listener_fd, notif.id, notif.pid, target_fd, len, flags) {
+        Ok(received) => {
+            let source = handle.response_source(flags);
+            if let Err(err) = write_proc_bytes(notif.pid, buf_ptr, &received.payload) {
                 if err.kind() == io::ErrorKind::Interrupted {
                     seccomp::send_errno(listener_fd, notif.id, libc::EINTR);
                 } else {
@@ -627,7 +649,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
                 return;
             }
             if let Some(addr_len) = addr_len {
-                if let Some(source) = handle.response_source(flags) {
+                if let Some(source) = source {
                     if write_sockaddr_result(notif.pid, src_addr, addr_len_ptr, addr_len, source)
                         .is_err()
                     {
@@ -635,12 +657,10 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
                         return;
                     }
                 }
-            } else if flags & libc::MSG_PEEK == 0 {
-                let _ = handle.response_source(flags);
             }
-            seccomp::send_value(listener_fd, notif.id, payload.len() as i64);
+            seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
         }
-        Err(err) => seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err)),
+        Err(err) => send_recv_error(listener_fd, notif.id, &err),
     }
 }
 
@@ -649,12 +669,18 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
     let msg_ptr = notif.data.args[1];
     let flags = notif.data.args[2] as i32;
 
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
     let Some(handle) = relays.get(notif.pid, target_fd) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
     if msg_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
     let msg = match read_msghdr(notif.pid, msg_ptr) {
@@ -681,8 +707,9 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
         return;
     }
 
-    match recv_msg_from_relay_fd(notif.pid, target_fd, capacity, flags) {
+    match recv_msg_from_relay_fd(listener_fd, notif.id, notif.pid, target_fd, capacity, flags) {
         Ok(received) => {
+            let source = handle.response_source(flags);
             if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
                 || write_proc_bytes(notif.pid, msg_ptr + 48, &received.msg_flags.to_ne_bytes())
                     .is_err()
@@ -691,7 +718,7 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
                 return;
             }
             if msg.name != 0 {
-                if let Some(source) = handle.response_source(flags) {
+                if let Some(source) = source {
                     if write_sockaddr_to_msghdr(notif.pid, msg_ptr, msg.name, msg.name_len, source)
                         .is_err()
                     {
@@ -699,12 +726,10 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
                         return;
                     }
                 }
-            } else if flags & libc::MSG_PEEK == 0 {
-                let _ = handle.response_source(flags);
             }
             seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
         }
-        Err(err) => seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err)),
+        Err(err) => send_recv_error(listener_fd, notif.id, &err),
     }
 }
 
@@ -716,8 +741,14 @@ enum UdpRouteKind {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct RelayKey {
-    pid: u32,
+    tgid: u32,
     fd: RawFd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FdIdentity {
+    dev: libc::dev_t,
+    ino: libc::ino_t,
 }
 
 #[derive(Default)]
@@ -730,6 +761,7 @@ struct UdpRelayHandle {
     tx: mpsc::Sender<UdpJob>,
     default_dest: Arc<Mutex<Option<Destination>>>,
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
+    target_identity: FdIdentity,
 }
 
 struct UdpJob {
@@ -747,6 +779,48 @@ struct UdpRelayConfig {
     debug: bool,
 }
 
+fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
+    RelayKey {
+        tgid: thread_group_id(pid).unwrap_or(pid),
+        fd,
+    }
+}
+
+fn valid_relay_locked(
+    relays: &mut HashMap<RelayKey, UdpRelayHandle>,
+    key: RelayKey,
+    pid: u32,
+    fd: RawFd,
+) -> Option<UdpRelayHandle> {
+    let handle = relays.get(&key).cloned()?;
+    if handle.target_fd_matches(pid, fd) {
+        Some(handle)
+    } else {
+        relays.remove(&key);
+        None
+    }
+}
+
+fn build_udp_relay_config(cfg: &EffectiveConfig) -> Result<UdpRelayConfig> {
+    let dns_server = if cfg.enable_dns {
+        parse_destination_addr(&cfg.dns_server).context("parse DNS server")?
+    } else {
+        Destination {
+            ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 0,
+        }
+    };
+
+    Ok(UdpRelayConfig {
+        proxy: cfg.proxy.clone(),
+        dns_server,
+        enable_dns: cfg.enable_dns,
+        enable_udp: cfg.enable_udp,
+        timeout: cfg.connect_timeout,
+        debug: cfg.debug,
+    })
+}
+
 impl UdpRelayRegistry {
     fn ensure(
         &self,
@@ -757,19 +831,31 @@ impl UdpRelayRegistry {
         fd: RawFd,
         default_dest: Option<Destination>,
     ) -> Result<UdpRelayHandle> {
-        let key = RelayKey { pid, fd };
-        if let Some(handle) = self.inner.lock().unwrap().get(&key).cloned() {
+        let key = relay_key(pid, fd);
+        {
+            let mut relays = self.inner.lock().unwrap();
+            if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
+                if let Some(dest) = default_dest {
+                    handle.set_default_dest(dest);
+                }
+                return Ok(handle);
+            }
+        }
+
+        let relay_cfg = build_udp_relay_config(cfg)?;
+        let mut relays = self.inner.lock().unwrap();
+        if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
             if let Some(dest) = default_dest {
                 handle.set_default_dest(dest);
             }
             return Ok(handle);
         }
-
         let (relay_socket, target_fd) = make_udp_pair().context("create UDP relay socket pair")?;
         let target_flags = read_target_fd_flags(pid, fd);
         if target_flags.status_flags & libc::O_NONBLOCK != 0 {
             let _ = set_nonblocking(target_fd);
         }
+        let target_identity = fd_identity(target_fd).context("stat UDP relay target socket")?;
 
         let mut addfd = SeccompNotifAddfd {
             id: notif_id,
@@ -782,25 +868,15 @@ impl UdpRelayRegistry {
         close_fd(target_fd);
         addfd_result.context("inject UDP relay fd")?;
 
-        let relay_cfg = UdpRelayConfig {
-            proxy: cfg.proxy.clone(),
-            dns_server: parse_destination_addr(&cfg.dns_server).context("parse DNS server")?,
-            enable_dns: cfg.enable_dns,
-            enable_udp: cfg.enable_udp,
-            timeout: cfg.connect_timeout,
-            debug: cfg.debug,
-        };
-        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest);
-        self.inner.lock().unwrap().insert(key, handle.clone());
+        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
+        relays.insert(key, handle.clone());
         Ok(handle)
     }
 
     fn get(&self, pid: u32, fd: RawFd) -> Option<UdpRelayHandle> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(&RelayKey { pid, fd })
-            .cloned()
+        let key = relay_key(pid, fd);
+        let mut relays = self.inner.lock().unwrap();
+        valid_relay_locked(&mut relays, key, pid, fd)
     }
 }
 
@@ -823,12 +899,17 @@ impl UdpRelayHandle {
             pending.pop_front()
         }
     }
+
+    fn target_fd_matches(&self, pid: u32, fd: RawFd) -> bool {
+        matches!(remote_fd_identity(pid, fd), Ok(identity) if identity == self.target_identity)
+    }
 }
 
 fn start_udp_relay(
     cfg: UdpRelayConfig,
     relay_socket: UdpSocket,
     default_dest: Option<Destination>,
+    target_identity: FdIdentity,
 ) -> UdpRelayHandle {
     let socket = Arc::new(relay_socket);
     let (tx, rx) = mpsc::channel::<UdpJob>();
@@ -878,6 +959,7 @@ fn start_udp_relay(
         tx,
         default_dest,
         pending_sources,
+        target_identity,
     }
 }
 
@@ -994,6 +1076,11 @@ struct RelayRecvmsg {
     msg_flags: i32,
 }
 
+struct RelayRecvfrom {
+    payload: Vec<u8>,
+    result_len: usize,
+}
+
 fn read_iovec_targets(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<TargetIovec>> {
     if iov_len > 1024 {
         return Err(io::Error::new(
@@ -1044,16 +1131,27 @@ fn read_iovec_payload(pid: u32, iovecs: &[TargetIovec], total_len: usize) -> io:
     Ok(payload)
 }
 
-fn recv_from_relay_fd(pid: u32, fd: RawFd, len: usize, flags: i32) -> io::Result<Vec<u8>> {
+fn recv_from_relay_fd(
+    listener_fd: RawFd,
+    notif_id: u64,
+    pid: u32,
+    fd: RawFd,
+    len: usize,
+    flags: i32,
+) -> io::Result<RelayRecvfrom> {
     let duplicated = duplicate_remote_fd(pid, fd)?;
+    let nonblocking = recv_is_nonblocking(duplicated.as_raw_fd(), flags);
     let mut payload = vec![0_u8; len];
     loop {
+        if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
+            return Err(notification_interrupted());
+        }
         let rc = unsafe {
             libc::recv(
                 duplicated.as_raw_fd(),
                 payload.as_mut_ptr().cast(),
                 payload.len(),
-                flags,
+                flags | libc::MSG_DONTWAIT,
             )
         };
         if rc < 0 {
@@ -1061,20 +1159,31 @@ fn recv_from_relay_fd(pid: u32, fd: RawFd, len: usize, flags: i32) -> io::Result
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
+                wait_for_relay_readable(listener_fd, notif_id, duplicated.as_raw_fd())?;
+                continue;
+            }
             return Err(err);
         }
-        payload.truncate(rc as usize);
-        return Ok(payload);
+        let result_len = rc as usize;
+        payload.truncate(result_len.min(payload.len()));
+        return Ok(RelayRecvfrom {
+            payload,
+            result_len,
+        });
     }
 }
 
 fn recv_msg_from_relay_fd(
+    listener_fd: RawFd,
+    notif_id: u64,
     pid: u32,
     fd: RawFd,
     capacity: usize,
     flags: i32,
 ) -> io::Result<RelayRecvmsg> {
     let duplicated = duplicate_remote_fd(pid, fd)?;
+    let nonblocking = recv_is_nonblocking(duplicated.as_raw_fd(), flags);
     let mut payload = vec![0_u8; capacity];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
@@ -1085,10 +1194,18 @@ fn recv_msg_from_relay_fd(
     msg.msg_iovlen = 1;
 
     loop {
-        let rc = unsafe { libc::recvmsg(duplicated.as_raw_fd(), &mut msg, flags) };
+        if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
+            return Err(notification_interrupted());
+        }
+        let rc =
+            unsafe { libc::recvmsg(duplicated.as_raw_fd(), &mut msg, flags | libc::MSG_DONTWAIT) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
+                wait_for_relay_readable(listener_fd, notif_id, duplicated.as_raw_fd())?;
                 continue;
             }
             return Err(err);
@@ -1101,6 +1218,48 @@ fn recv_msg_from_relay_fd(
             msg_flags: msg.msg_flags,
         });
     }
+}
+
+fn recv_is_nonblocking(fd: RawFd, flags: i32) -> bool {
+    flags & libc::MSG_DONTWAIT != 0
+        || fd_status_flags(fd)
+            .map(|status_flags| status_flags & libc::O_NONBLOCK != 0)
+            .unwrap_or(false)
+}
+
+fn wait_for_relay_readable(listener_fd: RawFd, notif_id: u64, fd: RawFd) -> io::Result<()> {
+    const POLL_INTERVAL_MS: libc::c_int = 100;
+
+    loop {
+        if !seccomp::notif_id_valid(listener_fd, notif_id) {
+            return Err(notification_interrupted());
+        }
+
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, POLL_INTERVAL_MS) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            continue;
+        }
+        if pollfd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        return Ok(());
+    }
+}
+
+fn notification_interrupted() -> io::Error {
+    io::Error::from_raw_os_error(libc::EINTR)
 }
 
 fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::Result<()> {
@@ -1184,12 +1343,15 @@ fn errno_from_io(err: &io::Error) -> i32 {
     err.raw_os_error().unwrap_or(libc::EIO)
 }
 
-fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
-    if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
-        return socket_type_from_fd(duplicated.as_raw_fd());
+fn send_recv_error(listener_fd: RawFd, notif_id: u64, err: &io::Error) {
+    if err.kind() == io::ErrorKind::Interrupted && !seccomp::notif_id_valid(listener_fd, notif_id) {
+        return;
     }
+    seccomp::send_errno(listener_fd, notif_id, errno_from_io(err));
+}
 
-    let file = File::open(format!("/proc/{pid}/fd/{fd}")).ok()?;
+fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
+    let file = duplicate_remote_fd(pid, fd).ok()?;
     socket_type_from_fd(file.as_raw_fd())
 }
 
@@ -1209,6 +1371,33 @@ fn socket_type_from_fd(fd: RawFd) -> Option<i32> {
         None
     } else {
         Some(ty)
+    }
+}
+
+fn fd_identity(fd: RawFd) -> io::Result<FdIdentity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(FdIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        })
+    }
+}
+
+fn remote_fd_identity(pid: u32, fd: RawFd) -> io::Result<FdIdentity> {
+    let duplicated = duplicate_remote_fd(pid, fd)?;
+    fd_identity(duplicated.as_raw_fd())
+}
+
+fn fd_status_flags(fd: RawFd) -> io::Result<i32> {
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
     }
 }
 
@@ -1261,9 +1450,36 @@ fn is_executable(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
+fn thread_group_id(pid: u32) -> io::Result<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    for line in status.lines() {
+        if let Some(raw) = line.strip_prefix("Tgid:") {
+            return raw
+                .trim()
+                .parse()
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "missing Tgid in proc status",
+    ))
+}
+
 fn read_sockaddr(pid: u32, addr: u64, addr_len: usize) -> io::Result<Vec<u8>> {
-    let len = addr_len.min(128);
-    read_proc_bytes(pid, addr, len)
+    let family_len = addr_len.min(2);
+    let family_raw = read_proc_bytes(pid, addr, family_len)?;
+    if family_raw.len() < 2 {
+        return Ok(family_raw);
+    }
+
+    let family = u16::from_ne_bytes([family_raw[0], family_raw[1]]) as i32;
+    let needed_len = match family {
+        libc::AF_INET => 8,
+        libc::AF_INET6 => 28,
+        _ => return Ok(family_raw),
+    };
+    read_proc_bytes(pid, addr, addr_len.min(needed_len).min(128))
 }
 
 fn read_proc_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -1496,14 +1712,8 @@ fn read_target_fd_flags(pid: u32, fd: RawFd) -> TargetFdFlags {
     let mut flags = TargetFdFlags::default();
 
     if let Ok(duplicated) = duplicate_remote_fd(pid, fd) {
-        let rc = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFL) };
-        if rc >= 0 {
-            flags.status_flags = rc;
-        }
-    } else if let Ok(file) = File::open(format!("/proc/{pid}/fd/{fd}")) {
-        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-        if rc >= 0 {
-            flags.status_flags = rc;
+        if let Ok(status_flags) = fd_status_flags(duplicated.as_raw_fd()) {
+            flags.status_flags = status_flags;
         }
     }
 
@@ -1675,6 +1885,22 @@ mod tests {
         let dest = parse_sockaddr(&raw).unwrap();
         assert_eq!(dest.ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
         assert_eq!(dest.port, 443);
+    }
+
+    #[test]
+    fn reads_only_sockaddr_family_for_unsupported_family() {
+        let raw = (libc::AF_UNIX as u16).to_ne_bytes();
+        let got = read_sockaddr(std::process::id(), raw.as_ptr() as u64, 128).unwrap();
+
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn relay_key_uses_thread_group_id() {
+        let key = relay_key(std::process::id(), 9);
+
+        assert_eq!(key.tgid, std::process::id());
+        assert_eq!(key.fd, 9);
     }
 
     #[test]
