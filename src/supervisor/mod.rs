@@ -661,9 +661,16 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
         return;
     }
 
-    match recv_from_relay_fd(listener_fd, notif.id, relay_fd.as_raw_fd(), len, flags) {
+    match recv_from_relay_fd(
+        listener_fd,
+        notif.id,
+        relay_fd.as_raw_fd(),
+        len,
+        flags,
+        &handle.pending_sources,
+    ) {
         Ok(received) => {
-            let source = handle.response_source(flags);
+            let source = received.source;
             if let Err(err) = write_proc_bytes(notif.pid, buf_ptr, &received.payload) {
                 if err.kind() == io::ErrorKind::Interrupted {
                     seccomp::send_errno(listener_fd, notif.id, libc::EINTR);
@@ -731,9 +738,16 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
         return;
     }
 
-    match recv_msg_from_relay_fd(listener_fd, notif.id, relay_fd.as_raw_fd(), capacity, flags) {
+    match recv_msg_from_relay_fd(
+        listener_fd,
+        notif.id,
+        relay_fd.as_raw_fd(),
+        capacity,
+        flags,
+        &handle.pending_sources,
+    ) {
         Ok(received) => {
-            let source = handle.response_source(flags);
+            let source = received.source;
             if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
                 || write_proc_bytes(notif.pid, msg_ptr + 48, &received.msg_flags.to_ne_bytes())
                     .is_err()
@@ -939,15 +953,6 @@ impl UdpRelayHandle {
             .map_err(|_| anyhow!("UDP relay worker exited"))
     }
 
-    fn response_source(&self, flags: i32) -> Option<Destination> {
-        let mut pending = self.pending_sources.lock().unwrap();
-        if flags & libc::MSG_PEEK != 0 {
-            pending.front().copied()
-        } else {
-            pending.pop_front()
-        }
-    }
-
     fn target_fd_matches(&self, pid: u32, fd: RawFd) -> bool {
         matches!(remote_fd_identity(pid, fd), Ok(identity) if identity == self.target_identity)
     }
@@ -1113,11 +1118,13 @@ struct RelayRecvmsg {
     payload: Vec<u8>,
     result_len: usize,
     msg_flags: i32,
+    source: Option<Destination>,
 }
 
 struct RelayRecvfrom {
     payload: Vec<u8>,
     result_len: usize,
+    source: Option<Destination>,
 }
 
 fn read_iovec_targets(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<TargetIovec>> {
@@ -1176,6 +1183,7 @@ fn recv_from_relay_fd(
     relay_fd: RawFd,
     len: usize,
     flags: i32,
+    pending: &Mutex<VecDeque<Destination>>,
 ) -> io::Result<RelayRecvfrom> {
     let nonblocking = recv_is_nonblocking(relay_fd, flags);
     let mut payload = vec![0_u8; len];
@@ -1183,32 +1191,60 @@ fn recv_from_relay_fd(
         if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
         }
-        let rc = unsafe {
+        let (result, source) = claim_datagram(pending, flags, || unsafe {
             libc::recv(
                 relay_fd,
                 payload.as_mut_ptr().cast(),
                 payload.len(),
                 flags | libc::MSG_DONTWAIT,
             )
-        };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
-                wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
-                continue;
-            }
-            return Err(err);
-        }
-        let result_len = rc as usize;
-        payload.truncate(result_len.min(payload.len()));
-        return Ok(RelayRecvfrom {
-            payload,
-            result_len,
         });
+        match result {
+            Ok(rc) => {
+                let result_len = rc as usize;
+                payload.truncate(result_len.min(payload.len()));
+                return Ok(RelayRecvfrom {
+                    payload,
+                    result_len,
+                    source,
+                });
+            }
+            Err(err) => {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
+                    wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
     }
+}
+
+/// Runs `recv` while holding the pending-sources lock, and on success claims
+/// the matching source in the same critical section. This keeps the datagram
+/// and its source address bound together: without it, two threads receiving
+/// concurrently on a shared (unconnected) relay could pop sources in a
+/// different order than they received datagrams. errno is captured inside the
+/// lock, before any other syscall can clobber it.
+fn claim_datagram(
+    pending: &Mutex<VecDeque<Destination>>,
+    flags: i32,
+    recv: impl FnOnce() -> libc::ssize_t,
+) -> (io::Result<libc::ssize_t>, Option<Destination>) {
+    let mut pending = pending.lock().unwrap();
+    let rc = recv();
+    if rc < 0 {
+        return (Err(io::Error::last_os_error()), None);
+    }
+    let source = if flags & libc::MSG_PEEK != 0 {
+        pending.front().copied()
+    } else {
+        pending.pop_front()
+    };
+    (Ok(rc), source)
 }
 
 fn recv_msg_from_relay_fd(
@@ -1217,6 +1253,7 @@ fn recv_msg_from_relay_fd(
     relay_fd: RawFd,
     capacity: usize,
     flags: i32,
+    pending: &Mutex<VecDeque<Destination>>,
 ) -> io::Result<RelayRecvmsg> {
     let nonblocking = recv_is_nonblocking(relay_fd, flags);
     let mut payload = vec![0_u8; capacity];
@@ -1232,25 +1269,32 @@ fn recv_msg_from_relay_fd(
         if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
         }
-        let rc = unsafe { libc::recvmsg(relay_fd, &mut msg, flags | libc::MSG_DONTWAIT) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
+        let (result, source) =
+            claim_datagram(pending, flags, || unsafe {
+                libc::recvmsg(relay_fd, &mut msg, flags | libc::MSG_DONTWAIT)
+            });
+        match result {
+            Ok(rc) => {
+                let copied_len = (rc as usize).min(payload.len());
+                payload.truncate(copied_len);
+                return Ok(RelayRecvmsg {
+                    payload,
+                    result_len: rc as usize,
+                    msg_flags: msg.msg_flags,
+                    source,
+                });
             }
-            if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
-                wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
-                continue;
+            Err(err) => {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
+                    wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
+                    continue;
+                }
+                return Err(err);
             }
-            return Err(err);
         }
-        let copied_len = (rc as usize).min(payload.len());
-        payload.truncate(copied_len);
-        return Ok(RelayRecvmsg {
-            payload,
-            result_len: rc as usize,
-            msg_flags: msg.msg_flags,
-        });
     }
 }
 
