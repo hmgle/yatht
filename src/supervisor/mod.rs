@@ -1002,7 +1002,7 @@ fn start_udp_relay(
                 Ok(Some(response)) => {
                     let mut pending = write_pending_sources.lock().unwrap();
                     pending.push_back(source);
-                    if socket.send(&response).is_err() {
+                    if !send_relay_response(&socket, &response) {
                         let _ = pending.pop_back();
                     }
                 }
@@ -1021,6 +1021,19 @@ fn start_udp_relay(
         default_dest,
         pending_sources,
         target_identity,
+    }
+}
+
+/// Sends the relay response back to the target, retrying on EINTR. A signal
+/// interrupting this blocking send would otherwise drop the response (mirrors
+/// the reader-side EINTR retry), leaving the target's recvfrom without data.
+fn send_relay_response(socket: &UdpSocket, response: &[u8]) -> bool {
+    loop {
+        match socket.send(response) {
+            Ok(_) => return true,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
     }
 }
 
