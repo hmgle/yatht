@@ -634,7 +634,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    let Some((handle, relay_fd)) = relays.get_with_fd(notif.pid, target_fd) else {
+    let Some((handle, relay_fd)) = relays.lookup(notif.pid, target_fd) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
@@ -703,7 +703,7 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    let Some((handle, relay_fd)) = relays.get_with_fd(notif.pid, target_fd) else {
+    let Some((handle, relay_fd)) = relays.lookup(notif.pid, target_fd) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
@@ -869,15 +869,14 @@ impl UdpRelayRegistry {
         fd: RawFd,
         default_dest: Option<Destination>,
     ) -> Result<UdpRelayHandle> {
-        let key = relay_key(pid, fd);
-        {
-            let mut relays = self.inner.lock().unwrap();
-            if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
-                if let Some(dest) = default_dest {
-                    handle.set_default_dest(dest);
-                }
-                return Ok(handle);
+        // Fast path: reuse an existing relay. lookup() probes the map under the
+        // lock and only duplicates the target fd (for the identity check)
+        // outside the lock, so a hit does not serialize other lookups.
+        if let Some((handle, _fd)) = self.lookup(pid, fd) {
+            if let Some(dest) = default_dest {
+                handle.set_default_dest(dest);
             }
+            return Ok(handle);
         }
 
         // Build the relay resources outside the lock: binding two UDP sockets,
@@ -898,10 +897,13 @@ impl UdpRelayRegistry {
         let target_identity =
             fd_identity(target_fd.as_raw_fd()).context("stat UDP relay target socket")?;
 
+        let key = relay_key(pid, fd);
         let mut relays = self.inner.lock().unwrap();
         // Re-check under the lock: another thread may have created the relay for
         // this key while we built ours. If so, drop our unused socket pair and
         // reuse theirs -- injecting again would clobber the fd they installed.
+        // This re-check runs only on relay creation (cold path); the identity
+        // check under the lock here is not on the per-datagram hot path.
         if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
             if let Some(dest) = default_dest {
                 handle.set_default_dest(dest);
@@ -924,19 +926,30 @@ impl UdpRelayRegistry {
         Ok(handle)
     }
 
-    /// Looks up the relay while reusing the single fd duplication for both the
-    /// identity check and the caller's subsequent recv. Avoids duplicating the
-    /// target fd twice (pidfd_open + pidfd_getfd + fstat) per datagram.
-    fn get_with_fd(&self, pid: u32, fd: RawFd) -> Option<(UdpRelayHandle, OwnedFd)> {
+    /// Fast relay lookup. Probes the map under the lock first, so the common
+    /// case -- a recvfrom/recvmsg on a plain fd with no relay -- costs a single
+    /// cheap map miss with no fd duplication. Only on a hit is the target fd
+    /// duplicated (once, outside the lock) and its identity verified; the
+    /// duplicated fd is handed back so the caller can recv on it without
+    /// duplicating again. A stale entry (fd reused for a different socket) is
+    /// removed, but only if the entry we saw is still the current one, so a
+    /// concurrent insert of a fresh relay is never clobbered.
+    fn lookup(&self, pid: u32, fd: RawFd) -> Option<(UdpRelayHandle, OwnedFd)> {
+        let key = relay_key(pid, fd);
+        let handle = {
+            let relays = self.inner.lock().unwrap();
+            relays.get(&key).cloned()
+        }?;
         let duplicated = duplicate_remote_fd(pid, fd).ok()?;
         let identity = fd_identity(duplicated.as_raw_fd()).ok()?;
-        let key = relay_key(pid, fd);
-        let mut relays = self.inner.lock().unwrap();
-        let handle = relays.get(&key).cloned()?;
         if handle.target_identity == identity {
             Some((handle, duplicated))
         } else {
-            relays.remove(&key);
+            let mut relays = self.inner.lock().unwrap();
+            if matches!(relays.get(&key), Some(current) if current.target_identity == handle.target_identity)
+            {
+                relays.remove(&key);
+            }
             None
         }
     }
