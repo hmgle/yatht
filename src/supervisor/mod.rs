@@ -866,31 +866,44 @@ impl UdpRelayRegistry {
             }
         }
 
+        // Build the relay resources outside the lock: binding two UDP sockets,
+        // reading the target fd flags (pidfd + /proc), and fstat are the
+        // expensive parts and must not block concurrent get()/ensure() for
+        // unrelated keys. The lock is only needed to serialize the fd injection
+        // and map insert (below), which is what actually prevents a double
+        // ADDFD race on the same key.
         let relay_cfg = build_udp_relay_config(cfg)?;
+        let (relay_socket, target_fd) = make_udp_pair().context("create UDP relay socket pair")?;
+        // Own the raw target fd so it is closed on every exit path (racing
+        // loser, injection failure, or after a successful ADDFD copy).
+        let target_fd = unsafe { OwnedFd::from_raw_fd(target_fd) };
+        let target_flags = read_target_fd_flags(pid, fd);
+        if target_flags.status_flags & libc::O_NONBLOCK != 0 {
+            let _ = set_nonblocking(target_fd.as_raw_fd());
+        }
+        let target_identity =
+            fd_identity(target_fd.as_raw_fd()).context("stat UDP relay target socket")?;
+
         let mut relays = self.inner.lock().unwrap();
+        // Re-check under the lock: another thread may have created the relay for
+        // this key while we built ours. If so, drop our unused socket pair and
+        // reuse theirs -- injecting again would clobber the fd they installed.
         if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
             if let Some(dest) = default_dest {
                 handle.set_default_dest(dest);
             }
             return Ok(handle);
         }
-        let (relay_socket, target_fd) = make_udp_pair().context("create UDP relay socket pair")?;
-        let target_flags = read_target_fd_flags(pid, fd);
-        if target_flags.status_flags & libc::O_NONBLOCK != 0 {
-            let _ = set_nonblocking(target_fd);
-        }
-        let target_identity = fd_identity(target_fd).context("stat UDP relay target socket")?;
 
         let mut addfd = SeccompNotifAddfd {
             id: notif_id,
             flags: seccomp::ADDFD_FLAG_SETFD,
-            srcfd: target_fd as u32,
+            srcfd: target_fd.as_raw_fd() as u32,
             newfd: fd as u32,
             newfd_flags: target_flags.newfd_flags,
         };
-        let addfd_result = seccomp::notif_addfd(listener_fd, &mut addfd);
-        close_fd(target_fd);
-        addfd_result.context("inject UDP relay fd")?;
+        seccomp::notif_addfd(listener_fd, &mut addfd).context("inject UDP relay fd")?;
+        drop(target_fd);
 
         let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
         relays.insert(key, handle.clone());
