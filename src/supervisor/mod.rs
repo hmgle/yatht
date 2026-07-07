@@ -319,10 +319,6 @@ fn handle_connect(
         }
     };
 
-    if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
-    }
-
     let dest = match parse_sockaddr(&raw) {
         Ok(dest) => dest,
         Err(_) => {
@@ -331,9 +327,25 @@ fn handle_connect(
         }
     };
 
+    if direct_connect_can_continue_before_socket_type(&cfg, dest) {
+        if cfg.debug {
+            eprintln!(
+                "seccomp-unotify-proxy: direct {} for pid={} fd={}",
+                dest.authority(),
+                notif.pid,
+                target_fd
+            );
+        }
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+
     match socket_type(notif.pid, target_fd) {
         Some(libc::SOCK_DGRAM) => {
             if udp_route_for(&cfg, dest).is_some() {
+                if !seccomp::notif_id_valid(listener_fd, notif.id) {
+                    return;
+                }
                 if cfg.debug {
                     eprintln!(
                         "seccomp-unotify-proxy: UDP connect relay {} for pid={} fd={}",
@@ -902,6 +914,13 @@ fn udp_route_for(cfg: &EffectiveConfig, dest: Destination) -> Option<UdpRouteKin
     } else {
         None
     }
+}
+
+fn direct_connect_can_continue_before_socket_type(
+    cfg: &EffectiveConfig,
+    dest: Destination,
+) -> bool {
+    cfg.route_for(dest.ip) == Route::Direct && !(cfg.enable_dns && dest.port == 53)
 }
 
 fn udp_route_for_relay(cfg: &UdpRelayConfig, dest: Destination) -> Option<UdpRouteKind> {
@@ -1659,6 +1678,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_connect_fast_path_skips_socket_type_when_dns_disabled() {
+        let cfg = test_config(false);
+        let dest = Destination {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 443,
+        };
+
+        assert!(direct_connect_can_continue_before_socket_type(&cfg, dest));
+    }
+
+    #[test]
+    fn direct_connect_fast_path_preserves_dns_udp_detection() {
+        let cfg = test_config(true);
+        let dest = Destination {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 53,
+        };
+
+        assert!(!direct_connect_can_continue_before_socket_type(&cfg, dest));
+    }
+
+    #[test]
     fn os_list_round_trips() {
         let values = vec![
             OsString::from("curl"),
@@ -1667,5 +1708,24 @@ mod tests {
         let encoded = encode_os_list(&values).unwrap();
         let decoded = decode_os_list(&encoded).unwrap();
         assert_eq!(values, decoded);
+    }
+
+    fn test_config(enable_dns: bool) -> EffectiveConfig {
+        EffectiveConfig {
+            proxy: crate::config::ProxyConfig::Socks5 {
+                addr: "127.0.0.1:1080".to_string(),
+                username: None,
+                password: None,
+            },
+            bypass_local: true,
+            bypass_cidrs: Vec::new(),
+            proxy_cidrs: Vec::new(),
+            connect_timeout: Duration::from_secs(10),
+            enable_dns,
+            enable_udp: false,
+            dns_server: "1.1.1.1:53".to_string(),
+            debug: false,
+            command: Vec::new(),
+        }
     }
 }

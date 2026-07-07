@@ -65,7 +65,9 @@ is `socks5://127.0.0.1:1080`.
   notification id, and applies routing policy. Simulated UDP receives write
   results back with `process_vm_writev(2)`.
 - Direct routes respond with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, letting the
-  original `connect` run unchanged.
+  original syscall run unchanged. Direct non-DNS `connect(2)` notifications use
+  this fast path before socket-type inspection to avoid an extra
+  `pidfd_getfd(2)`/`getsockopt(2)` round trip.
 - Proxied routes complete the SOCKS5/HTTP CONNECT handshake in the supervisor,
   inject the connected TCP fd into the target with
   `SECCOMP_IOCTL_NOTIF_ADDFD | SECCOMP_ADDFD_FLAG_SETFD`, then respond with
@@ -96,6 +98,14 @@ The first matching rule wins:
 5. Remaining TCP destinations are proxied.
 6. With `--enable-dns`, UDP/53 is redirected before generic UDP policy.
 7. With `--enable-udp`, generic UDP follows the same CIDR policy as TCP.
+
+Default routing is a fast transparent-proxy policy for trusted target
+processes, not a security boundary. `SECCOMP_USER_NOTIF_FLAG_CONTINUE` resumes
+the original syscall, so pointer arguments such as `sockaddr *` can be modified
+by another target thread between supervisor inspection and kernel use. Strict
+egress enforcement should be provided by the kernel network layer, such as a
+dedicated netns with nftables rules or cgroup eBPF, allowing only intended
+direct CIDRs and the configured proxy endpoint.
 
 ## Test Plan
 

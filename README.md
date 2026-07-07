@@ -15,6 +15,14 @@ same TCP proxy. With `--enable-udp`, generic UDP is forwarded through SOCKS5 UDP
 ASSOCIATE. It does not use `LD_PRELOAD` or `ptrace`, so it can work with static
 binaries that ignore preload-based tools.
 
+By default the launcher is optimized for trusted-process transparent proxying.
+Direct routes are continued in-kernel for low overhead. Do not treat CIDR
+routing in this process as a security boundary for hostile code: seccomp user
+notification `CONTINUE` has an inherent pointer-argument TOCTOU window. For
+strict egress enforcement, run the target in a network namespace, nftables
+ruleset, cgroup eBPF policy, or equivalent kernel network policy that only
+allows the configured direct CIDRs and proxy endpoint.
+
 Requirements:
 
 - Linux x86_64
