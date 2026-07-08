@@ -2,8 +2,8 @@
 
 ## Summary
 
-`yatht` is short for "Yet Another Traffic Handoff Transport". It is a
-proxychains-ng-like launcher for Linux processes. The current version
+`yatht` is short for "Yet Another Traffic Handoff Transport". It is a launcher
+for Linux processes. The current version
 transparently redirects TCP `connect(2)`, UDP DNS queries, and generic UDP sends
 through one configured proxy without `LD_PRELOAD` and without `ptrace`.
 
@@ -141,6 +141,5 @@ should bypass the proxy unless `--proxy-local` is set.
 
 ## Deferred Work
 
-- Multiple proxy chain modes compatible with proxychains-ng.
 - Additional architectures such as aarch64.
 - Optional compatibility fallback for kernels older than 5.9.

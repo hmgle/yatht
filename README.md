@@ -6,20 +6,85 @@ handing a target process' traffic off to an external proxy transport.
 Transparent TCP and UDP proxy launcher for Linux x86_64 using seccomp user
 notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 
+## Features
+
+- Redirects TCP `connect(2)` through a SOCKS5 or HTTP CONNECT proxy.
+- Redirects UDP/53 DNS queries as DNS-over-TCP when `--enable-dns` is set.
+- Redirects generic UDP through SOCKS5 UDP ASSOCIATE when `--enable-udp` is set.
+- Works without `LD_PRELOAD` or `ptrace`, including for static binaries that
+  ignore preload-based tools.
+- Lets local/private destinations bypass the proxy by default, with CIDR
+  allow-list and bypass controls.
+
+## Requirements
+
+- Linux x86_64
+- Linux kernel 5.9 or newer
+- Rust toolchain for building from source
+- A reachable SOCKS5 or HTTP CONNECT proxy
+
+## Build
+
+```sh
+cargo build --release
+```
+
+The binary will be available at `target/release/yatht`.
+
+## Quick Start
+
 ```sh
 cargo build
 target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://example.com
 target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
 
-The tool redirects TCP `connect(2)` through one SOCKS5 or HTTP CONNECT proxy.
-With `--enable-dns`, UDP/53 queries are forwarded as DNS-over-TCP through the
-same TCP proxy. With `--enable-udp`, generic UDP is forwarded through SOCKS5 UDP
-ASSOCIATE. It does not use `LD_PRELOAD` or `ptrace`, so it can work with static
-binaries that ignore preload-based tools.
+Use `--` before the target command and its arguments. If `--proxy` is omitted,
+the default proxy is `socks5://127.0.0.1:1080`.
+
+## Configuration
+
+Configuration can be passed through CLI flags or a TOML file:
+
+```sh
+target/release/yatht --config examples/config.toml -- curl https://example.com
+```
+
+```toml
+proxy = "socks5://127.0.0.1:1080"
+connect_timeout = "10s"
+bypass_local = true
+bypass_cidrs = []
+proxy_cidrs = []
+enable_dns = false
+enable_udp = false
+dns_server = "1.1.1.1:53"
+debug = false
+```
+
+Important options:
+
+- `--proxy <url>`: `socks5://[user:pass@]host:port` or `http://host:port`.
+- `--config <path>`: TOML configuration file.
+- `--bypass-cidr <CIDR>`: direct-route matching destinations; repeatable.
+- `--proxy-cidr <CIDR>`: proxy only matching destinations; repeatable.
+- `--proxy-local`: proxy local/private/link-local destinations too.
+- `--connect-timeout <duration>`: proxy connection timeout, default `10s`.
+- `--enable-dns`: redirect UDP/53 through DNS-over-TCP.
+- `--enable-udp`: redirect generic UDP through SOCKS5 UDP ASSOCIATE.
+- `--dns-server <addr>`: DNS-over-TCP upstream for `--enable-dns`.
+- `--debug`: print routing and notification diagnostics.
+
+CLI CIDR options extend file CIDR lists. CLI booleans enable their matching
+features. `--proxy-local` disables the default `bypass_local = true` behavior.
+
+## Routing and Limitations
 
 UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.
+
+HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
+redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.
 
 By default the launcher is optimized for trusted-process transparent proxying.
 Direct routes are continued in-kernel for low overhead. Do not treat CIDR
@@ -29,11 +94,17 @@ strict egress enforcement, run the target in a network namespace, nftables
 ruleset, cgroup eBPF policy, or equivalent kernel network policy that only
 allows the configured direct CIDRs and proxy endpoint.
 
-Requirements:
+## Development
 
-- Linux x86_64
-- kernel 5.9 or newer
-- a reachable SOCKS5 or HTTP CONNECT proxy
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
 See [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) for the current design,
 scope, and test plan.
+
+## License
+
+Licensed under the MIT License. See [LICENSE](LICENSE).

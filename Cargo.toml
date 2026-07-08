@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Transparent TCP and UDP proxying with seccomp user notification and ADDFD"
+repository = "https://github.com/hmgle/yatht"
+homepage = "https://github.com/hmgle/yatht"
+readme = "README.md"
+keywords = ["linux", "seccomp", "proxy", "socks5", "network"]
+categories = ["command-line-utilities", "network-programming", "os::linux"]
 
 [dependencies]
 anyhow = "1.0"
