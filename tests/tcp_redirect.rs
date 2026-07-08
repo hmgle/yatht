@@ -41,7 +41,7 @@ fn redirects_local_tcp_connect_through_socks5() {
         handle_socks5_connect(&mut client, dest_tx);
     });
 
-    let bin = env!("CARGO_BIN_EXE_seccomp-unotify-proxy");
+    let bin = env!("CARGO_BIN_EXE_yatht");
     let output = Command::new(bin)
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))

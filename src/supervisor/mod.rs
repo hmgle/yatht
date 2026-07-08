@@ -234,7 +234,7 @@ fn notification_loop(
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 if cfg.debug {
-                    eprintln!("seccomp-unotify-proxy: notification loop stopped: {err}");
+                    eprintln!("yatht: notification loop stopped: {err}");
                 }
                 return;
             }
@@ -256,14 +256,14 @@ fn try_queue_notification(
                 return queue_notification_blocking(tx, listener_fd, notif, debug, queue_name);
             }
             if debug {
-                eprintln!("seccomp-unotify-proxy: {queue_name} queue full");
+                eprintln!("yatht: {queue_name} queue full");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
             true
         }
         Err(channel::TrySendError::Disconnected(notif)) => {
             if debug {
-                eprintln!("seccomp-unotify-proxy: {queue_name} workers stopped");
+                eprintln!("yatht: {queue_name} workers stopped");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EIO);
             false
@@ -289,7 +289,7 @@ fn queue_notification_blocking(
         Ok(()) => true,
         Err(channel::SendError(notif)) => {
             if debug {
-                eprintln!("seccomp-unotify-proxy: {queue_name} workers stopped");
+                eprintln!("yatht: {queue_name} workers stopped");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EIO);
             false
@@ -307,7 +307,7 @@ fn queue_blocking_notification(
         Ok(()) => true,
         Err(channel::SendError(notif)) => {
             if debug {
-                eprintln!("seccomp-unotify-proxy: blocking recv workers stopped");
+                eprintln!("yatht: blocking recv workers stopped");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EIO);
             false
@@ -434,7 +434,7 @@ fn handle_connect(
         }
         if cfg.debug {
             eprintln!(
-                "seccomp-unotify-proxy: direct {} for pid={} fd={}",
+                "yatht: direct {} for pid={} fd={}",
                 dest.authority(),
                 notif.pid,
                 target_fd
@@ -452,7 +452,7 @@ fn handle_connect(
                 }
                 if cfg.debug {
                     eprintln!(
-                        "seccomp-unotify-proxy: UDP connect relay {} for pid={} fd={}",
+                        "yatht: UDP connect relay {} for pid={} fd={}",
                         dest.authority(),
                         notif.pid,
                         target_fd
@@ -471,7 +471,7 @@ fn handle_connect(
                     }
                     Err(err) => {
                         if cfg.debug {
-                            eprintln!("seccomp-unotify-proxy: UDP relay setup failed: {err:#}");
+                            eprintln!("yatht: UDP relay setup failed: {err:#}");
                         }
                         seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
                     }
@@ -491,7 +491,7 @@ fn handle_connect(
         Some(other) => {
             if cfg.debug {
                 eprintln!(
-                    "seccomp-unotify-proxy: unsupported socket type {} for pid={} fd={}",
+                    "yatht: unsupported socket type {} for pid={} fd={}",
                     other, notif.pid, target_fd
                 );
             }
@@ -501,7 +501,7 @@ fn handle_connect(
         None => {
             if cfg.debug {
                 eprintln!(
-                    "seccomp-unotify-proxy: cannot inspect socket type for pid={} fd={}",
+                    "yatht: cannot inspect socket type for pid={} fd={}",
                     notif.pid, target_fd
                 );
             }
@@ -513,7 +513,7 @@ fn handle_connect(
     if cfg.route_for(dest.ip) == Route::Direct {
         if cfg.debug {
             eprintln!(
-                "seccomp-unotify-proxy: direct {} for pid={} fd={}",
+                "yatht: direct {} for pid={} fd={}",
                 dest.authority(),
                 notif.pid,
                 target_fd
@@ -525,7 +525,7 @@ fn handle_connect(
 
     if cfg.debug {
         eprintln!(
-            "seccomp-unotify-proxy: proxy {} for pid={} fd={}",
+            "yatht: proxy {} for pid={} fd={}",
             dest.authority(),
             notif.pid,
             target_fd
@@ -536,10 +536,7 @@ fn handle_connect(
         Ok(stream) => stream,
         Err(err) => {
             if cfg.debug {
-                eprintln!(
-                    "seccomp-unotify-proxy: proxy dial {} failed: {err:#}",
-                    dest.authority()
-                );
+                eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
             return;
@@ -567,7 +564,7 @@ fn handle_connect(
         Ok(_) => seccomp::send_success(listener_fd, notif.id),
         Err(err) => {
             if cfg.debug {
-                eprintln!("seccomp-unotify-proxy: ADDFD failed: {err}");
+                eprintln!("yatht: ADDFD failed: {err}");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
         }
@@ -687,7 +684,7 @@ fn relay_for_send(
         Ok(handle) => Some(handle),
         Err(err) => {
             if cfg.debug {
-                eprintln!("seccomp-unotify-proxy: UDP relay setup failed: {err:#}");
+                eprintln!("yatht: UDP relay setup failed: {err:#}");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
             None
@@ -1539,9 +1536,7 @@ fn start_udp_relay(
                     // successful send means the datagram is actually queued.
                     if pending.len() >= MAX_PENDING_SOURCES {
                         if cfg.debug {
-                            eprintln!(
-                                "seccomp-unotify-proxy: UDP relay pending queue full, dropping response"
-                            );
+                            eprintln!("yatht: UDP relay pending queue full, dropping response");
                         }
                         continue;
                     }
@@ -1556,7 +1551,7 @@ fn start_udp_relay(
                 Ok(None) => {}
                 Err(err) => {
                     if cfg.debug {
-                        eprintln!("seccomp-unotify-proxy: UDP relay forward failed: {err:#}");
+                        eprintln!("yatht: UDP relay forward failed: {err:#}");
                     }
                 }
             }

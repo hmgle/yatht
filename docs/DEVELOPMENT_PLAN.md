@@ -1,11 +1,11 @@
-# seccomp-unotify-proxy Development Plan
+# yatht Development Plan
 
 ## Summary
 
-`seccomp-unotify-proxy` is a proxychains-ng-like launcher for Linux processes.
-The current version transparently redirects TCP `connect(2)`, UDP DNS queries,
-and generic UDP sends through one configured proxy without `LD_PRELOAD` and
-without `ptrace`.
+`yatht` is short for "Yet Another Traffic Handoff Transport". It is a
+proxychains-ng-like launcher for Linux processes. The current version
+transparently redirects TCP `connect(2)`, UDP DNS queries, and generic UDP sends
+through one configured proxy without `LD_PRELOAD` and without `ptrace`.
 
 The implementation is from-scratch Rust and targets Linux x86_64 with kernel
 5.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
@@ -14,7 +14,7 @@ The implementation is from-scratch Rust and targets Linux x86_64 with kernel
 ## Public Interface
 
 ```text
-seccomp-unotify-proxy [OPTIONS] -- <command> [args...]
+yatht [OPTIONS] -- <command> [args...]
 
 Options:
   --config <path>                 TOML configuration file
@@ -132,8 +132,8 @@ cargo test
 
 ```sh
 cargo build
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 -- curl https://api.ipify.org
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
+target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://api.ipify.org
+target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
 
 The reported IP should be the proxy egress IP. A connection to `127.0.0.1`

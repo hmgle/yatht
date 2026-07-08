@@ -425,23 +425,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "seccomp-unotify-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "humantime",
- "ipnet",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "url",
-]
-
-[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -656,6 +639,23 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "yatht"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "humantime",
+ "ipnet",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "url",
+]
 
 [[package]]
 name = "yoke"

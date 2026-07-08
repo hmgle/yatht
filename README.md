@@ -1,12 +1,15 @@
-# seccomp-unotify-proxy
+# yatht
+
+`yatht` stands for "Yet Another Traffic Handoff Transport": a short name for
+handing a target process' traffic off to an external proxy transport.
 
 Transparent TCP and UDP proxy launcher for Linux x86_64 using seccomp user
 notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 
 ```sh
 cargo build
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 -- curl https://example.com
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
+target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://example.com
+target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
 
 The tool redirects TCP `connect(2)` through one SOCKS5 or HTTP CONNECT proxy.

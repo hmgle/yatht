@@ -37,7 +37,7 @@ fn redirects_dns_udp_over_tcp_proxy() {
         client.write_all(b"dns-ok").unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))
         .arg("--enable-dns")
@@ -88,7 +88,7 @@ fn redirects_connected_dns_udp_over_tcp_proxy() {
         client.write_all(b"dns-ok").unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))
         .arg("--enable-dns")
@@ -139,7 +139,7 @@ fn redirects_threaded_connected_dns_udp_over_tcp_proxy() {
         client.write_all(b"dns-ok").unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))
         .arg("--enable-dns")
@@ -188,7 +188,7 @@ fn rewrites_dns_recvmsg_source_to_original_destination() {
         client.write_all(b"dns-ok").unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))
         .arg("--enable-dns")
@@ -241,7 +241,7 @@ fn redirects_generic_udp_over_socks5_associate() {
         let _ = client.read(&mut keepalive);
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -300,7 +300,7 @@ fn updates_connected_udp_destination_on_reconnect() {
         let _ = client.read(&mut keepalive);
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -377,7 +377,7 @@ fn direct_send_on_relayized_fd_reaches_peer() {
         direct.send_to(b"direct-ok", peer).unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_seccomp-unotify-proxy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
