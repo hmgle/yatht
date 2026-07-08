@@ -18,7 +18,7 @@ fn main() {
     match result {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            eprintln!("seccomp-unotify-proxy: {err:#}");
+            eprintln!("yatht: {err:#}");
             std::process::exit(1);
         }
     }

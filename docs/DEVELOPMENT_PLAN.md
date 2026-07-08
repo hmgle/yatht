@@ -1,11 +1,11 @@
-# seccomp-unotify-proxy Development Plan
+# yatht Development Plan
 
 ## Summary
 
-`seccomp-unotify-proxy` is a proxychains-ng-like launcher for Linux processes.
-The current version transparently redirects TCP `connect(2)`, UDP DNS queries,
-and generic UDP sends through one configured proxy without `LD_PRELOAD` and
-without `ptrace`.
+`yatht` is short for "Yet Another Traffic Handoff Transport". It is a
+proxychains-ng-like launcher for Linux processes. The current version
+transparently redirects TCP `connect(2)`, UDP DNS queries, and generic UDP sends
+through one configured proxy without `LD_PRELOAD` and without `ptrace`.
 
 The implementation is from-scratch Rust and targets Linux x86_64 with kernel
 5.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
@@ -14,7 +14,7 @@ The implementation is from-scratch Rust and targets Linux x86_64 with kernel
 ## Public Interface
 
 ```text
-seccomp-unotify-proxy [OPTIONS] -- <command> [args...]
+yatht [OPTIONS] -- <command> [args...]
 
 Options:
   --config <path>                 TOML configuration file
@@ -55,8 +55,8 @@ is `socks5://127.0.0.1:1080`.
   to the parent, then `execve`s the requested target after the parent
   acknowledges receipt.
 - The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
-  send/receive syscalls only when DNS or generic UDP redirection is enabled.
-  All other syscalls are allowed.
+  send/receive and close syscalls only when DNS or generic UDP redirection is
+  enabled. All other syscalls are allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
@@ -79,13 +79,17 @@ is `socks5://127.0.0.1:1080`.
   thread per notification. Blocking UDP receive notifications use separate
   workers and an unbounded dispatch queue so full receive handling does not turn
   blocking socket calls into `EAGAIN` retry loops.
-- UDP redirection injects a connected loopback datagram socket into the target
-  and runs a supervisor relay. Explicit `sendto(2)` / `sendmsg(2)` destinations
-  are forwarded by the notification handler; connected UDP sends are read by the
-  relay socket.
-- DNS redirection forwards each UDP/53 payload to `dns_server` using DNS-over-TCP
-  through the configured TCP proxy. Generic UDP uses SOCKS5 UDP ASSOCIATE and is
-  unavailable for HTTP CONNECT proxies.
+- UDP redirection injects one end of an AF_UNIX datagram socketpair into the
+  target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
+  `sendmsg(2)` destinations are forwarded by the notification handler;
+  connected UDP sends are read by the relay socket. `close(2)` and closing
+  `close_range(2)` calls remove matching relays so long-running targets do not
+  retain relay threads after closing UDP sockets.
+- DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
+  DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
+  SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
+- Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten in the current
+  implementation.
 
 ## Routing Rules
 
@@ -128,8 +132,8 @@ cargo test
 
 ```sh
 cargo build
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 -- curl https://api.ipify.org
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
+target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://api.ipify.org
+target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
 
 The reported IP should be the proxy egress IP. A connection to `127.0.0.1`

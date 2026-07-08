@@ -12,7 +12,7 @@ use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "seccomp-unotify-proxy",
+    name = "yatht",
     version,
     about = "Run a command with TCP and UDP traffic transparently proxied with seccomp user notification"
 )]

@@ -1,12 +1,15 @@
-# seccomp-unotify-proxy
+# yatht
+
+`yatht` stands for "Yet Another Traffic Handoff Transport": a short name for
+handing a target process' traffic off to an external proxy transport.
 
 Transparent TCP and UDP proxy launcher for Linux x86_64 using seccomp user
 notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 
 ```sh
 cargo build
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 -- curl https://example.com
-target/debug/seccomp-unotify-proxy --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
+target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://example.com
+target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
 
 The tool redirects TCP `connect(2)` through one SOCKS5 or HTTP CONNECT proxy.
@@ -14,6 +17,9 @@ With `--enable-dns`, UDP/53 queries are forwarded as DNS-over-TCP through the
 same TCP proxy. With `--enable-udp`, generic UDP is forwarded through SOCKS5 UDP
 ASSOCIATE. It does not use `LD_PRELOAD` or `ptrace`, so it can work with static
 binaries that ignore preload-based tools.
+
+UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
+`recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.
 
 By default the launcher is optimized for trusted-process transparent proxying.
 Direct routes are continued in-kernel for low overhead. Do not treat CIDR
