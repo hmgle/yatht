@@ -26,19 +26,32 @@ pub fn dial(proxy: &ProxyConfig, dest: Destination, timeout: Duration) -> Result
     }
 }
 
-pub fn dns_over_tcp(
-    proxy: &ProxyConfig,
-    dns_server: Destination,
-    query: &[u8],
-    timeout: Duration,
-) -> Result<Vec<u8>> {
+pub struct DnsTcpConnection {
+    stream: TcpStream,
+}
+
+impl DnsTcpConnection {
+    pub fn connect(
+        proxy: &ProxyConfig,
+        dns_server: Destination,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let stream = dial(proxy, dns_server, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        Ok(Self { stream })
+    }
+
+    pub fn query(&mut self, query: &[u8]) -> Result<Vec<u8>> {
+        dns_query_over_stream(&mut self.stream, query)
+    }
+}
+
+fn dns_query_over_stream(stream: &mut TcpStream, query: &[u8]) -> Result<Vec<u8>> {
     if query.len() > u16::MAX as usize {
         bail!("DNS query is too large");
     }
 
-    let mut stream = dial(proxy, dns_server, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     stream.write_all(&(query.len() as u16).to_be_bytes())?;
     stream.write_all(query)?;
 
@@ -53,6 +66,7 @@ pub fn dns_over_tcp(
 pub struct Socks5UdpAssociation {
     _control: TcpStream,
     udp: UdpSocket,
+    recv_buf: Vec<u8>,
 }
 
 impl Socks5UdpAssociation {
@@ -88,26 +102,18 @@ impl Socks5UdpAssociation {
         Ok(Self {
             _control: control,
             udp,
+            recv_buf: vec![0_u8; 65_535],
         })
     }
 
-    pub fn send_datagram(
-        &mut self,
-        dest: Destination,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn send_datagram(&mut self, dest: Destination, payload: &[u8]) -> Result<Option<Vec<u8>>> {
         let packet = encode_socks5_udp(dest, payload)?;
-        self.udp.set_read_timeout(Some(timeout))?;
-        self.udp.set_write_timeout(Some(timeout))?;
         self.udp.send(&packet)?;
 
-        let mut buf = vec![0_u8; 65_535];
-        match self.udp.recv(&mut buf) {
-            Ok(n) => {
-                buf.truncate(n);
-                Ok(Some(decode_socks5_udp_payload(&buf)?.to_vec()))
-            }
+        match self.udp.recv(&mut self.recv_buf) {
+            Ok(n) => Ok(Some(
+                decode_socks5_udp_payload(&self.recv_buf[..n])?.to_vec(),
+            )),
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>

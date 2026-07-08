@@ -79,6 +79,8 @@ pub struct TrapSet {
     pub sendmsg: bool,
     pub recvfrom: bool,
     pub recvmsg: bool,
+    pub close: bool,
+    pub close_range: bool,
 }
 
 impl TrapSet {
@@ -89,6 +91,8 @@ impl TrapSet {
             sendmsg: false,
             recvfrom: false,
             recvmsg: false,
+            close: false,
+            close_range: false,
         }
     }
 
@@ -99,6 +103,8 @@ impl TrapSet {
             sendmsg: true,
             recvfrom: true,
             recvmsg: true,
+            close: true,
+            close_range: true,
         }
     }
 
@@ -119,12 +125,18 @@ impl TrapSet {
         if self.recvmsg {
             bits |= 1 << 4;
         }
+        if self.close {
+            bits |= 1 << 5;
+        }
+        if self.close_range {
+            bits |= 1 << 6;
+        }
         bits.to_string()
     }
 
     pub fn decode(raw: &str) -> Option<Self> {
         let bits = raw.parse::<u8>().ok()?;
-        if bits & !0b1_1111 != 0 {
+        if bits & !0b111_1111 != 0 {
             return None;
         }
         Some(Self {
@@ -133,6 +145,8 @@ impl TrapSet {
             sendmsg: bits & (1 << 2) != 0,
             recvfrom: bits & (1 << 3) != 0,
             recvmsg: bits & (1 << 4) != 0,
+            close: bits & (1 << 5) != 0,
+            close_range: bits & (1 << 6) != 0,
         })
     }
 
@@ -152,6 +166,12 @@ impl TrapSet {
         }
         if self.recvmsg {
             nrs.push(libc::SYS_recvmsg as u32);
+        }
+        if self.close {
+            nrs.push(libc::SYS_close as u32);
+        }
+        if self.close_range {
+            nrs.push(libc::SYS_close_range as u32);
         }
         nrs
     }
@@ -393,14 +413,16 @@ mod tests {
     #[test]
     fn socket_filter_traps_udp_senders() {
         let filter = socket_filter(TrapSet::with_udp());
-        assert_eq!(filter.len(), 11);
+        assert_eq!(filter.len(), 13);
         assert_eq!(filter[4].k, libc::SYS_connect as u32);
         assert_eq!(filter[5].k, libc::SYS_sendto as u32);
         assert_eq!(filter[6].k, libc::SYS_sendmsg as u32);
         assert_eq!(filter[7].k, libc::SYS_recvfrom as u32);
         assert_eq!(filter[8].k, libc::SYS_recvmsg as u32);
-        assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[10].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[9].k, libc::SYS_close as u32);
+        assert_eq!(filter[10].k, libc::SYS_close_range as u32);
+        assert_eq!(filter[11].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[12].k, SECCOMP_RET_USER_NOTIF);
     }
 
     #[test]
@@ -413,6 +435,6 @@ mod tests {
 
     #[test]
     fn trap_set_rejects_unknown_bits() {
-        assert_eq!(TrapSet::decode("32"), None);
+        assert_eq!(TrapSet::decode("128"), None);
     }
 }

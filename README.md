@@ -15,6 +15,9 @@ same TCP proxy. With `--enable-udp`, generic UDP is forwarded through SOCKS5 UDP
 ASSOCIATE. It does not use `LD_PRELOAD` or `ptrace`, so it can work with static
 binaries that ignore preload-based tools.
 
+UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
+`recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.
+
 By default the launcher is optimized for trusted-process transparent proxying.
 Direct routes are continued in-kernel for low overhead. Do not treat CIDR
 routing in this process as a security boundary for hostile code: seccomp user

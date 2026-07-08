@@ -8,6 +8,7 @@ description = "Transparent TCP and UDP proxying with seccomp user notification a
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
 humantime = "2.1"
 ipnet = { version = "2.11", features = ["serde"] }
 libc = "0.2"

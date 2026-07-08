@@ -9,11 +9,12 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use crossbeam_channel as channel;
 
 use crate::config::{EffectiveConfig, Route};
 use crate::proxy;
@@ -31,6 +32,22 @@ const MAX_UDP_PAYLOAD: usize = 65_535;
 const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
+const TGID_CACHE_MAX_ENTRIES: usize = 256;
+
+// The seccomp filter kills non-x86_64 ABIs, so target userspace structs are the
+// x86_64 Linux layouts regardless of the supervisor's Rust struct padding.
+const X86_64_IOVEC_SIZE: usize = 16;
+const X86_64_MSGHDR_SIZE: usize = 56;
+const X86_64_MSGHDR_NAME_LEN_OFFSET: usize = 8;
+const X86_64_MSGHDR_IOV_OFFSET: usize = 16;
+const X86_64_MSGHDR_IOV_LEN_OFFSET: usize = 24;
+const X86_64_MSGHDR_FLAGS_OFFSET: u64 = 48;
+const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+const CLOSE_RANGE_KNOWN_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
+
+const _: () = assert!(std::mem::size_of::<libc::iovec>() == X86_64_IOVEC_SIZE);
+const _: () = assert!(std::mem::size_of::<libc::msghdr>() == X86_64_MSGHDR_SIZE);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Destination {
@@ -165,14 +182,11 @@ fn notification_loop(
     relays: Arc<UdpRelayRegistry>,
 ) {
     let worker_count = notification_worker_count();
-    let (tx, rx) = mpsc::sync_channel::<SeccompNotif>(
+    let (tx, rx) = channel::bounded::<SeccompNotif>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
-    let (blocking_tx, blocking_rx) = mpsc::channel::<SeccompNotif>();
-    let rx = Arc::new(Mutex::new(rx));
-    let blocking_rx = Arc::new(Mutex::new(blocking_rx));
     for _ in 0..worker_count {
-        let worker_rx = Arc::clone(&rx);
+        let worker_rx = rx.clone();
         let worker_listener_fd = Arc::clone(&listener_fd);
         let worker_cfg = Arc::clone(&cfg);
         let worker_relays = Arc::clone(&relays);
@@ -180,26 +194,38 @@ fn notification_loop(
             notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
         });
     }
-    for _ in 0..worker_count {
-        let worker_rx = Arc::clone(&blocking_rx);
-        let worker_listener_fd = Arc::clone(&listener_fd);
-        let worker_cfg = Arc::clone(&cfg);
-        let worker_relays = Arc::clone(&relays);
-        thread::spawn(move || {
-            notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
-        });
-    }
+    let blocking_tx = if cfg.enable_dns || cfg.enable_udp {
+        let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
+        for _ in 0..worker_count {
+            let worker_rx = blocking_rx.clone();
+            let worker_listener_fd = Arc::clone(&listener_fd);
+            let worker_cfg = Arc::clone(&cfg);
+            let worker_relays = Arc::clone(&relays);
+            thread::spawn(move || {
+                notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
+            });
+        }
+        Some(blocking_tx)
+    } else {
+        None
+    };
 
     loop {
         let listener_raw_fd = listener_fd.as_raw_fd();
         match seccomp::notif_recv(listener_raw_fd) {
             Ok(notif) => {
                 if is_blocking_recv_notification(&notif) {
-                    if !queue_blocking_notification(&blocking_tx, listener_raw_fd, notif, cfg.debug)
-                    {
-                        return;
+                    if let Some(blocking_tx) = &blocking_tx {
+                        if !queue_blocking_notification(
+                            blocking_tx,
+                            listener_raw_fd,
+                            notif,
+                            cfg.debug,
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 if !try_queue_notification(&tx, listener_raw_fd, notif, cfg.debug, "notification") {
                     return;
@@ -217,7 +243,7 @@ fn notification_loop(
 }
 
 fn try_queue_notification(
-    tx: &mpsc::SyncSender<SeccompNotif>,
+    tx: &channel::Sender<SeccompNotif>,
     listener_fd: RawFd,
     notif: SeccompNotif,
     debug: bool,
@@ -225,14 +251,43 @@ fn try_queue_notification(
 ) -> bool {
     match tx.try_send(notif) {
         Ok(()) => true,
-        Err(mpsc::TrySendError::Full(notif)) => {
+        Err(channel::TrySendError::Full(notif)) => {
+            if should_block_when_queue_full(&notif) {
+                return queue_notification_blocking(tx, listener_fd, notif, debug, queue_name);
+            }
             if debug {
                 eprintln!("seccomp-unotify-proxy: {queue_name} queue full");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
             true
         }
-        Err(mpsc::TrySendError::Disconnected(notif)) => {
+        Err(channel::TrySendError::Disconnected(notif)) => {
+            if debug {
+                eprintln!("seccomp-unotify-proxy: {queue_name} workers stopped");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            false
+        }
+    }
+}
+
+fn should_block_when_queue_full(notif: &SeccompNotif) -> bool {
+    matches!(
+        notif.data.nr as libc::c_long,
+        libc::SYS_connect | libc::SYS_close | libc::SYS_close_range
+    )
+}
+
+fn queue_notification_blocking(
+    tx: &channel::Sender<SeccompNotif>,
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    debug: bool,
+    queue_name: &str,
+) -> bool {
+    match tx.send(notif) {
+        Ok(()) => true,
+        Err(channel::SendError(notif)) => {
             if debug {
                 eprintln!("seccomp-unotify-proxy: {queue_name} workers stopped");
             }
@@ -243,14 +298,14 @@ fn try_queue_notification(
 }
 
 fn queue_blocking_notification(
-    tx: &mpsc::Sender<SeccompNotif>,
+    tx: &channel::Sender<SeccompNotif>,
     listener_fd: RawFd,
     notif: SeccompNotif,
     debug: bool,
 ) -> bool {
     match tx.send(notif) {
         Ok(()) => true,
-        Err(mpsc::SendError(notif)) => {
+        Err(channel::SendError(notif)) => {
             if debug {
                 eprintln!("seccomp-unotify-proxy: blocking recv workers stopped");
             }
@@ -262,15 +317,12 @@ fn queue_blocking_notification(
 
 fn notification_worker(
     listener_fd: Arc<OwnedFd>,
-    rx: Arc<Mutex<mpsc::Receiver<SeccompNotif>>>,
+    rx: channel::Receiver<SeccompNotif>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
 ) {
     loop {
-        let notif = {
-            let rx = rx.lock().expect("notification worker receiver poisoned");
-            rx.recv()
-        };
+        let notif = rx.recv();
         let Ok(notif) = notif else {
             return;
         };
@@ -309,8 +361,30 @@ fn handle_notification(
         libc::SYS_sendmsg => handle_sendmsg(listener_fd, notif, cfg, relays),
         libc::SYS_recvfrom => handle_recvfrom(listener_fd, notif, relays),
         libc::SYS_recvmsg => handle_recvmsg(listener_fd, notif, relays),
+        libc::SYS_close => handle_close(listener_fd, notif, relays),
+        libc::SYS_close_range => handle_close_range(listener_fd, notif, relays),
         _ => seccomp::send_continue(listener_fd, notif.id),
     }
+}
+
+fn handle_close(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    relays.remove_for_close(notif.pid, fd);
+    seccomp::send_continue(listener_fd, notif.id);
+}
+
+fn handle_close_range(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let first = notif.data.args[0] as u32;
+    let last = notif.data.args[1] as u32;
+    let flags = notif.data.args[2] as u32;
+    if close_range_closes_fds(first, last, flags) {
+        relays.remove_for_close_range(notif.pid, first, last);
+    }
+    seccomp::send_continue(listener_fd, notif.id);
+}
+
+fn close_range_closes_fds(first: u32, last: u32, flags: u32) -> bool {
+    first <= last && flags & !CLOSE_RANGE_KNOWN_FLAGS == 0 && flags & CLOSE_RANGE_CLOEXEC == 0
 }
 
 fn handle_connect(
@@ -518,7 +592,8 @@ fn handle_sendto(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest) else {
+    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest)
+    else {
         // Direct destination on a plain (non-relay) fd: the kernel socket is a
         // real UDP socket, so let the syscall run unmodified.
         seccomp::send_continue(listener_fd, notif.id);
@@ -658,7 +733,8 @@ fn handle_sendmsg(
             return;
         }
     };
-    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest) else {
+    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest)
+    else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
@@ -874,8 +950,12 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
         Ok(received) => {
             let source = received.source;
             if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
-                || write_proc_bytes(notif.pid, msg_ptr + 48, &received.msg_flags.to_ne_bytes())
-                    .is_err()
+                || write_proc_bytes(
+                    notif.pid,
+                    msg_ptr + X86_64_MSGHDR_FLAGS_OFFSET,
+                    &received.msg_flags.to_ne_bytes(),
+                )
+                .is_err()
             {
                 seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                 return;
@@ -967,10 +1047,75 @@ struct UdpRelayConfig {
     debug: bool,
 }
 
+struct DirectUdpSocket {
+    sock: UdpSocket,
+    recv_buf: Vec<u8>,
+}
+
 fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
     RelayKey {
-        tgid: thread_group_id(pid).unwrap_or(pid),
+        tgid: cached_thread_group_id(pid).unwrap_or(pid),
         fd,
+    }
+}
+
+struct CachedTgid {
+    tgid: u32,
+    pidfd: OwnedFd,
+}
+
+static TGID_CACHE: OnceLock<Mutex<HashMap<u32, CachedTgid>>> = OnceLock::new();
+
+fn cached_thread_group_id(pid: u32) -> io::Result<u32> {
+    let cache = TGID_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut cache = cache.lock().unwrap();
+        match cache.get(&pid) {
+            Some(entry) if pidfd_is_alive(entry.pidfd.as_raw_fd()) => return Ok(entry.tgid),
+            Some(_) => {
+                cache.remove(&pid);
+            }
+            None => {}
+        }
+    }
+
+    let pidfd = match pidfd_open(pid, libc::PIDFD_THREAD) {
+        Ok(pidfd) => pidfd,
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+            return thread_group_id(pid);
+        }
+        Err(_) => return thread_group_id(pid),
+    };
+    let tgid = thread_group_id(pid)?;
+
+    let mut cache = cache.lock().unwrap();
+    if cache.len() >= TGID_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(pid, CachedTgid { tgid, pidfd });
+    Ok(tgid)
+}
+
+fn pidfd_is_alive(pidfd: RawFd) -> bool {
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if rc == 0 {
+            return true;
+        }
+        if rc > 0 {
+            return pollfd.revents
+                & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                == 0;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return false;
+        }
     }
 }
 
@@ -1175,6 +1320,51 @@ impl UdpRelayRegistry {
         }
     }
 
+    fn remove_for_close(&self, pid: u32, fd: RawFd) {
+        if self.inner.lock().unwrap().is_empty() {
+            return;
+        }
+        let key = relay_key(pid, fd);
+        let handle = {
+            let relays = self.inner.lock().unwrap();
+            match relays.get(&key) {
+                Some(RelayState::Ready(handle)) => handle.clone(),
+                _ => return,
+            }
+        };
+        if handle.target_fd_matches(pid, fd) {
+            self.remove_ready_if_current(key, handle.target_identity);
+        }
+    }
+
+    fn remove_for_close_range(&self, pid: u32, first: u32, last: u32) {
+        if self.inner.lock().unwrap().is_empty() {
+            return;
+        }
+        let tgid = cached_thread_group_id(pid).unwrap_or(pid);
+        let candidates = {
+            let relays = self.inner.lock().unwrap();
+            relays
+                .iter()
+                .filter_map(|(key, state)| {
+                    if key.tgid != tgid || !fd_in_close_range(key.fd, first, last) {
+                        return None;
+                    }
+                    match state {
+                        RelayState::Ready(handle) => Some((*key, handle.clone())),
+                        RelayState::Creating => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (key, handle) in candidates {
+            if handle.target_fd_matches(pid, key.fd) {
+                self.remove_ready_if_current(key, handle.target_identity);
+            }
+        }
+    }
+
     fn remove_ready_if_current(&self, key: RelayKey, target_identity: FdIdentity) {
         let removed = {
             let mut relays = self.inner.lock().unwrap();
@@ -1189,6 +1379,12 @@ impl UdpRelayRegistry {
             handle.shutdown();
         }
     }
+}
+
+fn fd_in_close_range(fd: RawFd, first: u32, last: u32) -> bool {
+    u32::try_from(fd)
+        .map(|fd| (first..=last).contains(&fd))
+        .unwrap_or(false)
 }
 
 /// Owns the single-flight `Creating` marker for one relay key. On drop it clears
@@ -1325,6 +1521,7 @@ fn start_udp_relay(
     let write_fd = Arc::clone(&relay_fd);
     let write_shutdown = Arc::clone(&shutdown);
     thread::spawn(move || {
+        let mut dns_tcp = None;
         let mut socks_udp = None;
         let mut direct_udp = None;
         for job in rx {
@@ -1332,7 +1529,7 @@ fn start_udp_relay(
                 break;
             }
             let source = job.dest;
-            match forward_udp_job(&cfg, &mut socks_udp, &mut direct_udp, job) {
+            match forward_udp_job(&cfg, &mut dns_tcp, &mut socks_udp, &mut direct_udp, job) {
                 Ok(Some(response)) => {
                     let mut pending = write_pending_sources.lock().unwrap();
                     // Drop the response if the target is not draining fast
@@ -1410,17 +1607,16 @@ fn send_relay_response(fd: RawFd, response: &[u8]) -> bool {
 
 fn forward_udp_job(
     cfg: &UdpRelayConfig,
+    dns_tcp: &mut Option<proxy::DnsTcpConnection>,
     socks_udp: &mut Option<proxy::Socks5UdpAssociation>,
-    direct_udp: &mut Option<UdpSocket>,
+    direct_udp: &mut Option<DirectUdpSocket>,
     job: UdpJob,
 ) -> Result<Option<Vec<u8>>> {
     // The route was decided by the notification handler, which has the full
     // routing table. Honour it verbatim so a datagram bound for a direct route
     // is never accidentally tunnelled through the proxy (and vice versa).
     match job.route {
-        UdpRouteKind::Dns => {
-            proxy::dns_over_tcp(&cfg.proxy, cfg.dns_server, &job.payload, cfg.timeout).map(Some)
-        }
+        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload).map(Some),
         UdpRouteKind::Generic => {
             if socks_udp.is_none() {
                 *socks_udp = Some(proxy::Socks5UdpAssociation::connect(
@@ -1431,9 +1627,40 @@ fn forward_udp_job(
             socks_udp
                 .as_mut()
                 .expect("SOCKS5 UDP association initialized")
-                .send_datagram(job.dest, &job.payload, cfg.timeout)
+                .send_datagram(job.dest, &job.payload)
         }
         UdpRouteKind::Direct => forward_direct_udp(direct_udp, job.dest, &job.payload, cfg.timeout),
+    }
+}
+
+fn forward_dns_tcp(
+    cfg: &UdpRelayConfig,
+    dns_tcp: &mut Option<proxy::DnsTcpConnection>,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if dns_tcp.is_none() {
+        *dns_tcp = Some(proxy::DnsTcpConnection::connect(
+            &cfg.proxy,
+            cfg.dns_server,
+            cfg.timeout,
+        )?);
+    }
+
+    match dns_tcp
+        .as_mut()
+        .expect("DNS-over-TCP connection initialized")
+        .query(payload)
+    {
+        Ok(response) => Ok(response),
+        Err(first_err) => {
+            *dns_tcp = None;
+            let mut fresh =
+                proxy::DnsTcpConnection::connect(&cfg.proxy, cfg.dns_server, cfg.timeout)
+                    .with_context(|| format!("reconnect DNS-over-TCP after {first_err:#}"))?;
+            let response = fresh.query(payload)?;
+            *dns_tcp = Some(fresh);
+            Ok(response)
+        }
     }
 }
 
@@ -1442,14 +1669,14 @@ fn forward_udp_job(
 /// Mirrors the single request/response model of the proxy paths: one datagram is
 /// read back (within the timeout) so the connected-UDP return path stays fed.
 fn forward_direct_udp(
-    direct_udp: &mut Option<UdpSocket>,
+    direct_udp: &mut Option<DirectUdpSocket>,
     dest: Destination,
     payload: &[u8],
     timeout: Duration,
 ) -> Result<Option<Vec<u8>>> {
     let family_matches = direct_udp
         .as_ref()
-        .and_then(|sock| sock.local_addr().ok())
+        .and_then(|state| state.sock.local_addr().ok())
         .map(|addr| addr.is_ipv4() == dest.ip.is_ipv4())
         .unwrap_or(false);
     if !family_matches {
@@ -1461,22 +1688,22 @@ fn forward_direct_udp(
         let sock = UdpSocket::bind(bind)?;
         sock.set_read_timeout(Some(timeout))?;
         sock.set_write_timeout(Some(timeout))?;
-        *direct_udp = Some(sock);
+        *direct_udp = Some(DirectUdpSocket {
+            sock,
+            recv_buf: vec![0_u8; MAX_UDP_PAYLOAD],
+        });
     }
-    let sock = direct_udp
-        .as_ref()
+    let state = direct_udp
+        .as_mut()
         .expect("direct UDP socket initialized above");
-    sock.send_to(payload, SocketAddr::new(dest.ip, dest.port))?;
+    state
+        .sock
+        .send_to(payload, SocketAddr::new(dest.ip, dest.port))?;
 
-    let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
-    match sock.recv_from(&mut buf) {
-        Ok((n, _)) => {
-            buf.truncate(n);
-            Ok(Some(buf))
-        }
+    match state.sock.recv_from(&mut state.recv_buf) {
+        Ok((n, _)) => Ok(Some(state.recv_buf[..n].to_vec())),
         Err(err)
-            if err.kind() == io::ErrorKind::WouldBlock
-                || err.kind() == io::ErrorKind::TimedOut =>
+            if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut =>
         {
             Ok(None)
         }
@@ -1532,12 +1759,24 @@ struct TargetMsghdr {
 }
 
 fn read_msghdr(pid: u32, msg_ptr: u64) -> io::Result<TargetMsghdr> {
-    let raw = read_proc_bytes(pid, msg_ptr, 56)?;
+    let raw = read_proc_bytes(pid, msg_ptr, X86_64_MSGHDR_SIZE)?;
     Ok(TargetMsghdr {
         name: u64::from_ne_bytes(raw[0..8].try_into().unwrap()),
-        name_len: u32::from_ne_bytes(raw[8..12].try_into().unwrap()),
-        iov: u64::from_ne_bytes(raw[16..24].try_into().unwrap()),
-        iov_len: u64::from_ne_bytes(raw[24..32].try_into().unwrap()),
+        name_len: u32::from_ne_bytes(
+            raw[X86_64_MSGHDR_NAME_LEN_OFFSET..X86_64_MSGHDR_NAME_LEN_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ),
+        iov: u64::from_ne_bytes(
+            raw[X86_64_MSGHDR_IOV_OFFSET..X86_64_MSGHDR_IOV_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        ),
+        iov_len: u64::from_ne_bytes(
+            raw[X86_64_MSGHDR_IOV_LEN_OFFSET..X86_64_MSGHDR_IOV_LEN_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        ),
     })
 }
 
@@ -1567,11 +1806,20 @@ fn read_iovec_targets(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<Ta
             "too many iovecs",
         ));
     }
+    let raw = read_proc_bytes(
+        pid,
+        iov_ptr,
+        (iov_len as usize).saturating_mul(X86_64_IOVEC_SIZE),
+    )?;
     let mut iovecs = Vec::with_capacity(iov_len as usize);
     for index in 0..iov_len {
-        let raw = read_proc_bytes(pid, iov_ptr + index * 16, 16)?;
-        let base = u64::from_ne_bytes(raw[0..8].try_into().unwrap());
-        let len = u64::from_ne_bytes(raw[8..16].try_into().unwrap()) as usize;
+        let offset = index as usize * X86_64_IOVEC_SIZE;
+        let base = u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap());
+        let len = u64::from_ne_bytes(
+            raw[offset + 8..offset + X86_64_IOVEC_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         iovecs.push(TargetIovec { base, len });
     }
     Ok(iovecs)
@@ -1843,10 +2091,10 @@ fn write_sockaddr_result(
     addr_len: u32,
     source: Destination,
 ) -> io::Result<()> {
-    let raw = sockaddr_bytes(source);
-    let write_len = (addr_len as usize).min(raw.len());
+    let (raw, raw_len) = sockaddr_bytes(source);
+    let write_len = (addr_len as usize).min(raw_len);
     write_proc_bytes(pid, addr, &raw[..write_len])?;
-    write_proc_bytes(pid, addr_len_ptr, &(raw.len() as u32).to_ne_bytes())
+    write_proc_bytes(pid, addr_len_ptr, &(raw_len as u32).to_ne_bytes())
 }
 
 fn write_sockaddr_to_msghdr(
@@ -1856,27 +2104,30 @@ fn write_sockaddr_to_msghdr(
     addr_len: u32,
     source: Destination,
 ) -> io::Result<()> {
-    let raw = sockaddr_bytes(source);
-    let write_len = (addr_len as usize).min(raw.len());
+    let (raw, raw_len) = sockaddr_bytes(source);
+    let write_len = (addr_len as usize).min(raw_len);
     write_proc_bytes(pid, addr, &raw[..write_len])?;
-    write_proc_bytes(pid, msg_ptr + 8, &(raw.len() as u32).to_ne_bytes())
+    write_proc_bytes(
+        pid,
+        msg_ptr + X86_64_MSGHDR_NAME_LEN_OFFSET as u64,
+        &(raw_len as u32).to_ne_bytes(),
+    )
 }
 
-fn sockaddr_bytes(dest: Destination) -> Vec<u8> {
+fn sockaddr_bytes(dest: Destination) -> ([u8; 28], usize) {
+    let mut raw = [0_u8; 28];
     match dest.ip {
         IpAddr::V4(ip) => {
-            let mut raw = vec![0_u8; 16];
             raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
             raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
             raw[4..8].copy_from_slice(&ip.octets());
-            raw
+            (raw, 16)
         }
         IpAddr::V6(ip) => {
-            let mut raw = vec![0_u8; 28];
             raw[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
             raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
             raw[8..24].copy_from_slice(&ip.octets());
-            raw
+            (raw, 28)
         }
     }
 }
@@ -2477,6 +2728,67 @@ mod tests {
         ));
         assert!(!registry.inner.lock().unwrap().contains_key(&key));
         assert!(handle.shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn close_removes_matching_relay() {
+        let registry = UdpRelayRegistry::default();
+        let (relay, target) = make_relay_pair().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = UdpRelayHandle {
+            tx,
+            default_dest: Arc::new(Mutex::new(None)),
+            pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+            relay_fd: Arc::new(relay),
+            target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let key = relay_key(std::process::id(), target.as_raw_fd());
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .insert(key, RelayState::Ready(handle));
+
+        registry.remove_for_close(std::process::id(), target.as_raw_fd());
+
+        assert!(!registry.inner.lock().unwrap().contains_key(&key));
+        assert!(shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn close_range_only_removes_when_fds_are_closed() {
+        assert!(close_range_closes_fds(3, 9, 0));
+        assert!(close_range_closes_fds(3, 9, CLOSE_RANGE_UNSHARE));
+        assert!(!close_range_closes_fds(9, 3, 0));
+        assert!(!close_range_closes_fds(3, 9, CLOSE_RANGE_CLOEXEC));
+        assert!(!close_range_closes_fds(3, 9, 1 << 30));
+    }
+
+    #[test]
+    fn reads_iovec_targets_in_one_batch() {
+        let first = [1_u8, 2, 3];
+        let second = [4_u8, 5];
+        let raw = [
+            libc::iovec {
+                iov_base: first.as_ptr() as *mut libc::c_void,
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr() as *mut libc::c_void,
+                iov_len: second.len(),
+            },
+        ];
+
+        let got =
+            read_iovec_targets(std::process::id(), raw.as_ptr() as u64, raw.len() as u64).unwrap();
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].base, first.as_ptr() as u64);
+        assert_eq!(got[0].len, first.len());
+        assert_eq!(got[1].base, second.as_ptr() as u64);
+        assert_eq!(got[1].len, second.len());
     }
 
     #[test]

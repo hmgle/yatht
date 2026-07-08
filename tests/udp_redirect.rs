@@ -392,7 +392,10 @@ fn direct_send_on_relayized_fd_reaches_peer() {
         .unwrap();
 
     assert_success(&output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "proxy-ok:direct-ok");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "proxy-ok:direct-ok"
+    );
     assert_eq!(
         dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         proxied_dest
