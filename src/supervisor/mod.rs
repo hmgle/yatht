@@ -384,7 +384,9 @@ fn handle_close_range(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRe
 }
 
 fn close_range_closes_fds(first: u32, last: u32, flags: u32) -> bool {
-    first <= last && flags & !CLOSE_RANGE_KNOWN_FLAGS == 0 && flags & CLOSE_RANGE_CLOEXEC == 0
+    first <= last
+        && flags & !CLOSE_RANGE_KNOWN_FLAGS == 0
+        && flags & (CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) == 0
 }
 
 fn handle_connect(
@@ -2760,7 +2762,7 @@ mod tests {
     #[test]
     fn close_range_only_removes_when_fds_are_closed() {
         assert!(close_range_closes_fds(3, 9, 0));
-        assert!(close_range_closes_fds(3, 9, CLOSE_RANGE_UNSHARE));
+        assert!(!close_range_closes_fds(3, 9, CLOSE_RANGE_UNSHARE));
         assert!(!close_range_closes_fds(9, 3, 0));
         assert!(!close_range_closes_fds(3, 9, CLOSE_RANGE_CLOEXEC));
         assert!(!close_range_closes_fds(3, 9, 1 << 30));
