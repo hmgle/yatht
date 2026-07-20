@@ -83,14 +83,16 @@ is `socks5://127.0.0.1:1080`.
 - Nonblocking notifications are dispatched through a bounded queue to a bounded
   worker pool so slow proxy dials apply backpressure without creating one OS
   thread per notification. Blocking UDP receive notifications use separate
-  workers and an unbounded dispatch queue so full receive handling does not turn
-  blocking socket calls into `EAGAIN` retry loops.
+  workers and a bounded dispatch queue; saturation returns `EAGAIN` rather than
+  allowing unbounded memory growth.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
   target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
   `sendmsg(2)` destinations are forwarded by the notification handler;
   connected UDP sends are read by the relay socket. `close(2)` and closing
   `close_range(2)` calls remove matching relays so long-running targets do not
   retain relay threads after closing UDP sockets.
+- Each UDP relay has a bounded job queue. Blocking sends apply backpressure;
+  nonblocking sends return `EAGAIN` when the queue is full.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.

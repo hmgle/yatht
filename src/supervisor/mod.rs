@@ -9,7 +9,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ const MAX_UDP_PAYLOAD: usize = 65_535;
 const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
+const UDP_JOB_QUEUE_CAPACITY: usize = 64;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
 
 struct NotificationFailure {
@@ -252,7 +253,9 @@ fn notification_loop(
         });
     }
     let blocking_tx = if cfg.enable_dns || cfg.enable_udp {
-        let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
+        let (blocking_tx, blocking_rx) = channel::bounded::<SeccompNotif>(
+            worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
+        );
         for _ in 0..worker_count {
             let worker_rx = blocking_rx.clone();
             let worker_listener_fd = Arc::clone(&listener_fd);
@@ -402,9 +405,16 @@ fn queue_blocking_notification(
     notif: SeccompNotif,
     debug: bool,
 ) -> bool {
-    match tx.send(notif) {
+    match tx.try_send(notif) {
         Ok(()) => true,
-        Err(channel::SendError(notif)) => {
+        Err(channel::TrySendError::Full(notif)) => {
+            if debug {
+                eprintln!("yatht: blocking recv queue full");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+            true
+        }
+        Err(channel::TrySendError::Disconnected(notif)) => {
             if debug {
                 eprintln!("yatht: blocking recv workers stopped");
             }
@@ -702,6 +712,7 @@ fn handle_sendto(
     let target_fd = notif.data.args[0] as RawFd;
     let buf_ptr = notif.data.args[1];
     let len = notif.data.args[2] as usize;
+    let flags = notif.data.args[3] as i32;
     let addr = notif.data.args[4];
     let addr_len = notif.data.args[5] as usize;
 
@@ -736,10 +747,14 @@ fn handle_sendto(
         Some(handle) => handle,
         None => return,
     };
-    if handle.send(dest, payload, route).is_ok() {
-        seccomp::send_value(listener_fd, notif.id, len as i64);
-    } else {
-        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+    let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
+        .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
+    match handle.send(dest, payload, route, nonblocking) {
+        Ok(()) => seccomp::send_value(listener_fd, notif.id, len as i64),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+        }
+        Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
     }
 }
 
@@ -826,6 +841,7 @@ fn handle_sendmsg(
 ) {
     let target_fd = notif.data.args[0] as RawFd;
     let msg_ptr = notif.data.args[1];
+    let flags = notif.data.args[2] as i32;
 
     if msg_ptr == 0 {
         seccomp::send_continue(listener_fd, notif.id);
@@ -896,10 +912,14 @@ fn handle_sendmsg(
         Some(handle) => handle,
         None => return,
     };
-    if handle.send(dest, payload, route).is_ok() {
-        seccomp::send_value(listener_fd, notif.id, written);
-    } else {
-        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+    let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
+        .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
+    match handle.send(dest, payload, route, nonblocking) {
+        Ok(()) => seccomp::send_value(listener_fd, notif.id, written),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+        }
+        Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
     }
 }
 
@@ -1155,7 +1175,7 @@ struct UdpRelayRegistry {
 
 #[derive(Clone)]
 struct UdpRelayHandle {
-    tx: mpsc::Sender<UdpJob>,
+    tx: channel::Sender<UdpJob>,
     default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     relay_fd: Arc<OwnedFd>,
@@ -1590,14 +1610,29 @@ impl UdpRelayHandle {
         *self.default_dest.lock().unwrap() = Some((dest, route));
     }
 
-    fn send(&self, dest: Destination, payload: Vec<u8>, route: UdpRouteKind) -> Result<()> {
+    fn send(
+        &self,
+        dest: Destination,
+        payload: Vec<u8>,
+        route: UdpRouteKind,
+        nonblocking: bool,
+    ) -> io::Result<()> {
+        let job = UdpJob {
+            dest,
+            payload,
+            route,
+        };
+        if nonblocking {
+            return self.tx.try_send(job).map_err(|err| match err {
+                channel::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
+                channel::TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited")
+                }
+            });
+        }
         self.tx
-            .send(UdpJob {
-                dest,
-                payload,
-                route,
-            })
-            .map_err(|_| anyhow!("UDP relay worker exited"))
+            .send(job)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited"))
     }
 
     /// Duplicates the target fd from the *currently notifying* thread rather than
@@ -1634,7 +1669,7 @@ fn start_udp_relay(
 ) -> UdpRelayHandle {
     let relay_fd = Arc::new(relay_socket);
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel::<UdpJob>();
+    let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
     let default_dest = Arc::new(Mutex::new(default_dest));
     let pending_sources = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -2959,7 +2994,7 @@ mod tests {
     fn close_removes_matching_relay() {
         let registry = UdpRelayRegistry::default();
         let (relay, target) = make_relay_pair().unwrap();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = channel::bounded(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = UdpRelayHandle {
             tx,
@@ -3067,6 +3102,33 @@ mod tests {
     }
 
     #[test]
+    fn nonblocking_udp_send_reports_full_job_queue() {
+        let (relay, target) = make_relay_pair().unwrap();
+        let (tx, _rx) = channel::bounded(1);
+        let handle = UdpRelayHandle {
+            tx,
+            default_dest: Arc::new(Mutex::new(None)),
+            pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+            relay_fd: Arc::new(relay),
+            target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let dest = Destination {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 53,
+        };
+
+        handle
+            .send(dest, b"first".to_vec(), UdpRouteKind::Dns, true)
+            .unwrap();
+        let err = handle
+            .send(dest, b"second".to_vec(), UdpRouteKind::Dns, true)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
     fn direct_connect_fast_path_skips_socket_type_when_dns_disabled() {
         let cfg = test_config(false);
         let dest = Destination {
@@ -3101,7 +3163,7 @@ mod tests {
 
     fn test_relay_handle() -> UdpRelayHandle {
         let (relay, target) = make_relay_pair().unwrap();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = channel::bounded(1);
         UdpRelayHandle {
             tx,
             default_dest: Arc::new(Mutex::new(None)),
