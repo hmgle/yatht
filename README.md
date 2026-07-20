@@ -3,14 +3,15 @@
 `yatht` stands for "Yet Another Traffic Handoff Transport": a short name for
 handing a target process' traffic off to an external proxy transport.
 
-Transparent TCP and UDP proxy launcher for Linux x86_64 using seccomp user
-notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
+TCP and experimental UDP proxy launcher for trusted Linux x86_64 processes
+using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 
 ## Features
 
 - Redirects TCP `connect(2)` through a SOCKS5 or HTTP CONNECT proxy.
 - Redirects UDP/53 DNS queries as DNS-over-TCP when `--enable-dns` is set.
-- Redirects generic UDP through SOCKS5 UDP ASSOCIATE when `--enable-udp` is set.
+- Redirects request/response UDP through SOCKS5 UDP ASSOCIATE when
+  experimental `--enable-udp` is set.
 - Works without `LD_PRELOAD` or `ptrace`, including for static binaries that
   ignore preload-based tools.
 - Lets local/private destinations bypass the proxy by default, with CIDR
@@ -78,13 +79,27 @@ Important options:
 CLI CIDR options extend file CIDR lists. CLI booleans enable their matching
 features. `--proxy-local` disables the default `bypass_local = true` behavior.
 
-## Routing and Limitations
+## Compatibility and Limitations
+
+TCP redirection is intended for conventional blocking clients. Replacing the
+target socket does not preserve every Linux socket behavior: a nonblocking
+`connect(2)` is completed synchronously, existing epoll registrations and bind
+state are not migrated, and most socket options are not copied.
+
+Generic UDP redirection is experimental and currently models one request with
+at most one response. It does not preserve unsolicited, delayed, reordered, or
+multiple responses, ancillary data, pre-existing epoll registrations, or fd
+aliases created with `dup(2)` or inherited across `fork(2)`.
 
 UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.
+
+The supervisor follows the initially launched process. Programs that daemonize
+or leave background descendants running after that process exits are not
+currently supported.
 
 By default the launcher is optimized for trusted-process transparent proxying.
 Direct routes are continued in-kernel for low overhead. Do not treat CIDR

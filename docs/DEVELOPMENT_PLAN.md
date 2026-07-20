@@ -3,9 +3,13 @@
 ## Summary
 
 `yatht` is short for "Yet Another Traffic Handoff Transport". It is a launcher
-for Linux processes. The current version
+for trusted Linux processes. The current version
 transparently redirects TCP `connect(2)`, UDP DNS queries, and generic UDP sends
 through one configured proxy without `LD_PRELOAD` and without `ptrace`.
+
+Generic UDP is experimental and limited to a request/response workload. The
+seccomp backend is a compatibility tool, not a complete emulation of Linux
+socket semantics or a security boundary.
 
 The implementation is from-scratch Rust and targets Linux x86_64 with kernel
 5.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
@@ -143,3 +147,6 @@ should bypass the proxy unless `--proxy-local` is set.
 
 - Additional architectures such as aarch64.
 - Optional compatibility fallback for kernels older than 5.9.
+- Complete nonblocking connect, epoll, fd-alias, fork, and general UDP socket
+  semantics. These require an architecture decision rather than local syscall
+  handler extensions.

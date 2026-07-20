@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -78,6 +78,7 @@ pub enum ProxyConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     proxy: Option<String>,
     connect_timeout: Option<String>,
@@ -126,7 +127,7 @@ impl EffectiveConfig {
         let mut proxy_cidrs = file_cfg.proxy_cidrs.unwrap_or_default();
         proxy_cidrs.extend(cli.proxy_cidrs);
 
-        Ok(Self {
+        let cfg = Self {
             proxy,
             bypass_local: if cli.proxy_local {
                 false
@@ -144,7 +145,31 @@ impl EffectiveConfig {
                 .unwrap_or_else(|| "1.1.1.1:53".to_string()),
             debug: cli.debug || file_cfg.debug.unwrap_or(false),
             command: cli.command,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.connect_timeout.is_zero() {
+            bail!("connect timeout must be greater than zero");
+        }
+        if self.enable_udp && matches!(self.proxy, ProxyConfig::Http { .. }) {
+            bail!("generic UDP redirection requires a SOCKS5 proxy");
+        }
+        if self.enable_dns {
+            let mut addrs = self
+                .dns_server
+                .to_socket_addrs()
+                .with_context(|| format!("resolve DNS server {:?}", self.dns_server))?;
+            if !addrs.any(|addr| addr.port() != 0) {
+                bail!(
+                    "DNS server {:?} resolved to no address with a nonzero port",
+                    self.dns_server
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn route_for(&self, ip: IpAddr) -> Route {
@@ -172,6 +197,9 @@ impl ProxyConfig {
         let port = url
             .port()
             .ok_or_else(|| anyhow!("proxy URL is missing a port"))?;
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            bail!("proxy URL must not contain a path, query, or fragment");
+        }
         let addr = format_host_port(host, port);
 
         match url.scheme() {
@@ -256,6 +284,51 @@ mod tests {
     }
 
     #[test]
+    fn rejects_proxy_url_options_that_are_ignored() {
+        let err = ProxyConfig::parse("socks5://127.0.0.1:1080/route?mode=tcp")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path, query, or fragment"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_file_config_fields() {
+        let err = toml::from_str::<FileConfig>("proyx = 'socks5://127.0.0.1:1080'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `proyx`"), "{err}");
+    }
+
+    #[test]
+    fn rejects_http_proxy_for_generic_udp() {
+        let mut cfg = test_config();
+        cfg.proxy = ProxyConfig::parse("http://127.0.0.1:8080").unwrap();
+        cfg.enable_udp = true;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("requires a SOCKS5 proxy"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_connect_timeout() {
+        let mut cfg = test_config();
+        cfg.connect_timeout = Duration::ZERO;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("greater than zero"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_dns_server_when_dns_is_enabled() {
+        let mut cfg = test_config();
+        cfg.enable_dns = true;
+        cfg.dns_server = "invalid DNS server".to_string();
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("resolve DNS server"), "{err}");
+    }
+
+    #[test]
     fn route_prefers_bypass_cidr() {
         let cfg = EffectiveConfig {
             proxy: ProxyConfig::parse("socks5://127.0.0.1:1080").unwrap(),
@@ -282,18 +355,8 @@ mod tests {
 
     #[test]
     fn proxy_cidr_is_allow_list() {
-        let cfg = EffectiveConfig {
-            proxy: ProxyConfig::parse("socks5://127.0.0.1:1080").unwrap(),
-            bypass_local: false,
-            bypass_cidrs: vec![],
-            proxy_cidrs: vec![IpNet::from_str("198.51.100.0/24").unwrap()],
-            connect_timeout: Duration::from_secs(10),
-            enable_dns: false,
-            enable_udp: false,
-            dns_server: "1.1.1.1:53".to_string(),
-            debug: false,
-            command: vec![OsString::from("true")],
-        };
+        let mut cfg = test_config();
+        cfg.proxy_cidrs = vec![IpNet::from_str("198.51.100.0/24").unwrap()];
 
         assert_eq!(
             cfg.route_for(IpAddr::from_str("203.0.113.10").unwrap()),
@@ -303,5 +366,20 @@ mod tests {
             cfg.route_for(IpAddr::from_str("198.51.100.10").unwrap()),
             Route::Proxy
         );
+    }
+
+    fn test_config() -> EffectiveConfig {
+        EffectiveConfig {
+            proxy: ProxyConfig::parse("socks5://127.0.0.1:1080").unwrap(),
+            bypass_local: false,
+            bypass_cidrs: vec![],
+            proxy_cidrs: vec![],
+            connect_timeout: Duration::from_secs(10),
+            enable_dns: false,
+            enable_udp: false,
+            dns_server: "1.1.1.1:53".to_string(),
+            debug: false,
+            command: vec![OsString::from("true")],
+        }
     }
 }
