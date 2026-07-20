@@ -83,8 +83,10 @@ is `socks5://127.0.0.1:1080`.
 - Nonblocking notifications are dispatched through a bounded queue to a bounded
   worker pool so slow proxy dials apply backpressure without creating one OS
   thread per notification. Blocking UDP receive notifications use separate
-  workers and a bounded dispatch queue; saturation returns `EAGAIN` rather than
-  allowing unbounded memory growth.
+  workers and an unbounded dispatch queue so queue pressure does not change a
+  blocking socket call into an `EAGAIN` retry. The number of queued receives is
+  bounded by the number of target threads, since each thread can have only one
+  notification pending.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
   target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
   `sendmsg(2)` destinations are forwarded by the notification handler;

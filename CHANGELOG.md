@@ -7,7 +7,7 @@
 - Keep proxy handshake timeouts out of target TCP connections.
 - Terminate the target when seccomp notification handling fails fatally.
 - Keep the notification listener alive for adopted target descendants.
-- Bound UDP job and blocking receive queues with explicit backpressure.
+- Bound UDP job queues while preserving blocking receive behavior.
 - Clarify that generic UDP and complete Linux socket semantics remain
   experimental.
 

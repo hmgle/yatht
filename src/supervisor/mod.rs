@@ -360,9 +360,7 @@ fn notification_loop(
         });
     }
     let blocking_tx = if cfg.enable_dns || cfg.enable_udp {
-        let (blocking_tx, blocking_rx) = channel::bounded::<SeccompNotif>(
-            worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
-        );
+        let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
         for _ in 0..worker_count {
             let worker_rx = blocking_rx.clone();
             let worker_listener_fd = Arc::clone(&listener_fd);
@@ -512,16 +510,9 @@ fn queue_blocking_notification(
     notif: SeccompNotif,
     debug: bool,
 ) -> bool {
-    match tx.try_send(notif) {
+    match tx.send(notif) {
         Ok(()) => true,
-        Err(channel::TrySendError::Full(notif)) => {
-            if debug {
-                eprintln!("yatht: blocking recv queue full");
-            }
-            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
-            true
-        }
-        Err(channel::TrySendError::Disconnected(notif)) => {
+        Err(channel::SendError(notif)) => {
             if debug {
                 eprintln!("yatht: blocking recv workers stopped");
             }
@@ -3247,6 +3238,27 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn blocking_receive_dispatch_waits_for_queue_capacity() {
+        let (tx, rx) = channel::bounded(1);
+        tx.send(SeccompNotif::default()).unwrap();
+        let (done_tx, done_rx) = channel::bounded(1);
+        thread::spawn(move || {
+            done_tx
+                .send(queue_blocking_notification(
+                    &tx,
+                    -1,
+                    SeccompNotif::default(),
+                    false,
+                ))
+                .unwrap();
+        });
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
     }
 
     #[test]
