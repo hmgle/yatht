@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -132,7 +132,6 @@ fn dial_socks5(
     dest: Destination,
     timeout: Duration,
 ) -> Result<TcpStream> {
-    let deadline = Instant::now() + timeout;
     let mut stream = connect_with_timeout(proxy_addr, timeout)
         .with_context(|| format!("connect SOCKS5 proxy {proxy_addr}"))?;
     stream.set_read_timeout(Some(timeout))?;
@@ -156,9 +155,7 @@ fn dial_socks5(
 
     let _ = read_socks5_reply_addr(&mut stream)?;
 
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    stream.set_read_timeout(Some(remaining.max(Duration::from_secs(1))))?;
-    stream.set_write_timeout(Some(remaining.max(Duration::from_secs(1))))?;
+    clear_handshake_timeouts(&stream)?;
     Ok(stream)
 }
 
@@ -339,7 +336,14 @@ fn dial_http_connect(proxy_addr: &str, dest: Destination, timeout: Duration) -> 
         bail!("HTTP CONNECT failed: {status}");
     }
 
+    clear_handshake_timeouts(&stream)?;
     Ok(stream)
+}
+
+fn clear_handshake_timeouts(stream: &TcpStream) -> Result<()> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(())
 }
 
 fn connect_with_timeout(addr: &str, timeout: Duration) -> Result<TcpStream> {
@@ -393,6 +397,42 @@ mod tests {
             Duration::from_secs(2),
         )
         .unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
+        drop(stream);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn socks5_connect_clears_handshake_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut greeting = [0_u8; 3];
+            conn.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            conn.write_all(&[5, 0]).unwrap();
+
+            let mut request = [0_u8; 10];
+            conn.read_exact(&mut request).unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 1]);
+            conn.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        });
+
+        let stream = dial_socks5(
+            &addr.to_string(),
+            None,
+            None,
+            Destination {
+                ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                port: 443,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
         drop(stream);
         handle.join().unwrap();
     }
