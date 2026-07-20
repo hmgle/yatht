@@ -97,9 +97,9 @@ UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.
 
-The supervisor follows the initially launched process. Programs that daemonize
-or leave background descendants running after that process exits are not
-currently supported.
+The supervisor acts as a child subreaper and keeps the seccomp listener alive
+until descendants of the initially launched process have exited. Its final exit
+status remains the status of the initially launched process.
 
 By default the launcher is optimized for trusted-process transparent proxying.
 Direct routes are continued in-kernel for low overhead. Do not treat CIDR

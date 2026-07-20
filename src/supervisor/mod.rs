@@ -37,6 +37,7 @@ const TGID_CACHE_MAX_ENTRIES: usize = 256;
 struct NotificationFailure {
     target_pid: u32,
     reported: AtomicBool,
+    shutting_down: AtomicBool,
     tx: channel::Sender<String>,
 }
 
@@ -47,6 +48,7 @@ impl NotificationFailure {
         }
         let _ = self.tx.try_send(format!("{context}: {err}"));
         unsafe {
+            libc::kill(-(self.target_pid as libc::pid_t), libc::SIGKILL);
             libc::kill(self.target_pid as libc::pid_t, libc::SIGKILL);
         }
     }
@@ -92,6 +94,7 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     }
 
     let target_path = resolve_target(&cfg.command[0])?;
+    set_child_subreaper().context("become child subreaper")?;
     let argv = cfg.command.clone();
     let (parent_sock, child_sock) = socketpair().context("create control socketpair")?;
     let trap_set = if cfg.enable_dns || cfg.enable_udp {
@@ -114,6 +117,9 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let parent_fd = parent_sock;
     unsafe {
         command.pre_exec(move || {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             if child_fd != CONTROL_FD && libc::dup2(child_fd, CONTROL_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -154,14 +160,16 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let failure = Arc::new(NotificationFailure {
         target_pid: child.id(),
         reported: AtomicBool::new(false),
+        shutting_down: AtomicBool::new(false),
         tx: failure_tx,
     });
     let loop_cfg = Arc::clone(&cfg);
     let loop_relays = Arc::clone(&relays);
     let loop_failure = Arc::clone(&failure);
+    let loop_state = Arc::clone(&failure);
     thread::spawn(move || {
         if std::panic::catch_unwind(|| {
-            notification_loop(listener_fd, loop_cfg, loop_relays, failure)
+            notification_loop(listener_fd, loop_cfg, loop_relays, loop_state)
         })
         .is_err()
         {
@@ -173,6 +181,8 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     });
 
     let status = child.wait().context("wait for target")?;
+    wait_for_descendants().context("wait for target descendants")?;
+    failure.shutting_down.store(true, Ordering::Release);
     if let Ok(failure) = failure_rx.try_recv() {
         bail!("seccomp notification handling failed: {failure}");
     }
@@ -313,7 +323,13 @@ fn notification_loop(
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return,
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
+                if failure.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(err) => {
                 if cfg.debug {
                     eprintln!("yatht: notification loop stopped: {err}");
@@ -2721,6 +2737,33 @@ fn set_no_new_privs() -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+fn set_child_subreaper() -> io::Result<()> {
+    let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn wait_for_descendants() -> io::Result<()> {
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if rc > 0 {
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(());
+        }
+        return Err(err);
     }
 }
 

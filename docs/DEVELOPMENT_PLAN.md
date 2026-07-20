@@ -54,6 +54,8 @@ is `socks5://127.0.0.1:1080`.
 
 - The parent creates a Unix socketpair and re-execs itself into a small child
   stage.
+- The parent acts as a child subreaper. It preserves the initial target's exit
+  status while keeping the listener alive until adopted descendants exit.
 - The child stage sets `PR_SET_NO_NEW_PRIVS`, installs a seccomp classic-BPF
   filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`, writes the listener fd number
   to the parent, then `execve`s the requested target after the parent
