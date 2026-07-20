@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
@@ -5,6 +6,10 @@ use std::ptr;
 
 pub const USER_NOTIF_FLAG_CONTINUE: u32 = 1 << 0;
 pub const ADDFD_FLAG_SETFD: u32 = 1 << 0;
+
+thread_local! {
+    static NOTIFICATION_ERROR: RefCell<Option<io::Error>> = const { RefCell::new(None) };
+}
 
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
@@ -262,12 +267,23 @@ pub fn notif_recv(fd: RawFd) -> io::Result<SeccompNotif> {
 }
 
 pub fn notif_send(fd: RawFd, resp: &mut SeccompNotifResp) -> io::Result<()> {
-    ioctl_mut(fd, ioctl_notif_send(), resp)
+    ioctl_mut_retry(fd, ioctl_notif_send(), resp)
 }
 
 pub fn notif_id_valid(fd: RawFd, id: u64) -> bool {
     let mut id = id;
-    ioctl_mut(fd, ioctl_notif_id_valid(), &mut id).is_ok()
+    match ioctl_mut_retry(fd, ioctl_notif_id_valid(), &mut id) {
+        Ok(()) => true,
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => false,
+        Err(err) => {
+            record_notification_error(err);
+            false
+        }
+    }
+}
+
+pub fn take_notification_error() -> Option<io::Error> {
+    NOTIFICATION_ERROR.with(|error| error.borrow_mut().take())
 }
 
 pub fn notif_addfd(fd: RawFd, addfd: &mut SeccompNotifAddfd) -> io::Result<RawFd> {
@@ -285,7 +301,9 @@ pub fn send_continue(fd: RawFd, id: u64) {
         flags: USER_NOTIF_FLAG_CONTINUE,
         ..SeccompNotifResp::default()
     };
-    let _ = notif_send(fd, &mut resp);
+    if let Err(err) = notif_send(fd, &mut resp) {
+        record_notification_error_unless_stale(err);
+    }
 }
 
 pub fn send_success(fd: RawFd, id: u64) {
@@ -295,7 +313,9 @@ pub fn send_success(fd: RawFd, id: u64) {
         error: 0,
         flags: 0,
     };
-    let _ = notif_send(fd, &mut resp);
+    if let Err(err) = notif_send(fd, &mut resp) {
+        record_notification_error_unless_stale(err);
+    }
 }
 
 pub fn send_errno(fd: RawFd, id: u64, errno: i32) {
@@ -305,7 +325,9 @@ pub fn send_errno(fd: RawFd, id: u64, errno: i32) {
         error: -errno,
         flags: 0,
     };
-    let _ = notif_send(fd, &mut resp);
+    if let Err(err) = notif_send(fd, &mut resp) {
+        record_notification_error_unless_stale(err);
+    }
 }
 
 pub fn send_value(fd: RawFd, id: u64, value: i64) {
@@ -315,7 +337,33 @@ pub fn send_value(fd: RawFd, id: u64, value: i64) {
         error: 0,
         flags: 0,
     };
-    let _ = notif_send(fd, &mut resp);
+    if let Err(err) = notif_send(fd, &mut resp) {
+        record_notification_error_unless_stale(err);
+    }
+}
+
+fn record_notification_error_unless_stale(err: io::Error) {
+    if err.raw_os_error() != Some(libc::ENOENT) {
+        record_notification_error(err);
+    }
+}
+
+fn record_notification_error(err: io::Error) {
+    NOTIFICATION_ERROR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    });
+}
+
+fn ioctl_mut_retry<T>(fd: RawFd, request: libc::c_ulong, arg: &mut T) -> io::Result<()> {
+    loop {
+        match ioctl_mut(fd, request, arg) {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
 }
 
 fn ioctl_mut<T>(fd: RawFd, request: libc::c_ulong, arg: &mut T) -> io::Result<()> {
@@ -436,5 +484,21 @@ mod tests {
     #[test]
     fn trap_set_rejects_unknown_bits() {
         assert_eq!(TrapSet::decode("128"), None);
+    }
+
+    #[test]
+    fn records_fatal_notification_ioctl_errors() {
+        assert!(take_notification_error().is_none());
+        assert!(!notif_id_valid(-1, 1));
+        assert_eq!(
+            take_notification_error().and_then(|err| err.raw_os_error()),
+            Some(libc::EBADF)
+        );
+
+        send_continue(-1, 1);
+        assert_eq!(
+            take_notification_error().and_then(|err| err.raw_os_error()),
+            Some(libc::EBADF)
+        );
     }
 }

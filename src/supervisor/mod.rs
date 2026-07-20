@@ -34,6 +34,24 @@ const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
 
+struct NotificationFailure {
+    target_pid: u32,
+    reported: AtomicBool,
+    tx: channel::Sender<String>,
+}
+
+impl NotificationFailure {
+    fn report(&self, context: &str, err: io::Error) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.tx.try_send(format!("{context}: {err}"));
+        unsafe {
+            libc::kill(self.target_pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 // The seccomp filter kills non-x86_64 ABIs, so target userspace structs are the
 // x86_64 Linux layouts regardless of the supervisor's Rust struct padding.
 const X86_64_IOVEC_SIZE: usize = 16;
@@ -132,11 +150,32 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let cfg = Arc::new(cfg);
     let relays = Arc::new(UdpRelayRegistry::default());
     let listener_fd = Arc::new(listener_fd);
+    let (failure_tx, failure_rx) = channel::bounded(1);
+    let failure = Arc::new(NotificationFailure {
+        target_pid: child.id(),
+        reported: AtomicBool::new(false),
+        tx: failure_tx,
+    });
     let loop_cfg = Arc::clone(&cfg);
     let loop_relays = Arc::clone(&relays);
-    thread::spawn(move || notification_loop(listener_fd, loop_cfg, loop_relays));
+    let loop_failure = Arc::clone(&failure);
+    thread::spawn(move || {
+        if std::panic::catch_unwind(|| {
+            notification_loop(listener_fd, loop_cfg, loop_relays, failure)
+        })
+        .is_err()
+        {
+            loop_failure.report(
+                "seccomp notification loop panicked",
+                io::Error::other("notification loop panicked"),
+            );
+        }
+    });
 
     let status = child.wait().context("wait for target")?;
+    if let Ok(failure) = failure_rx.try_recv() {
+        bail!("seccomp notification handling failed: {failure}");
+    }
     if let Some(code) = status.code() {
         Ok(code)
     } else if let Some(signal) = status.signal() {
@@ -180,6 +219,7 @@ fn notification_loop(
     listener_fd: Arc<OwnedFd>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
+    failure: Arc<NotificationFailure>,
 ) {
     let worker_count = notification_worker_count();
     let (tx, rx) = channel::bounded::<SeccompNotif>(
@@ -190,8 +230,15 @@ fn notification_loop(
         let worker_listener_fd = Arc::clone(&listener_fd);
         let worker_cfg = Arc::clone(&cfg);
         let worker_relays = Arc::clone(&relays);
+        let worker_failure = Arc::clone(&failure);
         thread::spawn(move || {
-            notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
+            notification_worker(
+                worker_listener_fd,
+                worker_rx,
+                worker_cfg,
+                worker_relays,
+                worker_failure,
+            )
         });
     }
     let blocking_tx = if cfg.enable_dns || cfg.enable_udp {
@@ -201,8 +248,15 @@ fn notification_loop(
             let worker_listener_fd = Arc::clone(&listener_fd);
             let worker_cfg = Arc::clone(&cfg);
             let worker_relays = Arc::clone(&relays);
+            let worker_failure = Arc::clone(&failure);
             thread::spawn(move || {
-                notification_worker(worker_listener_fd, worker_rx, worker_cfg, worker_relays)
+                notification_worker(
+                    worker_listener_fd,
+                    worker_rx,
+                    worker_cfg,
+                    worker_relays,
+                    worker_failure,
+                )
             });
         }
         Some(blocking_tx)
@@ -222,20 +276,49 @@ fn notification_loop(
                             notif,
                             cfg.debug,
                         ) {
+                            if !report_thread_notification_error(
+                                &failure,
+                                "respond to notification",
+                            ) {
+                                failure.report(
+                                    "blocking notification workers stopped",
+                                    io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "blocking notification queue disconnected",
+                                    ),
+                                );
+                            }
+                            return;
+                        }
+                        if report_thread_notification_error(&failure, "respond to notification") {
                             return;
                         }
                         continue;
                     }
                 }
                 if !try_queue_notification(&tx, listener_raw_fd, notif, cfg.debug, "notification") {
+                    if !report_thread_notification_error(&failure, "respond to notification") {
+                        failure.report(
+                            "notification workers stopped",
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "notification queue disconnected",
+                            ),
+                        );
+                    }
+                    return;
+                }
+                if report_thread_notification_error(&failure, "respond to notification") {
                     return;
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return,
             Err(err) => {
                 if cfg.debug {
                     eprintln!("yatht: notification loop stopped: {err}");
                 }
+                failure.report("receive seccomp notification", err);
                 return;
             }
         }
@@ -320,19 +403,41 @@ fn notification_worker(
     rx: channel::Receiver<SeccompNotif>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
+    failure: Arc<NotificationFailure>,
 ) {
     loop {
         let notif = rx.recv();
         let Ok(notif) = notif else {
             return;
         };
-        handle_notification(
-            listener_fd.as_raw_fd(),
-            notif,
-            Arc::clone(&cfg),
-            Arc::clone(&relays),
-        );
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_notification(
+                listener_fd.as_raw_fd(),
+                notif,
+                Arc::clone(&cfg),
+                Arc::clone(&relays),
+            );
+        }))
+        .is_err()
+        {
+            failure.report(
+                "seccomp notification worker panicked",
+                io::Error::other("notification worker panicked"),
+            );
+            return;
+        }
+        if report_thread_notification_error(&failure, "respond to seccomp notification") {
+            return;
+        }
     }
+}
+
+fn report_thread_notification_error(failure: &NotificationFailure, context: &str) -> bool {
+    let Some(err) = seccomp::take_notification_error() else {
+        return false;
+    };
+    failure.report(context, err);
+    true
 }
 
 fn notification_worker_count() -> usize {
