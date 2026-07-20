@@ -506,6 +506,7 @@ fn build_non_socket_sendto_probe() -> (TempDir, PathBuf) {
     fs::write(
         &src,
         r#"
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -537,6 +538,19 @@ int main(void) {
     if (fstat(fd, &after) != 0) return 6;
     if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
         before.st_mode != after.st_mode) return 7;
+
+    int replaced = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    if (replaced < 0) return 8;
+    if (dup2(fd, replaced) != replaced) return 9;
+    struct stat duplicated;
+    if (fstat(replaced, &duplicated) != 0) return 10;
+    if (before.st_dev != duplicated.st_dev ||
+        before.st_ino != duplicated.st_ino) return 11;
+
+    int cloexec = open("/dev/zero", O_RDONLY);
+    if (cloexec < 0) return 12;
+    if (dup3(fd, cloexec, O_CLOEXEC) != cloexec) return 13;
+    if ((fcntl(cloexec, F_GETFD) & FD_CLOEXEC) == 0) return 14;
     return 0;
 }
 "#,

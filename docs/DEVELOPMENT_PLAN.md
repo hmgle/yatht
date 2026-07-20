@@ -61,8 +61,8 @@ is `socks5://127.0.0.1:1080`.
   to the parent, then `execve`s the requested target after the parent
   acknowledges receipt.
 - The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
-  send/receive and close syscalls only when DNS or generic UDP redirection is
-  enabled. All other syscalls are allowed.
+  send/receive plus descriptor close/replacement syscalls only when DNS or
+  generic UDP redirection is enabled. All other syscalls are allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
@@ -90,9 +90,11 @@ is `socks5://127.0.0.1:1080`.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
   target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
   `sendmsg(2)` destinations are forwarded by the notification handler;
-  connected UDP sends are read by the relay socket. `close(2)` and closing
-  `close_range(2)` calls remove matching relays so long-running targets do not
-  retain relay threads after closing UDP sockets.
+  connected UDP sends are read by the relay socket. `close(2)`, closing
+  `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay creation so
+  a concurrent descriptor change cannot cross the injection window. Closing
+  calls also remove matching relays so long-running targets do not retain relay
+  threads after closing UDP sockets.
 - Each UDP relay has a bounded job queue. Blocking sends apply backpressure;
   nonblocking sends return `EAGAIN` when the queue is full.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused

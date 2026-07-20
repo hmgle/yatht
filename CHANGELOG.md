@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Reject invalid and unsupported configuration combinations at startup.
-- Prevent UDP relay injection from replacing non-socket descriptors.
+- Serialize UDP relay injection with trapped descriptor replacement.
 - Keep proxy handshake timeouts out of target TCP connections.
 - Terminate the target when seccomp notification handling fails fatally.
 - Keep the notification listener alive for adopted target descendants.

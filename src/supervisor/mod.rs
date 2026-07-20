@@ -481,7 +481,11 @@ fn try_queue_notification(
 fn should_block_when_queue_full(notif: &SeccompNotif) -> bool {
     matches!(
         notif.data.nr as libc::c_long,
-        libc::SYS_connect | libc::SYS_close | libc::SYS_close_range
+        libc::SYS_connect
+            | libc::SYS_close
+            | libc::SYS_close_range
+            | libc::SYS_dup2
+            | libc::SYS_dup3
     )
 }
 
@@ -592,8 +596,18 @@ fn handle_notification(
         libc::SYS_recvmsg => handle_recvmsg(listener_fd, notif, relays),
         libc::SYS_close => handle_close(listener_fd, notif, relays),
         libc::SYS_close_range => handle_close_range(listener_fd, notif, relays),
+        libc::SYS_dup2 | libc::SYS_dup3 => handle_fd_replacement(listener_fd, notif, relays),
         _ => seccomp::send_continue(listener_fd, notif.id),
     }
+}
+
+fn handle_fd_replacement(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let old_fd = notif.data.args[0] as RawFd;
+    let new_fd = notif.data.args[1] as RawFd;
+    if old_fd != new_fd {
+        relays.wait_for_creation(notif.pid, new_fd);
+    }
+    seccomp::send_continue(listener_fd, notif.id);
 }
 
 fn handle_close(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
@@ -1426,25 +1440,6 @@ impl UdpRelayRegistry {
             return Ok(Some(handle));
         }
 
-        // Only replace real Internet datagram sockets. Other descriptors must
-        // continue in the kernel so it can preserve their native errno and
-        // semantics instead of allowing SETFD to clobber them.
-        let target_snapshot = match inspect_udp_target(pid, fd)? {
-            Some(snapshot) => snapshot,
-            None => {
-                // Another creator may have replaced the socket after the fast
-                // lookup missed. Recheck before continuing the syscall on what
-                // may now be the injected AF_UNIX endpoint.
-                if let Some(handle) = self.lookup_handle(pid, fd, true) {
-                    if let Some((dest, route)) = default_dest {
-                        handle.set_default_dest(dest, route);
-                    }
-                    return Ok(Some(handle));
-                }
-                return Ok(None);
-            }
-        };
-
         let key = relay_key(pid, fd);
 
         // Claim the key under the lock before building anything. Publishing a
@@ -1482,6 +1477,15 @@ impl UdpRelayRegistry {
         // waiters on every early return (build error, injection failure) so a
         // failed attempt never strands lookups waiting forever.
         let mut guard = CreatingGuard::new(self, key);
+
+        // Inspect only after publishing Creating. Trapped close/close_range and
+        // dup2/dup3 operations targeting this fd now wait until injection has
+        // either committed or failed, so they cannot replace the descriptor
+        // between this snapshot and ADDFD.
+        let target_snapshot = match inspect_udp_target(pid, fd)? {
+            Some(snapshot) => snapshot,
+            None => return Ok(None),
+        };
 
         let relay_cfg = build_udp_relay_config(cfg)?;
         let (relay_socket, target_fd) =
@@ -1595,15 +1599,17 @@ impl UdpRelayRegistry {
     }
 
     fn remove_for_close(&self, pid: u32, fd: RawFd) {
-        if self.inner.lock().unwrap().is_empty() {
-            return;
-        }
         let key = relay_key(pid, fd);
         let handle = {
-            let relays = self.inner.lock().unwrap();
-            match relays.get(&key) {
-                Some(RelayState::Ready(handle)) => handle.clone(),
-                _ => return,
+            let mut relays = self.inner.lock().unwrap();
+            loop {
+                match relays.get(&key) {
+                    Some(RelayState::Ready(handle)) => break handle.clone(),
+                    Some(RelayState::Creating) => {
+                        relays = self.created.wait(relays).unwrap();
+                    }
+                    None => return,
+                }
             }
         };
         if handle.target_fd_matches(pid, fd) {
@@ -1612,12 +1618,16 @@ impl UdpRelayRegistry {
     }
 
     fn remove_for_close_range(&self, pid: u32, first: u32, last: u32) {
-        if self.inner.lock().unwrap().is_empty() {
-            return;
-        }
         let tgid = cached_thread_group_id(pid).unwrap_or(pid);
         let candidates = {
-            let relays = self.inner.lock().unwrap();
+            let mut relays = self.inner.lock().unwrap();
+            while relays.iter().any(|(key, state)| {
+                key.tgid == tgid
+                    && fd_in_close_range(key.fd, first, last)
+                    && matches!(state, RelayState::Creating)
+            }) {
+                relays = self.created.wait(relays).unwrap();
+            }
             relays
                 .iter()
                 .filter_map(|(key, state)| {
@@ -1636,6 +1646,14 @@ impl UdpRelayRegistry {
             if handle.target_fd_matches(pid, key.fd) {
                 self.remove_ready_if_current(key, handle.target_identity);
             }
+        }
+    }
+
+    fn wait_for_creation(&self, pid: u32, fd: RawFd) {
+        let key = relay_key(pid, fd);
+        let mut relays = self.inner.lock().unwrap();
+        while matches!(relays.get(&key), Some(RelayState::Creating)) {
+            relays = self.created.wait(relays).unwrap();
         }
     }
 
@@ -3081,6 +3099,30 @@ mod tests {
             registry.lookup(std::process::id(), 9, false),
             RelayLookup::Creating
         ));
+    }
+
+    #[test]
+    fn fd_replacement_waits_for_relay_creation() {
+        let registry = Arc::new(UdpRelayRegistry::default());
+        let pid = std::process::id();
+        let fd = 9;
+        let key = relay_key(pid, fd);
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .insert(key, RelayState::Creating);
+        let waiter_registry = Arc::clone(&registry);
+        let (done_tx, done_rx) = channel::bounded(1);
+        thread::spawn(move || {
+            waiter_registry.wait_for_creation(pid, fd);
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        registry.inner.lock().unwrap().remove(&key);
+        registry.created.notify_all();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
