@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Reject invalid and unsupported configuration combinations at startup.
+- Prevent UDP relay injection from replacing non-socket descriptors.
+- Keep proxy handshake timeouts out of target TCP connections.
+- Terminate the target when seccomp notification handling fails fatally.
+- Keep the notification listener alive for adopted target descendants.
+- Bound UDP job and blocking receive queues with explicit backpressure.
+- Clarify that generic UDP and complete Linux socket semantics remain
+  experimental.
+
 ## 0.1.0
 
 - Initial release of `yatht`.

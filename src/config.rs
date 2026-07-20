@@ -14,7 +14,7 @@ use url::Url;
 #[command(
     name = "yatht",
     version,
-    about = "Run a command with TCP and UDP traffic transparently proxied with seccomp user notification"
+    about = "Proxy TCP and experimental UDP for a trusted command with seccomp user notification"
 )]
 pub struct Cli {
     #[arg(long)]
@@ -38,7 +38,10 @@ pub struct Cli {
     #[arg(long, help = "Redirect UDP/53 through DNS-over-TCP")]
     pub enable_dns: bool,
 
-    #[arg(long, help = "Redirect generic UDP through SOCKS5 UDP ASSOCIATE")]
+    #[arg(
+        long,
+        help = "Experimental request/response UDP through SOCKS5 UDP ASSOCIATE"
+    )]
     pub enable_udp: bool,
 
     #[arg(long, help = "DNS-over-TCP upstream for --enable-dns")]
