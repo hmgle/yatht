@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -36,7 +36,6 @@ const UDP_JOB_QUEUE_CAPACITY: usize = 64;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
 
 struct NotificationFailure {
-    target_pid: u32,
     reported: AtomicBool,
     shutting_down: AtomicBool,
     tx: channel::Sender<String>,
@@ -48,10 +47,6 @@ impl NotificationFailure {
             return;
         }
         let _ = self.tx.try_send(format!("{context}: {err}"));
-        unsafe {
-            libc::kill(-(self.target_pid as libc::pid_t), libc::SIGKILL);
-            libc::kill(self.target_pid as libc::pid_t, libc::SIGKILL);
-        }
     }
 }
 
@@ -118,9 +113,6 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let parent_fd = parent_sock;
     unsafe {
         command.pre_exec(move || {
-            if libc::setpgid(0, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
             if child_fd != CONTROL_FD && libc::dup2(child_fd, CONTROL_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -159,7 +151,6 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let listener_fd = Arc::new(listener_fd);
     let (failure_tx, failure_rx) = channel::bounded(1);
     let failure = Arc::new(NotificationFailure {
-        target_pid: child.id(),
         reported: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         tx: failure_tx,
@@ -181,12 +172,7 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
         }
     });
 
-    let status = child.wait().context("wait for target")?;
-    wait_for_descendants().context("wait for target descendants")?;
-    failure.shutting_down.store(true, Ordering::Release);
-    if let Ok(failure) = failure_rx.try_recv() {
-        bail!("seccomp notification handling failed: {failure}");
-    }
+    let status = monitor_target_tree(&mut child, &failure_rx, &failure)?;
     if let Some(code) = status.code() {
         Ok(code)
     } else if let Some(signal) = status.signal() {
@@ -194,6 +180,127 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     } else {
         Ok(1)
     }
+}
+
+fn monitor_target_tree(
+    child: &mut Child,
+    failure_rx: &channel::Receiver<String>,
+    failure: &NotificationFailure,
+) -> Result<ExitStatus> {
+    let mut target_status = None;
+    loop {
+        if let Ok(message) = failure_rx.try_recv() {
+            terminate_target_tree(child, &mut target_status)
+                .context("terminate target after notification failure")?;
+            bail!("seccomp notification handling failed: {message}");
+        }
+
+        if target_status.is_none() {
+            target_status = child.try_wait().context("wait for target")?;
+        }
+
+        if let Some(status) = target_status {
+            if !reap_descendants_nonblocking()? {
+                failure.shutting_down.store(true, Ordering::Release);
+                if let Ok(message) = failure_rx.try_recv() {
+                    bail!("seccomp notification handling failed: {message}");
+                }
+                return Ok(status);
+            }
+        }
+
+        match failure_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(message) => {
+                terminate_target_tree(child, &mut target_status)
+                    .context("terminate target after notification failure")?;
+                bail!("seccomp notification handling failed: {message}");
+            }
+            Err(channel::RecvTimeoutError::Timeout) => {}
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                bail!("seccomp notification failure channel disconnected");
+            }
+        }
+    }
+}
+
+fn terminate_target_tree(
+    child: &mut Child,
+    target_status: &mut Option<ExitStatus>,
+) -> io::Result<()> {
+    if target_status.is_none() {
+        if let Some(status) = child.try_wait()? {
+            *target_status = Some(status);
+        } else {
+            let _ = child.kill();
+            *target_status = Some(child.wait()?);
+        }
+    }
+    terminate_adopted_descendants()
+}
+
+fn terminate_adopted_descendants() -> io::Result<()> {
+    loop {
+        if !reap_descendants_nonblocking()? {
+            return Ok(());
+        }
+
+        for pid in direct_child_pids(std::process::id())? {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn reap_descendants_nonblocking() -> io::Result<bool> {
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if rc > 0 {
+            continue;
+        }
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(false);
+        }
+        return Err(err);
+    }
+}
+
+fn direct_child_pids(parent_pid: u32) -> io::Result<Vec<u32>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let status = match fs::read_to_string(entry.path().join("status")) {
+            Ok(status) => status,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(err) => return Err(err),
+        };
+        let is_child = status.lines().any(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                == Some(parent_pid)
+        });
+        if is_child {
+            children.push(pid);
+        }
+    }
+    Ok(children)
 }
 
 pub fn run_child_stage() -> Result<i32> {
@@ -2784,24 +2891,6 @@ fn set_child_subreaper() -> io::Result<()> {
     }
 }
 
-fn wait_for_descendants() -> io::Result<()> {
-    loop {
-        let mut status = 0;
-        let rc = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if rc > 0 {
-            continue;
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if err.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(());
-        }
-        return Err(err);
-    }
-}
-
 fn socketpair() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
@@ -2912,6 +3001,9 @@ fn decode_os_list(raw: &str) -> Result<Vec<OsString>> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
     use super::*;
 
     #[test]
@@ -2953,6 +3045,35 @@ mod tests {
 
         assert_eq!(key.tgid, std::process::id());
         assert_eq!(key.fd, 9);
+    }
+
+    #[test]
+    fn terminates_adopted_descendant_outside_process_group() {
+        set_child_subreaper().unwrap();
+        let mut parent = Command::new("sh")
+            .arg("-c")
+            .arg("setsid sleep 30 & echo $!")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant_pid = line.trim().parse::<u32>().unwrap();
+        assert!(parent.wait().unwrap().success());
+
+        let adopted = direct_child_pids(std::process::id())
+            .unwrap()
+            .contains(&descendant_pid);
+        let descendant_pgid = unsafe { libc::getpgid(descendant_pid as libc::pid_t) };
+        let result = terminate_adopted_descendants();
+
+        assert!(adopted, "descendant {descendant_pid} was not adopted");
+        assert_eq!(descendant_pgid, descendant_pid as libc::pid_t);
+        result.unwrap();
+        assert_eq!(unsafe { libc::kill(descendant_pid as libc::pid_t, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]
