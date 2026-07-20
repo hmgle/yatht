@@ -466,9 +466,10 @@ fn handle_connect(
                     target_fd,
                     Some((dest, kind)),
                 ) {
-                    Ok(_) => {
+                    Ok(Some(_)) => {
                         seccomp::send_success(listener_fd, notif.id);
                     }
+                    Ok(None) => seccomp::send_continue(listener_fd, notif.id),
                     Err(err) => {
                         if cfg.debug {
                             eprintln!("yatht: UDP relay setup failed: {err:#}");
@@ -681,7 +682,11 @@ fn relay_for_send(
         return Some(handle);
     }
     match relays.ensure(listener_fd, cfg, notif.id, notif.pid, target_fd, None) {
-        Ok(handle) => Some(handle),
+        Ok(Some(handle)) => Some(handle),
+        Ok(None) => {
+            seccomp::send_continue(listener_fd, notif.id);
+            None
+        }
         Err(err) => {
             if cfg.debug {
                 eprintln!("yatht: UDP relay setup failed: {err:#}");
@@ -1000,6 +1005,11 @@ struct FdIdentity {
     ino: libc::ino_t,
 }
 
+struct UdpTargetSnapshot {
+    identity: FdIdentity,
+    flags: TargetFdFlags,
+}
+
 /// Relay slot state. `Creating` is a single-flight marker published under the
 /// lock while a relay's sockets/fd are built outside it; concurrent lookups for
 /// the same key wait for it to resolve rather than missing the (still empty)
@@ -1167,15 +1177,34 @@ impl UdpRelayRegistry {
         pid: u32,
         fd: RawFd,
         default_dest: Option<(Destination, UdpRouteKind)>,
-    ) -> Result<UdpRelayHandle> {
+    ) -> Result<Option<UdpRelayHandle>> {
         // Fast path: reuse an existing relay. This still validates the target
         // fd identity, but it no longer returns an unused duplicate to ensure().
         if let Some(handle) = self.lookup_handle(pid, fd, true) {
             if let Some((dest, route)) = default_dest {
                 handle.set_default_dest(dest, route);
             }
-            return Ok(handle);
+            return Ok(Some(handle));
         }
+
+        // Only replace real Internet datagram sockets. Other descriptors must
+        // continue in the kernel so it can preserve their native errno and
+        // semantics instead of allowing SETFD to clobber them.
+        let target_snapshot = match inspect_udp_target(pid, fd)? {
+            Some(snapshot) => snapshot,
+            None => {
+                // Another creator may have replaced the socket after the fast
+                // lookup missed. Recheck before continuing the syscall on what
+                // may now be the injected AF_UNIX endpoint.
+                if let Some(handle) = self.lookup_handle(pid, fd, true) {
+                    if let Some((dest, route)) = default_dest {
+                        handle.set_default_dest(dest, route);
+                    }
+                    return Ok(Some(handle));
+                }
+                return Ok(None);
+            }
+        };
 
         let key = relay_key(pid, fd);
 
@@ -1192,7 +1221,7 @@ impl UdpRelayRegistry {
                     if let Some((dest, route)) = default_dest {
                         handle.set_default_dest(dest, route);
                     }
-                    return Ok(handle);
+                    return Ok(Some(handle));
                 }
                 match relays.get(&key) {
                     // Another thread is building this relay: wait for it to
@@ -1218,8 +1247,7 @@ impl UdpRelayRegistry {
         let relay_cfg = build_udp_relay_config(cfg)?;
         let (relay_socket, target_fd) =
             make_relay_pair().context("create UDP relay datagram socketpair")?;
-        let target_flags = read_target_fd_flags(pid, fd);
-        if target_flags.status_flags & libc::O_NONBLOCK != 0 {
+        if target_snapshot.flags.status_flags & libc::O_NONBLOCK != 0 {
             let _ = set_nonblocking(target_fd.as_raw_fd());
         }
         let target_identity =
@@ -1230,8 +1258,16 @@ impl UdpRelayRegistry {
             flags: seccomp::ADDFD_FLAG_SETFD,
             srcfd: target_fd.as_raw_fd() as u32,
             newfd: fd as u32,
-            newfd_flags: target_flags.newfd_flags,
+            newfd_flags: target_snapshot.flags.newfd_flags,
         };
+
+        let current_target = duplicate_remote_fd(pid, fd)
+            .context("duplicate UDP target fd immediately before injection")?;
+        if fd_identity(current_target.as_raw_fd()).context("stat current UDP target fd")?
+            != target_snapshot.identity
+        {
+            bail!("UDP target fd changed before relay injection");
+        }
         seccomp::notif_addfd(listener_fd, &mut addfd).context("inject UDP relay fd")?;
         drop(target_fd);
 
@@ -1239,7 +1275,7 @@ impl UdpRelayRegistry {
         // Publish the ready relay and hand the marker off to Ready in one
         // critical section so waiters wake to a usable handle.
         guard.commit(RelayState::Ready(handle.clone()));
-        Ok(handle)
+        Ok(Some(handle))
     }
 
     /// Fast relay lookup. Probes the map under the lock first, so the common
@@ -2162,6 +2198,50 @@ fn socket_type_from_fd(fd: RawFd) -> Option<i32> {
     } else {
         Some(ty)
     }
+}
+
+fn socket_domain_from_fd(fd: RawFd) -> Option<i32> {
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&domain) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            (&mut domain as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        None
+    } else {
+        Some(domain)
+    }
+}
+
+fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> {
+    let target = match duplicate_remote_fd(pid, fd) {
+        Ok(target) => target,
+        Err(err) if matches!(err.raw_os_error(), Some(libc::EBADF | libc::ENOTSOCK)) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err).context("duplicate UDP target fd"),
+    };
+    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
+        || !matches!(
+            socket_domain_from_fd(target.as_raw_fd()),
+            Some(libc::AF_INET | libc::AF_INET6)
+        )
+    {
+        return Ok(None);
+    }
+
+    let mut flags = read_target_fd_flags(pid, fd);
+    flags.status_flags = fd_status_flags(target.as_raw_fd()).unwrap_or(flags.status_flags);
+    Ok(Some(UdpTargetSnapshot {
+        identity: fd_identity(target.as_raw_fd()).context("stat UDP target fd")?,
+        flags,
+    }))
 }
 
 fn fd_identity(fd: RawFd) -> io::Result<FdIdentity> {

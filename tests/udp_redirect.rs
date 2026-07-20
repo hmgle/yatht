@@ -10,6 +10,26 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
+fn does_not_replace_non_socket_fd_for_udp_send() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_non_socket_sendto_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--proxy-local")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+}
+
+#[test]
 fn redirects_dns_udp_over_tcp_proxy() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -470,6 +490,59 @@ fn main() {
     )
     .unwrap();
     let status = Command::new("rustc")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_non_socket_sendto_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("non_socket_sendto_probe.c");
+    let bin = dir.path().join("non_socket_sendto_probe");
+    fs::write(
+        &src,
+        r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return 2;
+
+    struct stat before;
+    if (fstat(fd, &before) != 0) return 3;
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(53);
+    if (inet_pton(AF_INET, "8.8.8.8", &dest.sin_addr) != 1) return 4;
+
+    errno = 0;
+    ssize_t rc = sendto(fd, "x", 1, 0,
+                        (struct sockaddr *)&dest, sizeof(dest));
+    if (rc != -1 || errno != ENOTSOCK) return 5;
+
+    struct stat after;
+    if (fstat(fd, &after) != 0) return 6;
+    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_mode != after.st_mode) return 7;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
         .arg(&src)
         .arg("-o")
         .arg(&bin)
