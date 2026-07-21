@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ pub struct EffectiveConfig {
     pub connect_timeout: Duration,
     pub enable_dns: bool,
     pub enable_udp: bool,
-    pub dns_server: String,
+    pub dns_server: Option<SocketAddr>,
     pub debug: bool,
     pub command: Vec<OsString>,
 }
@@ -130,6 +130,15 @@ impl EffectiveConfig {
         let mut proxy_cidrs = file_cfg.proxy_cidrs.unwrap_or_default();
         proxy_cidrs.extend(cli.proxy_cidrs);
 
+        let enable_dns = cli.enable_dns || file_cfg.enable_dns.unwrap_or(false);
+        let dns_server_raw = cli
+            .dns_server
+            .or(file_cfg.dns_server)
+            .unwrap_or_else(|| "1.1.1.1:53".to_string());
+        let dns_server = enable_dns
+            .then(|| resolve_dns_server(&dns_server_raw))
+            .transpose()?;
+
         let cfg = Self {
             proxy,
             bypass_local: if cli.proxy_local {
@@ -140,12 +149,9 @@ impl EffectiveConfig {
             bypass_cidrs,
             proxy_cidrs,
             connect_timeout,
-            enable_dns: cli.enable_dns || file_cfg.enable_dns.unwrap_or(false),
+            enable_dns,
             enable_udp: cli.enable_udp || file_cfg.enable_udp.unwrap_or(false),
-            dns_server: cli
-                .dns_server
-                .or(file_cfg.dns_server)
-                .unwrap_or_else(|| "1.1.1.1:53".to_string()),
+            dns_server,
             debug: cli.debug || file_cfg.debug.unwrap_or(false),
             command: cli.command,
         };
@@ -159,18 +165,6 @@ impl EffectiveConfig {
         }
         if self.enable_udp && matches!(self.proxy, ProxyConfig::Http { .. }) {
             bail!("generic UDP redirection requires a SOCKS5 proxy");
-        }
-        if self.enable_dns {
-            let mut addrs = self
-                .dns_server
-                .to_socket_addrs()
-                .with_context(|| format!("resolve DNS server {:?}", self.dns_server))?;
-            if !addrs.any(|addr| addr.port() != 0) {
-                bail!(
-                    "DNS server {:?} resolved to no address with a nonzero port",
-                    self.dns_server
-                );
-            }
         }
         Ok(())
     }
@@ -187,6 +181,13 @@ impl EffectiveConfig {
         }
         Route::Proxy
     }
+}
+
+fn resolve_dns_server(raw: &str) -> Result<SocketAddr> {
+    raw.to_socket_addrs()
+        .with_context(|| format!("resolve DNS server {raw:?}"))?
+        .find(|addr| addr.port() != 0)
+        .ok_or_else(|| anyhow!("DNS server {raw:?} resolved to no address with a nonzero port"))
 }
 
 impl ProxyConfig {
@@ -323,12 +324,43 @@ mod tests {
 
     #[test]
     fn rejects_invalid_dns_server_when_dns_is_enabled() {
-        let mut cfg = test_config();
-        cfg.enable_dns = true;
-        cfg.dns_server = "invalid DNS server".to_string();
-
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = resolve_dns_server("invalid DNS server")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("resolve DNS server"), "{err}");
+    }
+
+    #[test]
+    fn resolves_dns_server_to_a_nonzero_port() {
+        assert_eq!(
+            resolve_dns_server("127.0.0.1:53").unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 53))
+        );
+        assert!(resolve_dns_server("127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn load_stores_resolved_dns_server() {
+        let cli = Cli {
+            config: None,
+            proxy: None,
+            bypass_cidrs: Vec::new(),
+            proxy_cidrs: Vec::new(),
+            proxy_local: false,
+            connect_timeout: None,
+            enable_dns: true,
+            enable_udp: false,
+            dns_server: Some("127.0.0.1:5353".to_string()),
+            debug: false,
+            command: vec![OsString::from("true")],
+        };
+
+        let cfg = EffectiveConfig::load(cli).unwrap();
+
+        assert_eq!(
+            cfg.dns_server,
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 5353)))
+        );
     }
 
     #[test]
@@ -341,7 +373,7 @@ mod tests {
             connect_timeout: Duration::from_secs(10),
             enable_dns: false,
             enable_udp: false,
-            dns_server: "1.1.1.1:53".to_string(),
+            dns_server: None,
             debug: false,
             command: vec![OsString::from("true")],
         };
@@ -380,7 +412,7 @@ mod tests {
             connect_timeout: Duration::from_secs(10),
             enable_dns: false,
             enable_udp: false,
-            dns_server: "1.1.1.1:53".to_string(),
+            dns_server: None,
             debug: false,
             command: vec![OsString::from("true")],
         }

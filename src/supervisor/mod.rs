@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -1656,22 +1656,24 @@ fn valid_relay_locked(
     }
 }
 
-fn build_udp_relay_config(cfg: &EffectiveConfig) -> Result<UdpRelayConfig> {
-    let dns_server = if cfg.enable_dns {
-        parse_destination_addr(&cfg.dns_server).context("parse DNS server")?
-    } else {
-        Destination {
+fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
+    let dns_server = cfg
+        .dns_server
+        .map(|addr| Destination {
+            ip: addr.ip(),
+            port: addr.port(),
+        })
+        .unwrap_or(Destination {
             ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 0,
-        }
-    };
+        });
 
-    Ok(UdpRelayConfig {
+    UdpRelayConfig {
         proxy: cfg.proxy.clone(),
         dns_server,
         timeout: cfg.connect_timeout,
         debug: cfg.debug,
-    })
+    }
 }
 
 impl UdpRelayRegistry {
@@ -1740,7 +1742,7 @@ impl UdpRelayRegistry {
             None => return Ok(None),
         };
 
-        let relay_cfg = build_udp_relay_config(cfg)?;
+        let relay_cfg = build_udp_relay_config(cfg);
         let (relay_socket, target_fd) =
             make_relay_pair().context("create UDP relay datagram socketpair")?;
         if target_snapshot.flags.status_flags & libc::O_NONBLOCK != 0 {
@@ -3045,18 +3047,6 @@ fn advance_iovecs(iovecs: &mut [libc::iovec], start: &mut usize, mut bytes: usiz
     }
 }
 
-fn parse_destination_addr(raw: &str) -> Result<Destination> {
-    let socket_addr = raw
-        .to_socket_addrs()
-        .with_context(|| format!("resolve destination {raw}"))?
-        .next()
-        .ok_or_else(|| anyhow!("destination {raw} resolved to no addresses"))?;
-    Ok(Destination {
-        ip: socket_addr.ip(),
-        port: socket_addr.port(),
-    })
-}
-
 fn parse_sockaddr(raw: &[u8]) -> Result<Destination> {
     if raw.len() < 2 {
         bail!("sockaddr too short");
@@ -3654,7 +3644,7 @@ mod tests {
             connect_timeout: Duration::from_secs(10),
             enable_dns,
             enable_udp: false,
-            dns_server: "1.1.1.1:53".to_string(),
+            dns_server: enable_dns.then(|| SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53))),
             debug: false,
             command: Vec::new(),
         }
