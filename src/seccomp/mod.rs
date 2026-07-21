@@ -291,14 +291,21 @@ pub fn notif_send(fd: RawFd, resp: &mut SeccompNotifResp) -> io::Result<()> {
 }
 
 pub fn notif_id_valid(fd: RawFd, id: u64) -> bool {
-    let mut id = id;
-    match ioctl_mut_retry(fd, ioctl_notif_id_valid(), &mut id) {
-        Ok(()) => true,
-        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => false,
+    match notif_id_valid_result(fd, id) {
+        Ok(valid) => valid,
         Err(err) => {
             record_notification_error(err);
             false
         }
+    }
+}
+
+pub fn notif_id_valid_result(fd: RawFd, id: u64) -> io::Result<bool> {
+    let mut id = id;
+    match ioctl_mut_retry(fd, ioctl_notif_id_valid(), &mut id) {
+        Ok(()) => Ok(true),
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -511,6 +518,12 @@ mod tests {
     #[test]
     fn records_fatal_notification_ioctl_errors() {
         assert!(take_notification_error().is_none());
+        assert_eq!(
+            notif_id_valid_result(-1, 1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(take_notification_error().is_none());
+
         assert!(!notif_id_valid(-1, 1));
         assert_eq!(
             take_notification_error().and_then(|err| err.raw_os_error()),

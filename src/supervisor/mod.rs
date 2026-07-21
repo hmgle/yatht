@@ -719,16 +719,24 @@ fn blocking_recv_reactor(
         while index > 0 {
             index -= 1;
             let revents = pollfds[index + 1].revents;
-            if revents == 0
-                && seccomp::notif_id_valid(listener_fd.as_raw_fd(), pending[index].notif.id)
-            {
-                continue;
+            if revents == 0 {
+                match seccomp::notif_id_valid_result(
+                    listener_fd.as_raw_fd(),
+                    pending[index].notif.id,
+                ) {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        pending.swap_remove(index);
+                        continue;
+                    }
+                    Err(err) => {
+                        failure.report("validate blocking UDP receive", err);
+                        return;
+                    }
+                }
             }
 
             let pending_recv = pending.swap_remove(index);
-            if revents == 0 {
-                continue;
-            }
             match handle_recv_notification_once(
                 listener_fd.as_raw_fd(),
                 pending_recv.notif,
