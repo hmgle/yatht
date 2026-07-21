@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -11,7 +11,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel as channel;
@@ -35,6 +35,7 @@ const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
 const UDP_JOB_QUEUE_CAPACITY: usize = 64;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
 const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
+const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
 
 struct NotificationFailure {
     reported: AtomicBool,
@@ -50,11 +51,27 @@ struct BlockingRecvQueue {
 struct PendingBlockingRecv {
     notif: SeccompNotif,
     relay_fd: OwnedFd,
+    relay: FdIdentity,
+}
+
+#[derive(Clone, Copy)]
+struct BlockingRecvWork {
+    notif: SeccompNotif,
+    relay: Option<FdIdentity>,
+    terminal_revents: libc::c_short,
+}
+
+struct BlockingRecvCompletion {
+    work: BlockingRecvWork,
+    handling: RecvHandling,
 }
 
 enum RecvHandling {
     Completed,
-    Deferred(OwnedFd),
+    Deferred {
+        relay_fd: OwnedFd,
+        relay: FdIdentity,
+    },
 }
 
 impl NotificationFailure {
@@ -397,6 +414,7 @@ fn notification_loop(
                     reactor_wake_fd,
                     reactor_relays,
                     reactor_failure,
+                    worker_count,
                 )
             })
             .is_err()
@@ -432,10 +450,10 @@ fn notification_loop(
                                 "respond to notification",
                             ) {
                                 failure.report(
-                                    "blocking notification workers stopped",
+                                    "blocking receive reactor stopped",
                                     io::Error::new(
                                         io::ErrorKind::BrokenPipe,
-                                        "blocking notification queue disconnected",
+                                        "blocking receive queue disconnected",
                                     ),
                                 );
                             }
@@ -667,38 +685,152 @@ fn is_blocking_recv_notification(notif: &SeccompNotif) -> bool {
     flags & libc::MSG_DONTWAIT == 0
 }
 
-/// Multiplexes all potentially blocking relay receives in one poll set. A
-/// quiet socket is retained here as a pending notification instead of tying up
-/// a notification worker, so readable and explicitly nonblocking receives can
-/// continue to make progress regardless of how many quiet sockets exist.
+fn blocking_recv_worker(
+    listener_fd: Arc<OwnedFd>,
+    rx: channel::Receiver<BlockingRecvWork>,
+    completion_tx: channel::Sender<BlockingRecvCompletion>,
+    wake_fd: Arc<OwnedFd>,
+    relays: Arc<UdpRelayRegistry>,
+    failure: Arc<NotificationFailure>,
+) {
+    while let Ok(work) = rx.recv() {
+        let handling = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_recv_notification_once(
+                listener_fd.as_raw_fd(),
+                work.notif,
+                Arc::clone(&relays),
+                false,
+            )
+        })) {
+            Ok(handling) => handling,
+            Err(_) => {
+                failure.report(
+                    "blocking receive worker panicked",
+                    io::Error::other("blocking receive worker panicked"),
+                );
+                return;
+            }
+        };
+        if report_thread_notification_error(&failure, "respond to blocking UDP receive") {
+            return;
+        }
+        if completion_tx
+            .send(BlockingRecvCompletion { work, handling })
+            .is_err()
+        {
+            return;
+        }
+        wake_eventfd(wake_fd.as_raw_fd());
+    }
+}
+
+fn send_blocking_recv_poll_error(
+    listener_fd: RawFd,
+    notif_id: u64,
+    relay_fd: RawFd,
+    revents: libc::c_short,
+) {
+    let err = if revents & libc::POLLNVAL != 0 {
+        io::Error::from_raw_os_error(libc::EBADF)
+    } else {
+        socket_error(relay_fd).unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET))
+    };
+    send_recv_error(listener_fd, notif_id, &err);
+}
+
+fn queue_ready_blocking_recvs(
+    pending: &mut Vec<PendingBlockingRecv>,
+    pollfds: &[libc::pollfd],
+    in_flight: &mut HashSet<FdIdentity>,
+    work_backlog: &mut VecDeque<BlockingRecvWork>,
+) {
+    let terminal_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    let mut index = pending.len();
+    while index > 0 {
+        index -= 1;
+        let revents = pollfds[index + 1].revents;
+        if revents == 0 || in_flight.contains(&pending[index].relay) {
+            continue;
+        }
+
+        let pending_recv = pending.swap_remove(index);
+        in_flight.insert(pending_recv.relay);
+        work_backlog.push_back(BlockingRecvWork {
+            notif: pending_recv.notif,
+            relay: Some(pending_recv.relay),
+            terminal_revents: revents & terminal_events,
+        });
+    }
+}
+
+/// Owns readiness and pending-notification state without performing payload
+/// copies. Quiet sockets stay in the poll set while ready receives complete in
+/// a bounded worker pool, preserving liveness and parallelism across relays.
 fn blocking_recv_reactor(
     listener_fd: Arc<OwnedFd>,
     rx: channel::Receiver<SeccompNotif>,
     wake_fd: Arc<OwnedFd>,
     relays: Arc<UdpRelayRegistry>,
     failure: Arc<NotificationFailure>,
+    worker_count: usize,
 ) {
+    let (work_tx, work_rx) = channel::bounded::<BlockingRecvWork>(
+        worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
+    );
+    let (completion_tx, completion_rx) = channel::unbounded::<BlockingRecvCompletion>();
+    for _ in 0..worker_count {
+        let worker_listener_fd = Arc::clone(&listener_fd);
+        let worker_rx = work_rx.clone();
+        let worker_completion_tx = completion_tx.clone();
+        let worker_wake_fd = Arc::clone(&wake_fd);
+        let worker_relays = Arc::clone(&relays);
+        let worker_failure = Arc::clone(&failure);
+        thread::spawn(move || {
+            blocking_recv_worker(
+                worker_listener_fd,
+                worker_rx,
+                worker_completion_tx,
+                worker_wake_fd,
+                worker_relays,
+                worker_failure,
+            )
+        });
+    }
+    drop(completion_tx);
+
     let mut pending = Vec::<PendingBlockingRecv>::new();
+    let mut work_backlog = VecDeque::<BlockingRecvWork>::new();
+    let mut in_flight = HashSet::<FdIdentity>::new();
+    let validity_interval = Duration::from_millis(BLOCKING_RECV_POLL_INTERVAL_MS as u64);
+    let mut last_validity_sweep = Instant::now();
+    let mut channels_may_have_more = false;
+    let mut pollfds = Vec::<libc::pollfd>::new();
+
     loop {
-        let mut pollfds = Vec::with_capacity(pending.len() + 1);
+        pollfds.clear();
+        pollfds.reserve(pending.len() + 1);
         pollfds.push(libc::pollfd {
             fd: wake_fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
         pollfds.extend(pending.iter().map(|recv| libc::pollfd {
-            fd: recv.relay_fd.as_raw_fd(),
+            fd: if in_flight.contains(&recv.relay) {
+                -1
+            } else {
+                recv.relay_fd.as_raw_fd()
+            },
             events: libc::POLLIN,
             revents: 0,
         }));
 
-        let rc = unsafe {
-            libc::poll(
-                pollfds.as_mut_ptr(),
-                pollfds.len() as libc::nfds_t,
-                BLOCKING_RECV_POLL_INTERVAL_MS,
-            )
+        let timeout = if channels_may_have_more {
+            0
+        } else {
+            BLOCKING_RECV_POLL_INTERVAL_MS
         };
+        let rc =
+            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -715,11 +847,12 @@ fn blocking_recv_reactor(
             }
         }
 
-        let mut index = pending.len();
-        while index > 0 {
-            index -= 1;
-            let revents = pollfds[index + 1].revents;
-            if revents == 0 {
+        queue_ready_blocking_recvs(&mut pending, &pollfds, &mut in_flight, &mut work_backlog);
+
+        if last_validity_sweep.elapsed() >= validity_interval {
+            let mut index = pending.len();
+            while index > 0 {
+                index -= 1;
                 match seccomp::notif_id_valid_result(
                     listener_fd.as_raw_fd(),
                     pending[index].notif.id,
@@ -735,28 +868,44 @@ fn blocking_recv_reactor(
                     }
                 }
             }
+            last_validity_sweep = Instant::now();
+        }
 
-            let pending_recv = pending.swap_remove(index);
-            match handle_recv_notification_once(
-                listener_fd.as_raw_fd(),
-                pending_recv.notif,
-                Arc::clone(&relays),
-                false,
-            ) {
+        let mut completed = 0;
+        while completed < BLOCKING_RECV_CHANNEL_BUDGET {
+            let completion = match completion_rx.try_recv() {
+                Ok(completion) => completion,
+                Err(channel::TryRecvError::Empty) => break,
+                Err(channel::TryRecvError::Disconnected) => {
+                    failure.report(
+                        "blocking receive workers stopped",
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "blocking receive completion queue disconnected",
+                        ),
+                    );
+                    return;
+                }
+            };
+            completed += 1;
+            if let Some(relay) = completion.work.relay {
+                in_flight.remove(&relay);
+            }
+            match completion.handling {
                 RecvHandling::Completed => {}
-                RecvHandling::Deferred(relay_fd) => {
-                    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                        let err = if revents & libc::POLLNVAL != 0 {
-                            io::Error::from_raw_os_error(libc::EBADF)
-                        } else {
-                            socket_error(relay_fd.as_raw_fd())
-                                .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET))
-                        };
-                        send_recv_error(listener_fd.as_raw_fd(), pending_recv.notif.id, &err);
+                RecvHandling::Deferred { relay_fd, relay } => {
+                    if completion.work.terminal_revents != 0 {
+                        send_blocking_recv_poll_error(
+                            listener_fd.as_raw_fd(),
+                            completion.work.notif.id,
+                            relay_fd.as_raw_fd(),
+                            completion.work.terminal_revents,
+                        );
                     } else {
                         pending.push(PendingBlockingRecv {
-                            notif: pending_recv.notif,
+                            notif: completion.work.notif,
                             relay_fd,
+                            relay,
                         });
                     }
                 }
@@ -766,26 +915,46 @@ fn blocking_recv_reactor(
             }
         }
 
-        loop {
+        let mut received = 0;
+        while received < BLOCKING_RECV_CHANNEL_BUDGET {
             match rx.try_recv() {
-                Ok(notif) => match handle_recv_notification_once(
-                    listener_fd.as_raw_fd(),
+                Ok(notif) => work_backlog.push_back(BlockingRecvWork {
                     notif,
-                    Arc::clone(&relays),
-                    false,
-                ) {
-                    RecvHandling::Completed => {}
-                    RecvHandling::Deferred(relay_fd) => {
-                        pending.push(PendingBlockingRecv { notif, relay_fd });
-                    }
-                },
+                    relay: None,
+                    terminal_revents: 0,
+                }),
                 Err(channel::TryRecvError::Empty) => break,
                 Err(channel::TryRecvError::Disconnected) => return,
             }
-            if report_thread_notification_error(&failure, "respond to blocking UDP receive") {
-                return;
+            received += 1;
+        }
+
+        let mut dispatched = 0;
+        while dispatched < BLOCKING_RECV_CHANNEL_BUDGET {
+            let Some(work) = work_backlog.pop_front() else {
+                break;
+            };
+            match work_tx.try_send(work) {
+                Ok(()) => dispatched += 1,
+                Err(channel::TrySendError::Full(work)) => {
+                    work_backlog.push_front(work);
+                    break;
+                }
+                Err(channel::TrySendError::Disconnected(_)) => {
+                    failure.report(
+                        "blocking receive workers stopped",
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "blocking receive work queue disconnected",
+                        ),
+                    );
+                    return;
+                }
             }
         }
+
+        channels_may_have_more =
+            completed == BLOCKING_RECV_CHANNEL_BUDGET || received == BLOCKING_RECV_CHANNEL_BUDGET;
     }
 }
 
@@ -1385,7 +1554,10 @@ fn handle_recvfrom_once(
             RecvHandling::Completed
         }
         Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
-            RecvHandling::Deferred(relay_fd)
+            RecvHandling::Deferred {
+                relay_fd,
+                relay: handle.target_identity,
+            }
         }
         Err(err) => {
             send_recv_error(listener_fd, notif.id, &err);
@@ -1485,7 +1657,10 @@ fn handle_recvmsg_once(
             RecvHandling::Completed
         }
         Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
-            RecvHandling::Deferred(relay_fd)
+            RecvHandling::Deferred {
+                relay_fd,
+                relay: handle.target_identity,
+            }
         }
         Err(err) => {
             send_recv_error(listener_fd, notif.id, &err);
@@ -1513,7 +1688,7 @@ struct RelayKey {
     fd: RawFd,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FdIdentity {
     dev: libc::dev_t,
     ino: libc::ino_t,
@@ -3559,6 +3734,71 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
         assert_ne!(pollfd.revents & libc::POLLIN, 0);
+    }
+
+    #[test]
+    fn ready_blocking_receives_run_once_per_relay() {
+        let first_relay = FdIdentity { dev: 1, ino: 1 };
+        let second_relay = FdIdentity { dev: 1, ino: 2 };
+        let first_notif = SeccompNotif {
+            id: 1,
+            ..SeccompNotif::default()
+        };
+        let second_notif = SeccompNotif {
+            id: 2,
+            ..SeccompNotif::default()
+        };
+        let third_notif = SeccompNotif {
+            id: 3,
+            ..SeccompNotif::default()
+        };
+        let mut pending = vec![
+            PendingBlockingRecv {
+                notif: first_notif,
+                relay_fd: create_eventfd().unwrap(),
+                relay: first_relay,
+            },
+            PendingBlockingRecv {
+                notif: second_notif,
+                relay_fd: create_eventfd().unwrap(),
+                relay: first_relay,
+            },
+            PendingBlockingRecv {
+                notif: third_notif,
+                relay_fd: create_eventfd().unwrap(),
+                relay: second_relay,
+            },
+        ];
+        let pollfds = std::iter::once(libc::pollfd {
+            fd: -1,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .chain(pending.iter().map(|recv| libc::pollfd {
+            fd: recv.relay_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: libc::POLLIN,
+        }))
+        .collect::<Vec<_>>();
+        let mut in_flight = HashSet::new();
+        let mut work_backlog = VecDeque::new();
+
+        queue_ready_blocking_recvs(&mut pending, &pollfds, &mut in_flight, &mut work_backlog);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notif.id, first_notif.id);
+        assert_eq!(in_flight.len(), 2);
+        assert_eq!(work_backlog.len(), 2);
+        assert_eq!(
+            work_backlog
+                .iter()
+                .filter(|work| work.relay == Some(first_relay))
+                .count(),
+            1
+        );
+        assert!(work_backlog
+            .iter()
+            .any(|work| work.relay == Some(second_relay)));
     }
 
     #[test]

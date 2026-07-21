@@ -82,11 +82,14 @@ is `socks5://127.0.0.1:1080`.
   fall back to direct connections.
 - Nonblocking notifications are dispatched through a bounded queue to a bounded
   worker pool so slow proxy dials apply backpressure without creating one OS
-  thread per notification. Blocking UDP receive notifications use separate
-  workers and an unbounded dispatch queue so queue pressure does not change a
-  blocking socket call into an `EAGAIN` retry. The number of queued receives is
-  bounded by the number of target threads, since each thread can have only one
-  notification pending.
+  thread per notification. A readiness reactor retains pending blocking UDP
+  receives without dedicating a thread to each quiet socket, then dispatches
+  ready receives through a bounded worker pool. Once registered with the
+  reactor, only one completion per relay runs at a time while different relays
+  complete in parallel. The incoming receive queue remains unbounded so queue
+  pressure does not change a blocking socket call into an `EAGAIN` retry; its
+  size is bounded by the number of target threads because each thread can have
+  only one notification pending.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
   target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
   `sendmsg(2)` destinations are forwarded by the notification handler;

@@ -8,6 +8,8 @@
 - Terminate the target when seccomp notification handling fails fatally.
 - Keep the notification listener alive for adopted target descendants.
 - Bound UDP job queues while preserving blocking receive behavior.
+- Complete ready UDP receives in parallel without letting quiet sockets occupy
+  notification workers.
 - Clarify that generic UDP and complete Linux socket semantics remain
   experimental.
 

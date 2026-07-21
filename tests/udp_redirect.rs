@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -179,6 +179,75 @@ fn redirects_threaded_connected_dns_udp_over_tcp_proxy() {
         dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         dns_server
     );
+    socks_thread.join().unwrap();
+}
+
+#[test]
+fn quiet_dns_sockets_do_not_starve_active_receive() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    const QUIET_RECEIVES: usize = 70;
+
+    let (_probe_dir, probe) = build_quiet_receive_probe();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let dns_server = SocketAddr::from((Ipv4Addr::LOCALHOST, 53535));
+    let socks_thread = thread::spawn(move || {
+        let quiet_ready = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let mut handlers = Vec::new();
+        for _ in 0..=QUIET_RECEIVES {
+            let (mut client, _) = socks.accept().unwrap();
+            let handler_quiet_ready = Arc::clone(&quiet_ready);
+            handlers.push(thread::spawn(move || {
+                socks5_greet(&mut client);
+                let _dest = read_socks5_request(&mut client);
+                client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+
+                let mut len = [0_u8; 2];
+                client.read_exact(&mut len).unwrap();
+                let query_len = u16::from_be_bytes(len) as usize;
+                let mut query = vec![0_u8; query_len];
+                client.read_exact(&mut query).unwrap();
+                if query == b"active" {
+                    let (lock, ready) = &*handler_quiet_ready;
+                    let mut quiet_count = lock.lock().unwrap();
+                    while *quiet_count < QUIET_RECEIVES {
+                        quiet_count = ready.wait(quiet_count).unwrap();
+                    }
+                    client.write_all(&9_u16.to_be_bytes()).unwrap();
+                    client.write_all(b"active-ok").unwrap();
+                } else {
+                    let (lock, ready) = &*handler_quiet_ready;
+                    *lock.lock().unwrap() += 1;
+                    ready.notify_all();
+                }
+
+                let mut keepalive = [0_u8; 1];
+                let _ = client.read(&mut keepalive);
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .arg("--proxy")
+        .arg(format!("socks5://{socks_addr}"))
+        .arg("--enable-dns")
+        .arg("--dns-server")
+        .arg(dns_server.to_string())
+        .arg("--")
+        .arg(&probe)
+        .arg("8.8.8.8:53")
+        .arg(QUIET_RECEIVES.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "active-ok");
     socks_thread.join().unwrap();
 }
 
@@ -628,6 +697,59 @@ fn main() {
     .join()
     .unwrap();
     print!("{output}");
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("rustc")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_quiet_receive_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("quiet_receive_probe.rs");
+    let bin = dir.path().join("quiet_receive_probe");
+    fs::write(
+        &src,
+        r#"
+use std::env;
+use std::net::UdpSocket;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let args = env::args().collect::<Vec<_>>();
+    let dest = args[1].clone();
+    let quiet_count = args[2].parse::<usize>().unwrap();
+    let mut quiet_sockets = Vec::new();
+
+    for _ in 0..quiet_count {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.send_to(b"quiet", &dest).unwrap();
+        quiet_sockets.push(socket);
+    }
+    for socket in quiet_sockets {
+        thread::spawn(move || {
+            let mut buf = [0_u8; 16];
+            let _ = socket.recv_from(&mut buf);
+        });
+    }
+
+    thread::sleep(Duration::from_millis(250));
+    let active = UdpSocket::bind("0.0.0.0:0").unwrap();
+    active
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    active.send_to(b"active", &dest).unwrap();
+    let mut buf = [0_u8; 16];
+    let (n, _) = active.recv_from(&mut buf).unwrap();
+    print!("{}", String::from_utf8_lossy(&buf[..n]));
 }
 "#,
     )
