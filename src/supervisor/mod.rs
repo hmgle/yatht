@@ -34,11 +34,27 @@ const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
 const UDP_JOB_QUEUE_CAPACITY: usize = 64;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
+const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
 
 struct NotificationFailure {
     reported: AtomicBool,
     shutting_down: AtomicBool,
     tx: channel::Sender<String>,
+}
+
+struct BlockingRecvQueue {
+    tx: channel::Sender<SeccompNotif>,
+    wake_fd: Arc<OwnedFd>,
+}
+
+struct PendingBlockingRecv {
+    notif: SeccompNotif,
+    relay_fd: OwnedFd,
+}
+
+enum RecvHandling {
+    Completed,
+    Deferred(OwnedFd),
 }
 
 impl NotificationFailure {
@@ -359,25 +375,42 @@ fn notification_loop(
             )
         });
     }
-    let blocking_tx = if cfg.enable_dns || cfg.enable_udp {
+    let blocking_queue = if cfg.enable_dns || cfg.enable_udp {
         let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
-        for _ in 0..worker_count {
-            let worker_rx = blocking_rx.clone();
-            let worker_listener_fd = Arc::clone(&listener_fd);
-            let worker_cfg = Arc::clone(&cfg);
-            let worker_relays = Arc::clone(&relays);
-            let worker_failure = Arc::clone(&failure);
-            thread::spawn(move || {
-                notification_worker(
-                    worker_listener_fd,
-                    worker_rx,
-                    worker_cfg,
-                    worker_relays,
-                    worker_failure,
+        let wake_fd = match create_eventfd() {
+            Ok(fd) => Arc::new(fd),
+            Err(err) => {
+                failure.report("create blocking receive wake fd", err);
+                return;
+            }
+        };
+        let reactor_listener_fd = Arc::clone(&listener_fd);
+        let reactor_relays = Arc::clone(&relays);
+        let reactor_failure = Arc::clone(&failure);
+        let loop_failure = Arc::clone(&failure);
+        let reactor_wake_fd = Arc::clone(&wake_fd);
+        thread::spawn(move || {
+            if std::panic::catch_unwind(|| {
+                blocking_recv_reactor(
+                    reactor_listener_fd,
+                    blocking_rx,
+                    reactor_wake_fd,
+                    reactor_relays,
+                    reactor_failure,
                 )
-            });
-        }
-        Some(blocking_tx)
+            })
+            .is_err()
+            {
+                loop_failure.report(
+                    "blocking receive reactor panicked",
+                    io::Error::other("blocking receive reactor panicked"),
+                );
+            }
+        });
+        Some(BlockingRecvQueue {
+            tx: blocking_tx,
+            wake_fd,
+        })
     } else {
         None
     };
@@ -387,9 +420,9 @@ fn notification_loop(
         match seccomp::notif_recv(listener_raw_fd) {
             Ok(notif) => {
                 if is_blocking_recv_notification(&notif) {
-                    if let Some(blocking_tx) = &blocking_tx {
+                    if let Some(blocking_queue) = &blocking_queue {
                         if !queue_blocking_notification(
-                            blocking_tx,
+                            blocking_queue,
                             listener_raw_fd,
                             notif,
                             cfg.debug,
@@ -509,20 +542,70 @@ fn queue_notification_blocking(
 }
 
 fn queue_blocking_notification(
-    tx: &channel::Sender<SeccompNotif>,
+    queue: &BlockingRecvQueue,
     listener_fd: RawFd,
     notif: SeccompNotif,
     debug: bool,
 ) -> bool {
-    match tx.send(notif) {
-        Ok(()) => true,
+    match queue.tx.send(notif) {
+        Ok(()) => {
+            wake_eventfd(queue.wake_fd.as_raw_fd());
+            true
+        }
         Err(channel::SendError(notif)) => {
             if debug {
-                eprintln!("yatht: blocking recv workers stopped");
+                eprintln!("yatht: blocking recv reactor stopped");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::EIO);
             false
         }
+    }
+}
+
+fn create_eventfd() -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn wake_eventfd(fd: RawFd) {
+    let value = 1_u64;
+    let rc = unsafe {
+        libc::write(
+            fd,
+            (&value as *const u64).cast(),
+            std::mem::size_of_val(&value),
+        )
+    };
+    // A failed or saturated write is harmless: the reactor also wakes on its
+    // bounded validity-check interval and drains the notification channel.
+    let _ = rc;
+}
+
+fn drain_eventfd(fd: RawFd) -> io::Result<()> {
+    let mut value = 0_u64;
+    loop {
+        let rc = unsafe {
+            libc::read(
+                fd,
+                (&mut value as *mut u64).cast(),
+                std::mem::size_of_val(&value),
+            )
+        };
+        if rc >= 0 {
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(err);
     }
 }
 
@@ -576,10 +659,142 @@ fn notification_worker_count() -> usize {
 }
 
 fn is_blocking_recv_notification(notif: &SeccompNotif) -> bool {
-    matches!(
-        notif.data.nr as libc::c_long,
-        libc::SYS_recvfrom | libc::SYS_recvmsg
-    )
+    let flags = match notif.data.nr as libc::c_long {
+        libc::SYS_recvfrom => notif.data.args[3] as i32,
+        libc::SYS_recvmsg => notif.data.args[2] as i32,
+        _ => return false,
+    };
+    flags & libc::MSG_DONTWAIT == 0
+}
+
+/// Multiplexes all potentially blocking relay receives in one poll set. A
+/// quiet socket is retained here as a pending notification instead of tying up
+/// a notification worker, so readable and explicitly nonblocking receives can
+/// continue to make progress regardless of how many quiet sockets exist.
+fn blocking_recv_reactor(
+    listener_fd: Arc<OwnedFd>,
+    rx: channel::Receiver<SeccompNotif>,
+    wake_fd: Arc<OwnedFd>,
+    relays: Arc<UdpRelayRegistry>,
+    failure: Arc<NotificationFailure>,
+) {
+    let mut pending = Vec::<PendingBlockingRecv>::new();
+    loop {
+        let mut pollfds = Vec::with_capacity(pending.len() + 1);
+        pollfds.push(libc::pollfd {
+            fd: wake_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pollfds.extend(pending.iter().map(|recv| libc::pollfd {
+            fd: recv.relay_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+
+        let rc = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                BLOCKING_RECV_POLL_INTERVAL_MS,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            failure.report("poll blocking UDP receives", err);
+            return;
+        }
+
+        if pollfds[0].revents & libc::POLLIN != 0 {
+            if let Err(err) = drain_eventfd(wake_fd.as_raw_fd()) {
+                failure.report("drain blocking receive wake fd", err);
+                return;
+            }
+        }
+
+        let mut index = pending.len();
+        while index > 0 {
+            index -= 1;
+            let revents = pollfds[index + 1].revents;
+            if revents == 0
+                && seccomp::notif_id_valid(listener_fd.as_raw_fd(), pending[index].notif.id)
+            {
+                continue;
+            }
+
+            let pending_recv = pending.swap_remove(index);
+            if revents == 0 {
+                continue;
+            }
+            match handle_recv_notification_once(
+                listener_fd.as_raw_fd(),
+                pending_recv.notif,
+                Arc::clone(&relays),
+                false,
+            ) {
+                RecvHandling::Completed => {}
+                RecvHandling::Deferred(relay_fd) => {
+                    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                        let err = if revents & libc::POLLNVAL != 0 {
+                            io::Error::from_raw_os_error(libc::EBADF)
+                        } else {
+                            socket_error(relay_fd.as_raw_fd())
+                                .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET))
+                        };
+                        send_recv_error(listener_fd.as_raw_fd(), pending_recv.notif.id, &err);
+                    } else {
+                        pending.push(PendingBlockingRecv {
+                            notif: pending_recv.notif,
+                            relay_fd,
+                        });
+                    }
+                }
+            }
+            if report_thread_notification_error(&failure, "respond to blocking UDP receive") {
+                return;
+            }
+        }
+
+        loop {
+            match rx.try_recv() {
+                Ok(notif) => match handle_recv_notification_once(
+                    listener_fd.as_raw_fd(),
+                    notif,
+                    Arc::clone(&relays),
+                    false,
+                ) {
+                    RecvHandling::Completed => {}
+                    RecvHandling::Deferred(relay_fd) => {
+                        pending.push(PendingBlockingRecv { notif, relay_fd });
+                    }
+                },
+                Err(channel::TryRecvError::Empty) => break,
+                Err(channel::TryRecvError::Disconnected) => return,
+            }
+            if report_thread_notification_error(&failure, "respond to blocking UDP receive") {
+                return;
+            }
+        }
+    }
+}
+
+fn handle_recv_notification_once(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    relays: Arc<UdpRelayRegistry>,
+    wait_for_readable: bool,
+) -> RecvHandling {
+    match notif.data.nr as libc::c_long {
+        libc::SYS_recvfrom => handle_recvfrom_once(listener_fd, notif, relays, wait_for_readable),
+        libc::SYS_recvmsg => handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable),
+        _ => {
+            seccomp::send_continue(listener_fd, notif.id);
+            RecvHandling::Completed
+        }
+    }
 }
 
 fn handle_notification(
@@ -1078,6 +1293,15 @@ fn recv_request_is_nonblocking(pid: u32, fd: RawFd, flags: i32) -> io::Result<bo
 }
 
 fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let _ = handle_recvfrom_once(listener_fd, notif, relays, true);
+}
+
+fn handle_recvfrom_once(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    relays: Arc<UdpRelayRegistry>,
+    wait_for_readable: bool,
+) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
     let buf_ptr = notif.data.args[1];
     let len = notif.data.args[2] as usize;
@@ -1086,12 +1310,12 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     let addr_len_ptr = notif.data.args[5];
 
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
+        return RecvHandling::Completed;
     }
     let Some((handle, relay_fd)) =
         lookup_relay_for_recv(listener_fd, &notif, &relays, target_fd, flags)
     else {
-        return;
+        return RecvHandling::Completed;
     };
     // A single UDP datagram never exceeds MAX_UDP_PAYLOAD, so cap the local
     // receive buffer instead of continuing the syscall on the relay fd: a plain
@@ -1100,14 +1324,14 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     // the recvmsg capacity clamp below).
     let capacity = len.min(MAX_UDP_PAYLOAD);
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
+        return RecvHandling::Completed;
     }
     let addr_len = if src_addr != 0 && addr_len_ptr != 0 {
         match read_socklen(notif.pid, addr_len_ptr) {
             Ok(addr_len) => Some(addr_len),
             Err(_) => {
                 seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-                return;
+                return RecvHandling::Completed;
             }
         }
     } else {
@@ -1115,8 +1339,10 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
     };
 
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
+        return RecvHandling::Completed;
     }
+
+    let nonblocking = recv_is_nonblocking(relay_fd.as_raw_fd(), flags);
 
     match recv_from_relay_fd(
         listener_fd,
@@ -1125,6 +1351,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
         capacity,
         flags,
         &handle.pending_sources,
+        wait_for_readable,
     ) {
         Ok(received) => {
             let source = received.source;
@@ -1134,7 +1361,7 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
                 } else {
                     seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                 }
-                return;
+                return RecvHandling::Completed;
             }
             if let Some(addr_len) = addr_len {
                 if let Some(source) = source {
@@ -1142,48 +1369,64 @@ fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelay
                         .is_err()
                     {
                         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-                        return;
+                        return RecvHandling::Completed;
                     }
                 }
             }
             seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
+            RecvHandling::Completed
         }
-        Err(err) => send_recv_error(listener_fd, notif.id, &err),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
+            RecvHandling::Deferred(relay_fd)
+        }
+        Err(err) => {
+            send_recv_error(listener_fd, notif.id, &err);
+            RecvHandling::Completed
+        }
     }
 }
 
 fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let _ = handle_recvmsg_once(listener_fd, notif, relays, true);
+}
+
+fn handle_recvmsg_once(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    relays: Arc<UdpRelayRegistry>,
+    wait_for_readable: bool,
+) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
     let msg_ptr = notif.data.args[1];
     let flags = notif.data.args[2] as i32;
 
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
+        return RecvHandling::Completed;
     }
     let Some((handle, relay_fd)) =
         lookup_relay_for_recv(listener_fd, &notif, &relays, target_fd, flags)
     else {
-        return;
+        return RecvHandling::Completed;
     };
     if msg_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-        return;
+        return RecvHandling::Completed;
     }
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
+        return RecvHandling::Completed;
     }
     let msg = match read_msghdr(notif.pid, msg_ptr) {
         Ok(msg) => msg,
         Err(_) => {
             seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-            return;
+            return RecvHandling::Completed;
         }
     };
     let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
         Err(_) => {
             seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-            return;
+            return RecvHandling::Completed;
         }
     };
     let capacity = iovecs
@@ -1193,8 +1436,10 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
         .unwrap_or(MAX_UDP_PAYLOAD);
 
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
-        return;
+        return RecvHandling::Completed;
     }
+
+    let nonblocking = recv_is_nonblocking(relay_fd.as_raw_fd(), flags);
 
     match recv_msg_from_relay_fd(
         listener_fd,
@@ -1203,6 +1448,7 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
         capacity,
         flags,
         &handle.pending_sources,
+        wait_for_readable,
     ) {
         Ok(received) => {
             let source = received.source;
@@ -1215,7 +1461,7 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
                 .is_err()
             {
                 seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-                return;
+                return RecvHandling::Completed;
             }
             if msg.name != 0 {
                 if let Some(source) = source {
@@ -1223,13 +1469,20 @@ fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayR
                         .is_err()
                     {
                         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-                        return;
+                        return RecvHandling::Completed;
                     }
                 }
             }
             seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
+            RecvHandling::Completed
         }
-        Err(err) => send_recv_error(listener_fd, notif.id, &err),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
+            RecvHandling::Deferred(relay_fd)
+        }
+        Err(err) => {
+            send_recv_error(listener_fd, notif.id, &err);
+            RecvHandling::Completed
+        }
     }
 }
 
@@ -2170,11 +2423,12 @@ fn recv_from_relay_fd(
     capacity: usize,
     flags: i32,
     pending: &Mutex<VecDeque<Destination>>,
+    wait_for_readable: bool,
 ) -> io::Result<RelayRecvfrom> {
     let nonblocking = recv_is_nonblocking(relay_fd, flags);
     let mut payload = vec![0_u8; capacity];
     loop {
-        if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
+        if !nonblocking && wait_for_readable && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
         }
         let (result, source) = claim_datagram(pending, flags, || unsafe {
@@ -2199,7 +2453,7 @@ fn recv_from_relay_fd(
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
+                if err.kind() == io::ErrorKind::WouldBlock && !nonblocking && wait_for_readable {
                     wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
                     continue;
                 }
@@ -2240,6 +2494,7 @@ fn recv_msg_from_relay_fd(
     capacity: usize,
     flags: i32,
     pending: &Mutex<VecDeque<Destination>>,
+    wait_for_readable: bool,
 ) -> io::Result<RelayRecvmsg> {
     let nonblocking = recv_is_nonblocking(relay_fd, flags);
     let mut payload = vec![0_u8; capacity];
@@ -2252,7 +2507,7 @@ fn recv_msg_from_relay_fd(
     msg.msg_iovlen = 1;
 
     loop {
-        if !nonblocking && !seccomp::notif_id_valid(listener_fd, notif_id) {
+        if !nonblocking && wait_for_readable && !seccomp::notif_id_valid(listener_fd, notif_id) {
             return Err(notification_interrupted());
         }
         let (result, source) = claim_datagram(pending, flags, || unsafe {
@@ -2273,7 +2528,7 @@ fn recv_msg_from_relay_fd(
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                if err.kind() == io::ErrorKind::WouldBlock && !nonblocking {
+                if err.kind() == io::ErrorKind::WouldBlock && !nonblocking && wait_for_readable {
                     wait_for_relay_readable(listener_fd, notif_id, relay_fd)?;
                     continue;
                 }
@@ -3283,24 +3538,61 @@ mod tests {
     }
 
     #[test]
-    fn blocking_receive_dispatch_waits_for_queue_capacity() {
-        let (tx, rx) = channel::bounded(1);
-        tx.send(SeccompNotif::default()).unwrap();
-        let (done_tx, done_rx) = channel::bounded(1);
-        thread::spawn(move || {
-            done_tx
-                .send(queue_blocking_notification(
-                    &tx,
-                    -1,
-                    SeccompNotif::default(),
-                    false,
-                ))
-                .unwrap();
-        });
+    fn blocking_receive_dispatch_wakes_reactor() {
+        let (tx, rx) = channel::unbounded();
+        let wake_fd = Arc::new(create_eventfd().unwrap());
+        let queue = BlockingRecvQueue {
+            tx,
+            wake_fd: Arc::clone(&wake_fd),
+        };
 
-        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
-        rx.recv().unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(queue_blocking_notification(
+            &queue,
+            -1,
+            SeccompNotif::default(),
+            false,
+        ));
+        assert!(rx.try_recv().is_ok());
+
+        let mut pollfd = libc::pollfd {
+            fd: wake_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+    }
+
+    #[test]
+    fn explicit_nonblocking_receives_skip_blocking_reactor() {
+        let mut recvfrom = SeccompNotif::default();
+        recvfrom.data.nr = libc::SYS_recvfrom as i32;
+        assert!(is_blocking_recv_notification(&recvfrom));
+        recvfrom.data.args[3] = libc::MSG_DONTWAIT as u64;
+        assert!(!is_blocking_recv_notification(&recvfrom));
+
+        let mut recvmsg = SeccompNotif::default();
+        recvmsg.data.nr = libc::SYS_recvmsg as i32;
+        assert!(is_blocking_recv_notification(&recvmsg));
+        recvmsg.data.args[2] = libc::MSG_DONTWAIT as u64;
+        assert!(!is_blocking_recv_notification(&recvmsg));
+
+        let mut sendmsg = SeccompNotif::default();
+        sendmsg.data.nr = libc::SYS_sendmsg as i32;
+        assert!(!is_blocking_recv_notification(&sendmsg));
+    }
+
+    #[test]
+    fn blocking_receive_attempt_can_defer_without_polling() {
+        let (_relay, target) = make_relay_pair().unwrap();
+        let pending = Mutex::new(VecDeque::new());
+
+        let err = match recv_from_relay_fd(-1, 0, target.as_raw_fd(), 1, 0, &pending, false) {
+            Ok(_) => panic!("quiet relay unexpectedly received a datagram"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
