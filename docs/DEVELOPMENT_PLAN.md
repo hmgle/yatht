@@ -74,10 +74,15 @@ is `socks5://127.0.0.1:1080`.
   original syscall run unchanged. Direct non-DNS `connect(2)` notifications use
   this fast path before socket-type inspection to avoid an extra
   `pidfd_getfd(2)`/`getsockopt(2)` round trip.
-- Proxied routes complete the SOCKS5/HTTP CONNECT handshake in the supervisor,
-  inject the connected TCP fd into the target with
-  `SECCOMP_IOCTL_NOTIF_ADDFD | SECCOMP_ADDFD_FLAG_SETFD`, then respond with
-  `connect() = 0`.
+- Proxied routes duplicate the target TCP fd with `pidfd_getfd(2)`, complete the
+  SOCKS5/HTTP CONNECT handshake on a separate upstream socket, then connect the
+  original target open file description to a per-flow loopback listener. A
+  shared bounded-buffer reactor relays the accepted local socket to the proxy
+  tunnel before the supervisor responds with `connect() = 0`.
+- Keeping the target TCP open file description avoids fd replacement races and
+  natively preserves epoll registrations, descriptor aliases, bind state, and
+  options on the target-side TCP leg. The reactor propagates half-closes and
+  isolates ordinary flow errors without dedicating a thread to each flow.
 - TCP proxy failures are fail-closed and return `ECONNREFUSED`; they do not
   fall back to direct connections.
 - Nonblocking notifications are dispatched through a bounded queue to a bounded
@@ -134,7 +139,9 @@ direct CIDRs and the configured proxy endpoint.
   encoding.
 - Integration tests cover TCP CONNECT redirection, UDP/53 DNS-over-TCP
   redirection, and generic UDP over SOCKS5 UDP ASSOCIATE using local fake
-  proxies.
+  proxies. TCP integration also verifies stable socket identity, pre-connect
+  epoll registration, explicit bind state, socket options, and an alias used
+  after fork/exec.
 - Required local checks:
 
 ```sh
@@ -158,6 +165,7 @@ should bypass the proxy unless `--proxy-local` is set.
 
 - Additional architectures such as aarch64.
 - Optional compatibility fallback for kernels older than 5.9.
-- Complete nonblocking connect, epoll, fd-alias, fork, and general UDP socket
-  semantics. These require an architecture decision rather than local syscall
-  handler extensions.
+- Strict nonblocking connect completion, logical peer query virtualization, and
+  general UDP socket semantics. These require the backend decisions in
+  [SOCKET_SEMANTICS_ROADMAP.md](SOCKET_SEMANTICS_ROADMAP.md), not local syscall
+  handlers alone.

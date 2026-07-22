@@ -9,6 +9,8 @@ using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 ## Features
 
 - Redirects TCP `connect(2)` through a SOCKS5 or HTTP CONNECT proxy.
+- Preserves the original TCP socket description, including existing epoll
+  registrations and aliases, while relaying through a local broker.
 - Redirects UDP/53 DNS queries as DNS-over-TCP when `--enable-dns` is set.
 - Redirects request/response UDP through SOCKS5 UDP ASSOCIATE when
   experimental `--enable-udp` is set.
@@ -81,10 +83,18 @@ features. `--proxy-local` disables the default `bypass_local = true` behavior.
 
 ## Compatibility and Limitations
 
-TCP redirection is intended for conventional blocking clients. Replacing the
-target socket does not preserve every Linux socket behavior: a nonblocking
-`connect(2)` is completed synchronously, existing epoll registrations and bind
-state are not migrated, and most socket options are not copied.
+TCP redirection is intended for conventional blocking clients. The target's
+original AF_INET/AF_INET6 socket is connected to a per-flow loopback broker
+after the upstream proxy handshake succeeds. This keeps the socket's open file
+description stable, so existing epoll registrations, `dup(2)`/`fork(2)`
+aliases, explicit bind state, and socket options remain attached.
+
+This is still split-connection proxying rather than complete remote socket
+semantics. A nonblocking `connect(2)` is completed synchronously. Kernel peer
+and transport queries such as `getpeername(2)` and `TCP_INFO` describe the
+local broker leg rather than the requested remote peer. Route-affecting options
+such as `SO_BINDTODEVICE` can also prevent the target socket from reaching the
+loopback broker.
 
 Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
@@ -118,7 +128,9 @@ cargo test
 ```
 
 See [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) for the current design,
-scope, and test plan.
+scope, and test plan. See
+[docs/SOCKET_SEMANTICS_ROADMAP.md](docs/SOCKET_SEMANTICS_ROADMAP.md) for the
+compatibility architecture and backend roadmap.
 
 ## License
 
