@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -19,6 +19,7 @@ use crossbeam_channel as channel;
 use crate::config::{EffectiveConfig, Route};
 use crate::proxy;
 use crate::seccomp::{self, SeccompNotif, SeccompNotifAddfd};
+use crate::tcp_broker::TcpBroker;
 
 const CHILD_STAGE_ENV: &str = "SUP_CHILD_STAGE";
 const TARGET_PATH_ENV: &str = "SUP_TARGET_PATH";
@@ -36,6 +37,7 @@ const UDP_JOB_QUEUE_CAPACITY: usize = 64;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
 const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
 const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
+const LOCAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct NotificationFailure {
     reported: AtomicBool,
@@ -188,13 +190,33 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
         shutting_down: AtomicBool::new(false),
         tx: failure_tx,
     });
+    let (tcp_broker, tcp_broker_reactor) = TcpBroker::new().context("create TCP broker")?;
+    let reactor_failure = Arc::clone(&failure);
+    let panic_failure = Arc::clone(&failure);
+    thread::spawn(
+        move || match std::panic::catch_unwind(|| tcp_broker_reactor.run()) {
+            Ok(Ok(())) => {
+                if !reactor_failure.shutting_down.load(Ordering::Acquire) {
+                    reactor_failure.report(
+                        "TCP broker reactor stopped",
+                        io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker channel closed"),
+                    );
+                }
+            }
+            Ok(Err(err)) => reactor_failure.report("TCP broker reactor failed", err),
+            Err(_) => panic_failure.report(
+                "TCP broker reactor panicked",
+                io::Error::other("TCP broker reactor panicked"),
+            ),
+        },
+    );
     let loop_cfg = Arc::clone(&cfg);
     let loop_relays = Arc::clone(&relays);
     let loop_failure = Arc::clone(&failure);
     let loop_state = Arc::clone(&failure);
     thread::spawn(move || {
         if std::panic::catch_unwind(|| {
-            notification_loop(listener_fd, loop_cfg, loop_relays, loop_state)
+            notification_loop(listener_fd, loop_cfg, loop_relays, tcp_broker, loop_state)
         })
         .is_err()
         {
@@ -370,6 +392,7 @@ fn notification_loop(
     listener_fd: Arc<OwnedFd>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
+    tcp_broker: TcpBroker,
     failure: Arc<NotificationFailure>,
 ) {
     let worker_count = notification_worker_count();
@@ -381,6 +404,7 @@ fn notification_loop(
         let worker_listener_fd = Arc::clone(&listener_fd);
         let worker_cfg = Arc::clone(&cfg);
         let worker_relays = Arc::clone(&relays);
+        let worker_tcp_broker = tcp_broker.clone();
         let worker_failure = Arc::clone(&failure);
         thread::spawn(move || {
             notification_worker(
@@ -388,6 +412,7 @@ fn notification_loop(
                 worker_rx,
                 worker_cfg,
                 worker_relays,
+                worker_tcp_broker,
                 worker_failure,
             )
         });
@@ -632,6 +657,7 @@ fn notification_worker(
     rx: channel::Receiver<SeccompNotif>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
+    tcp_broker: TcpBroker,
     failure: Arc<NotificationFailure>,
 ) {
     loop {
@@ -645,6 +671,7 @@ fn notification_worker(
                 notif,
                 Arc::clone(&cfg),
                 Arc::clone(&relays),
+                tcp_broker.clone(),
             );
         }))
         .is_err()
@@ -979,9 +1006,10 @@ fn handle_notification(
     notif: SeccompNotif,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
+    tcp_broker: TcpBroker,
 ) {
     match notif.data.nr as libc::c_long {
-        libc::SYS_connect => handle_connect(listener_fd, notif, cfg, relays),
+        libc::SYS_connect => handle_connect(listener_fd, notif, cfg, relays, tcp_broker),
         libc::SYS_sendto => handle_sendto(listener_fd, notif, cfg, relays),
         libc::SYS_sendmsg => handle_sendmsg(listener_fd, notif, cfg, relays),
         libc::SYS_recvfrom => handle_recvfrom(listener_fd, notif, relays),
@@ -1029,6 +1057,7 @@ fn handle_connect(
     notif: SeccompNotif,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
+    tcp_broker: TcpBroker,
 ) {
     let target_fd = notif.data.args[0] as RawFd;
     let addr = notif.data.args[1];
@@ -1168,9 +1197,34 @@ fn handle_connect(
         );
     }
 
+    let target = match duplicate_remote_fd(notif.pid, target_fd) {
+        Ok(target)
+            if socket_type_from_fd(target.as_raw_fd()) == Some(libc::SOCK_STREAM)
+                && matches!(
+                    socket_domain_from_fd(target.as_raw_fd()),
+                    Some(libc::AF_INET | libc::AF_INET6)
+                ) =>
+        {
+            target
+        }
+        Ok(_) => {
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        Err(err) => {
+            if cfg.debug {
+                eprintln!("yatht: duplicate TCP target fd failed: {err}");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            return;
+        }
+    };
+    let target_domain = socket_domain_from_fd(target.as_raw_fd()).unwrap();
+
     let stream = match proxy::dial(&cfg.proxy, dest, cfg.connect_timeout) {
         Ok(stream) => stream,
         Err(err) => {
+            disconnect_tcp_socket(target.as_raw_fd());
             if cfg.debug {
                 eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
             }
@@ -1183,28 +1237,30 @@ fn handle_connect(
         return;
     }
 
-    let target_flags = read_target_fd_flags(notif.pid, target_fd);
-    if target_flags.status_flags & libc::O_NONBLOCK != 0 {
-        let _ = set_nonblocking(stream.as_raw_fd());
-    }
-
-    let mut addfd = SeccompNotifAddfd {
-        id: notif.id,
-        flags: seccomp::ADDFD_FLAG_SETFD,
-        srcfd: stream.as_raw_fd() as u32,
-        newfd: target_fd as u32,
-        newfd_flags: target_flags.newfd_flags,
-    };
-
-    match seccomp::notif_addfd(listener_fd, &mut addfd) {
-        Ok(_) => seccomp::send_success(listener_fd, notif.id),
+    let broker_target = match connect_target_to_broker(target.as_raw_fd(), target_domain) {
+        Ok(stream) => stream,
         Err(err) => {
             if cfg.debug {
-                eprintln!("yatht: ADDFD failed: {err}");
+                eprintln!("yatht: connect target socket to local broker failed: {err}");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            return;
         }
+    };
+
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        disconnect_tcp_socket(target.as_raw_fd());
+        return;
     }
+    if let Err(err) = tcp_broker.register(broker_target, stream) {
+        disconnect_tcp_socket(target.as_raw_fd());
+        if cfg.debug {
+            eprintln!("yatht: register TCP broker relay failed: {err}");
+        }
+        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
 }
 
 fn handle_sendto(
@@ -2929,6 +2985,101 @@ fn socket_domain_from_fd(fd: RawFd) -> Option<i32> {
     } else {
         Some(domain)
     }
+}
+
+fn connect_target_to_broker(target_fd: RawFd, domain: i32) -> io::Result<TcpStream> {
+    let bind_addr = match domain {
+        libc::AF_INET => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        libc::AF_INET6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        _ => return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT)),
+    };
+    let listener = TcpListener::bind(bind_addr)?;
+    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    let destination = Destination {
+        ip: local_addr.ip(),
+        port: local_addr.port(),
+    };
+    let (raw_addr, raw_len) = sockaddr_bytes(destination);
+
+    let rc = unsafe {
+        libc::connect(
+            target_fd,
+            raw_addr.as_ptr().cast::<libc::sockaddr>(),
+            raw_len as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if !matches!(
+            err.raw_os_error(),
+            Some(libc::EINPROGRESS | libc::EALREADY | libc::EINTR)
+        ) {
+            return Err(err);
+        }
+    }
+
+    let deadline = Instant::now() + LOCAL_BROKER_CONNECT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Some(err) = socket_error(target_fd) {
+                    return Err(err);
+                }
+                return Ok(stream);
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "local TCP broker connect timed out",
+            ));
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut pollfds = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: target_fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+        ];
+        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if pollfds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(socket_error(target_fd)
+                .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ECONNRESET)));
+        }
+    }
+}
+
+fn disconnect_tcp_socket(fd: RawFd) {
+    let address = libc::sockaddr {
+        sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+        sa_data: [0; 14],
+    };
+    let _ = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
 }
 
 fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> {

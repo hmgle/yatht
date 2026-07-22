@@ -2,6 +2,7 @@ mod config;
 mod proxy;
 mod seccomp;
 mod supervisor;
+mod tcp_broker;
 
 use anyhow::{Context, Result};
 use clap::Parser;
