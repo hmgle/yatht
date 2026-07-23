@@ -142,13 +142,17 @@ cargo test
 ```
 
 The deterministic local TCP broker benchmark builds its C workload on demand
-and stores raw JSONL, CSV, commands, and environment metadata under `target/`:
+and stores raw JSONL, partial failure results, commands, role-specific resource
+samples, binary provenance, and environment metadata under `target/`:
 
 ```sh
 cargo build --release --locked
 uv run scripts/tcp_broker_benchmark.py \
   --yatht target/release/yatht \
-  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht
+  --yatht-build-command 'cargo build --release --locked' \
+  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht \
+  --addfd-commit b5554b9 \
+  --addfd-build-command 'cargo build --release --locked'
 ```
 
 See [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) for the current design,
