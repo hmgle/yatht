@@ -59,6 +59,46 @@ struct ObservabilityInner {
     started: Instant,
 }
 
+impl ObservabilityInner {
+    fn new(tx: channel::Sender<WriterCommand>) -> Self {
+        Self {
+            tx,
+            dropped_events: AtomicU64::new(0),
+            next_flow_id: AtomicU64::new(1),
+            setup_completed: AtomicU64::new(0),
+            setup_failed: AtomicU64::new(0),
+            setup_cancelled: AtomicU64::new(0),
+            notification_queue_depth: AtomicU64::new(0),
+            notification_queue_peak: AtomicU64::new(0),
+            notification_queue_full: AtomicU64::new(0),
+            tcp_active_flows: AtomicU64::new(0),
+            tcp_peak_flows: AtomicU64::new(0),
+            tcp_registration_queue_depth: AtomicU64::new(0),
+            tcp_registration_queue_peak: AtomicU64::new(0),
+            tcp_registration_queue_full: AtomicU64::new(0),
+            tcp_pending_bytes: AtomicU64::new(0),
+            tcp_peak_pending_bytes: AtomicU64::new(0),
+            tcp_reserved_pending_bytes: AtomicU64::new(0),
+            tcp_peak_reserved_pending_bytes: AtomicU64::new(0),
+            tcp_target_to_upstream_bytes: AtomicU64::new(0),
+            tcp_upstream_to_target_bytes: AtomicU64::new(0),
+            tcp_recv_syscalls: AtomicU64::new(0),
+            tcp_send_syscalls: AtomicU64::new(0),
+            tcp_reactor_wakeups: AtomicU64::new(0),
+            tcp_half_closes: AtomicU64::new(0),
+            tcp_resets: AtomicU64::new(0),
+            tcp_flow_failures: AtomicU64::new(0),
+            tcp_flows_completed: AtomicU64::new(0),
+            tcp_flows_cancelled: AtomicU64::new(0),
+            tcp_active_flow_rejections: AtomicU64::new(0),
+            tcp_fd_headroom_rejections: AtomicU64::new(0),
+            tcp_pending_byte_rejections: AtomicU64::new(0),
+            tcp_reactor_stopped_rejections: AtomicU64::new(0),
+            started: Instant::now(),
+        }
+    }
+}
+
 enum WriterCommand {
     Event(MetricEvent),
     Finish(Box<RunSummary>),
@@ -182,41 +222,7 @@ impl ObservabilityRuntime {
             .open(path)
             .with_context(|| format!("create metrics file {}", path.display()))?;
         let (tx, rx) = channel::bounded(METRIC_QUEUE_CAPACITY);
-        let inner = Arc::new(ObservabilityInner {
-            tx,
-            dropped_events: AtomicU64::new(0),
-            next_flow_id: AtomicU64::new(1),
-            setup_completed: AtomicU64::new(0),
-            setup_failed: AtomicU64::new(0),
-            setup_cancelled: AtomicU64::new(0),
-            notification_queue_depth: AtomicU64::new(0),
-            notification_queue_peak: AtomicU64::new(0),
-            notification_queue_full: AtomicU64::new(0),
-            tcp_active_flows: AtomicU64::new(0),
-            tcp_peak_flows: AtomicU64::new(0),
-            tcp_registration_queue_depth: AtomicU64::new(0),
-            tcp_registration_queue_peak: AtomicU64::new(0),
-            tcp_registration_queue_full: AtomicU64::new(0),
-            tcp_pending_bytes: AtomicU64::new(0),
-            tcp_peak_pending_bytes: AtomicU64::new(0),
-            tcp_reserved_pending_bytes: AtomicU64::new(0),
-            tcp_peak_reserved_pending_bytes: AtomicU64::new(0),
-            tcp_target_to_upstream_bytes: AtomicU64::new(0),
-            tcp_upstream_to_target_bytes: AtomicU64::new(0),
-            tcp_recv_syscalls: AtomicU64::new(0),
-            tcp_send_syscalls: AtomicU64::new(0),
-            tcp_reactor_wakeups: AtomicU64::new(0),
-            tcp_half_closes: AtomicU64::new(0),
-            tcp_resets: AtomicU64::new(0),
-            tcp_flow_failures: AtomicU64::new(0),
-            tcp_flows_completed: AtomicU64::new(0),
-            tcp_flows_cancelled: AtomicU64::new(0),
-            tcp_active_flow_rejections: AtomicU64::new(0),
-            tcp_fd_headroom_rejections: AtomicU64::new(0),
-            tcp_pending_byte_rejections: AtomicU64::new(0),
-            tcp_reactor_stopped_rejections: AtomicU64::new(0),
-            started: Instant::now(),
-        });
+        let inner = Arc::new(ObservabilityInner::new(tx));
         let start = MetricEvent::RunStart {
             schema_version: SCHEMA_VERSION,
             pid: std::process::id(),
@@ -298,15 +304,16 @@ impl ObservabilityRuntime {
                 .then_some(total_cpu_ns as f64 / total_bytes as f64),
             dropped_metric_events: inner.dropped_events.load(Ordering::Relaxed),
         };
-        inner
+        let send_result = inner
             .tx
             .send(WriterCommand::Finish(Box::new(summary)))
-            .map_err(|_| anyhow!("metrics writer stopped before final summary"))?;
+            .map_err(|_| anyhow!("metrics writer stopped before final summary"));
         let writer = self.writer.take().expect("enabled metrics writer missing");
-        writer
-            .join()
-            .map_err(|_| anyhow!("metrics writer panicked"))??;
-        Ok(())
+        match writer.join() {
+            Err(_) => Err(anyhow!("metrics writer panicked")),
+            Ok(Err(err)) => Err(err).context("write performance metrics"),
+            Ok(Ok(())) => send_result,
+        }
     }
 }
 
@@ -751,5 +758,22 @@ mod tests {
 
         assert!(ObservabilityRuntime::start(Some(&path)).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "existing");
+    }
+
+    #[test]
+    fn finish_preserves_writer_io_error_after_channel_disconnect() {
+        let (tx, rx) = channel::bounded(METRIC_QUEUE_CAPACITY);
+        drop(rx);
+        let writer = thread::spawn(|| Err(io::Error::from_raw_os_error(libc::ENOSPC)));
+        let runtime = ObservabilityRuntime {
+            observability: Observability {
+                inner: Some(Arc::new(ObservabilityInner::new(tx))),
+            },
+            writer: Some(writer),
+        };
+
+        let error = runtime.finish().unwrap_err();
+        let io_error = error.root_cause().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(io_error.raw_os_error(), Some(libc::ENOSPC));
     }
 }
