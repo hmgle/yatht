@@ -1381,7 +1381,7 @@ fn handle_connect(
         }
         Ok(_) => {
             seccomp::send_continue(listener_fd, notif.id);
-            setup.failed("fd_inspection", "target fd changed during inspection");
+            setup.cancelled("fd_changed");
             return;
         }
         Err(err) => {

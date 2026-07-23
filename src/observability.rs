@@ -52,13 +52,16 @@ struct ObservabilityInner {
     tcp_half_closes: AtomicU64,
     tcp_resets: AtomicU64,
     tcp_flow_failures: AtomicU64,
+    tcp_flows_started: AtomicU64,
     tcp_flows_completed: AtomicU64,
     tcp_flows_cancelled: AtomicU64,
     tcp_active_flow_rejections: AtomicU64,
     tcp_fd_headroom_rejections: AtomicU64,
     tcp_pending_byte_rejections: AtomicU64,
     tcp_buffer_capacity_rejections: AtomicU64,
+    tcp_relay_init_rejections: AtomicU64,
     tcp_reactor_stopped_rejections: AtomicU64,
+    tcp_reactor_failures: AtomicU64,
     started: Instant,
 }
 
@@ -93,13 +96,16 @@ impl ObservabilityInner {
             tcp_half_closes: AtomicU64::new(0),
             tcp_resets: AtomicU64::new(0),
             tcp_flow_failures: AtomicU64::new(0),
+            tcp_flows_started: AtomicU64::new(0),
             tcp_flows_completed: AtomicU64::new(0),
             tcp_flows_cancelled: AtomicU64::new(0),
             tcp_active_flow_rejections: AtomicU64::new(0),
             tcp_fd_headroom_rejections: AtomicU64::new(0),
             tcp_pending_byte_rejections: AtomicU64::new(0),
             tcp_buffer_capacity_rejections: AtomicU64::new(0),
+            tcp_relay_init_rejections: AtomicU64::new(0),
             tcp_reactor_stopped_rejections: AtomicU64::new(0),
+            tcp_reactor_failures: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -187,13 +193,16 @@ struct RunSummary {
     tcp_half_closes: u64,
     tcp_resets: u64,
     tcp_flow_failures: u64,
+    tcp_flows_started: u64,
     tcp_flows_completed: u64,
     tcp_flows_cancelled: u64,
     tcp_active_flow_rejections: u64,
     tcp_fd_headroom_rejections: u64,
     tcp_pending_byte_rejections: u64,
     tcp_buffer_capacity_rejections: u64,
+    tcp_relay_init_rejections: u64,
     tcp_reactor_stopped_rejections: u64,
+    tcp_reactor_failures: u64,
     tcp_cpu_ns_per_byte: Option<f64>,
     dropped_metric_events: u64,
 }
@@ -306,6 +315,7 @@ impl ObservabilityRuntime {
             tcp_half_closes: inner.tcp_half_closes.load(Ordering::Relaxed),
             tcp_resets: inner.tcp_resets.load(Ordering::Relaxed),
             tcp_flow_failures: inner.tcp_flow_failures.load(Ordering::Relaxed),
+            tcp_flows_started: inner.tcp_flows_started.load(Ordering::Relaxed),
             tcp_flows_completed: inner.tcp_flows_completed.load(Ordering::Relaxed),
             tcp_flows_cancelled: inner.tcp_flows_cancelled.load(Ordering::Relaxed),
             tcp_active_flow_rejections: inner.tcp_active_flow_rejections.load(Ordering::Relaxed),
@@ -314,9 +324,11 @@ impl ObservabilityRuntime {
             tcp_buffer_capacity_rejections: inner
                 .tcp_buffer_capacity_rejections
                 .load(Ordering::Relaxed),
+            tcp_relay_init_rejections: inner.tcp_relay_init_rejections.load(Ordering::Relaxed),
             tcp_reactor_stopped_rejections: inner
                 .tcp_reactor_stopped_rejections
                 .load(Ordering::Relaxed),
+            tcp_reactor_failures: inner.tcp_reactor_failures.load(Ordering::Relaxed),
             tcp_cpu_ns_per_byte: (total_bytes != 0)
                 .then_some(total_cpu_ns as f64 / total_bytes as f64),
             dropped_metric_events: inner.dropped_events.load(Ordering::Relaxed),
@@ -576,9 +588,21 @@ impl Observability {
         }
     }
 
+    pub fn tcp_flow_started(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_flows_started.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn tcp_flow_cancelled(&self) {
         if let Some(inner) = &self.inner {
             inner.tcp_flows_cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_reactor_failed(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_reactor_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -592,6 +616,7 @@ impl Observability {
             "pending_bytes" => &inner.tcp_pending_byte_rejections,
             "buffer_capacity" => &inner.tcp_buffer_capacity_rejections,
             "registration_queue" => &inner.tcp_registration_queue_full,
+            "relay_init" => &inner.tcp_relay_init_rejections,
             _ => &inner.tcp_reactor_stopped_rejections,
         };
         counter.fetch_add(1, Ordering::Relaxed);

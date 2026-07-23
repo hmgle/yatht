@@ -30,6 +30,7 @@ pub struct TcpBrokerReactor {
     wake_fd: Arc<OwnedFd>,
     relays: Vec<TcpRelay>,
     resources: Arc<BrokerResources>,
+    teardown_recorded: bool,
 }
 
 struct BrokerResources {
@@ -65,6 +66,8 @@ pub struct TcpFlowPermit {
 enum BrokerCommand {
     Register(TcpRelay),
     Shutdown,
+    #[cfg(test)]
+    Panic,
 }
 
 struct TcpRelay {
@@ -139,6 +142,7 @@ impl TcpBroker {
                 wake_fd,
                 relays: Vec::new(),
                 resources,
+                teardown_recorded: false,
             },
         ))
     }
@@ -182,36 +186,38 @@ impl TcpBroker {
         }
 
         let registration_cancelled = Arc::new(AtomicBool::new(false));
-        let relay = TcpRelay::new(
+        let relay = match TcpRelay::new(
             target,
             upstream,
             permit,
             Arc::clone(&registration_cancelled),
-        );
-        match relay.and_then(|relay| {
-            self.tx
-                .try_send(BrokerCommand::Register(relay))
-                .map_err(|err| match err {
-                    channel::TrySendError::Full(_) => io::Error::new(
+        ) {
+            Ok(relay) => relay,
+            Err(err) => {
+                self.resources.release_registration_slot();
+                self.resources
+                    .observability
+                    .tcp_resource_rejection("relay_init");
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.tx.try_send(BrokerCommand::Register(relay)) {
+            self.resources.release_registration_slot();
+            let (reason, error) = match err {
+                channel::TrySendError::Full(_) => (
+                    "registration_queue",
+                    io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "TCP broker registration queue is full",
                     ),
-                    channel::TrySendError::Disconnected(_) => {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker reactor stopped")
-                    }
-                })
-        }) {
-            Ok(()) => {}
-            Err(err) => {
-                self.resources.release_registration_slot();
-                let reason = if err.kind() == io::ErrorKind::BrokenPipe {
-                    "reactor_stopped"
-                } else {
-                    "registration_queue"
-                };
-                self.resources.observability.tcp_resource_rejection(reason);
-                return Err(err);
-            }
+                ),
+                channel::TrySendError::Disconnected(_) => (
+                    "reactor_stopped",
+                    io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker reactor stopped"),
+                ),
+            };
+            self.resources.observability.tcp_resource_rejection(reason);
+            return Err(error);
         }
         if let Err(err) = wake() {
             registration_cancelled.store(true, Ordering::Release);
@@ -226,6 +232,14 @@ impl TcpBroker {
     pub fn shutdown(&self) -> io::Result<()> {
         self.tx
             .send(BrokerCommand::Shutdown)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker stopped"))?;
+        wake_eventfd(self.wake_fd.as_raw_fd())
+    }
+
+    #[cfg(test)]
+    fn panic_reactor(&self) -> io::Result<()> {
+        self.tx
+            .send(BrokerCommand::Panic)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker stopped"))?;
         wake_eventfd(self.wake_fd.as_raw_fd())
     }
@@ -438,11 +452,13 @@ impl TcpBrokerReactor {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(err);
+                return self.fail(err);
             }
 
             if pollfds[0].revents & libc::POLLIN != 0 {
-                drain_eventfd(self.wake_fd.as_raw_fd())?;
+                if let Err(err) = drain_eventfd(self.wake_fd.as_raw_fd()) {
+                    return self.fail(err);
+                }
                 self.resources.observability.tcp_reactor_wakeup();
                 if self.drain_commands()? {
                     return Ok(());
@@ -477,12 +493,37 @@ impl TcpBrokerReactor {
                         continue;
                     }
                     relay.accepted_by_reactor = true;
+                    self.resources.observability.tcp_flow_started();
                     self.relays.push(relay);
                 }
                 Ok(BrokerCommand::Shutdown) => return Ok(true),
+                #[cfg(test)]
+                Ok(BrokerCommand::Panic) => panic!("injected TCP broker reactor panic"),
                 Err(channel::TryRecvError::Empty) => return Ok(false),
                 Err(channel::TryRecvError::Disconnected) => return Ok(true),
             }
+        }
+    }
+
+    fn fail(&mut self, err: io::Error) -> io::Result<()> {
+        self.resources.observability.tcp_reactor_failed();
+        for relay in &mut self.relays {
+            relay.record_outcome(Some(&err));
+        }
+        self.teardown_recorded = true;
+        Err(err)
+    }
+}
+
+impl Drop for TcpBrokerReactor {
+    fn drop(&mut self) {
+        if std::thread::panicking() && !self.teardown_recorded {
+            let err = io::Error::other("TCP broker reactor panicked");
+            self.resources.observability.tcp_reactor_failed();
+            for relay in &mut self.relays {
+                relay.record_outcome(Some(&err));
+            }
+            self.teardown_recorded = true;
         }
     }
 }
@@ -1013,7 +1054,8 @@ fn drain_eventfd(fd: RawFd) -> io::Result<()> {
 mod tests {
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    use std::os::fd::IntoRawFd;
     use std::thread;
     use std::time::Duration;
 
@@ -1108,6 +1150,10 @@ mod tests {
         assert!(summary["tcp_recv_syscalls"].as_u64().unwrap() <= 8);
         assert_eq!(summary["tcp_buffer_capacity_bytes"], 0);
         assert!(summary["tcp_peak_buffer_capacity_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(summary["tcp_flows_started"], 1);
+        assert_eq!(summary["tcp_flows_completed"], 1);
+        assert_eq!(summary["tcp_flow_failures"], 0);
+        assert_eq!(summary["tcp_flows_cancelled"], 0);
     }
 
     #[test]
@@ -1200,7 +1246,93 @@ mod tests {
         assert_eq!(summary["tcp_reserved_pending_bytes"], 0);
         assert_eq!(summary["tcp_buffer_capacity_bytes"], 0);
         assert_eq!(summary["tcp_registration_queue_depth"], 0);
+        assert_eq!(summary["tcp_flows_started"], 1);
+        assert_eq!(summary["tcp_flows_completed"], 0);
+        assert_eq!(summary["tcp_flow_failures"], 0);
         assert_eq!(summary["tcp_flows_cancelled"], 1);
+        assert_eq!(summary["tcp_reactor_failures"], 0);
+    }
+
+    #[test]
+    fn classifies_relay_initialization_separately_from_queue_pressure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
+        let limits = TcpBrokerLimits {
+            max_active_flows: 1,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
+            rlimit_nofile: 4096,
+            baseline_fds: 0,
+            reserved_fds: 256,
+        };
+        let (broker, _reactor) = TcpBroker::new_with_limits(
+            runtime.observability(),
+            limits,
+            FlowLimitReason::ActiveFlow,
+        )
+        .unwrap();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let invalid_target = unsafe { TcpStream::from_raw_fd(udp.into_raw_fd()) };
+        let (upstream, _remote) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+
+        assert!(broker.register(invalid_target, upstream, permit).is_err());
+        runtime.finish().unwrap();
+        let summary = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "run_summary")
+            .unwrap();
+        assert_eq!(summary["tcp_relay_init_rejections"], 1);
+        assert_eq!(summary["tcp_registration_queue_full"], 0);
+        assert_eq!(summary["tcp_active_flows"], 0);
+    }
+
+    #[test]
+    fn reactor_panic_fails_started_relays() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
+        let limits = TcpBrokerLimits {
+            max_active_flows: 1,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
+            rlimit_nofile: 4096,
+            baseline_fds: 0,
+            reserved_fds: 256,
+        };
+        let (broker, reactor) = TcpBroker::new_with_limits(
+            runtime.observability(),
+            limits,
+            FlowLimitReason::ActiveFlow,
+        )
+        .unwrap();
+        let reactor_thread =
+            thread::spawn(move || std::panic::catch_unwind(|| reactor.run()).is_err());
+        let (broker_target, _target) = tcp_pair();
+        let (broker_upstream, _remote) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+
+        broker.panic_reactor().unwrap();
+        assert!(reactor_thread.join().unwrap());
+        runtime.finish().unwrap();
+        let summary = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "run_summary")
+            .unwrap();
+        assert_eq!(summary["tcp_flows_started"], 1);
+        assert_eq!(summary["tcp_flows_completed"], 0);
+        assert_eq!(summary["tcp_flow_failures"], 1);
+        assert_eq!(summary["tcp_flows_cancelled"], 0);
+        assert_eq!(summary["tcp_reactor_failures"], 1);
+        assert_eq!(summary["tcp_active_flows"], 0);
     }
 
     #[test]
