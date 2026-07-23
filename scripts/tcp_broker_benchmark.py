@@ -28,7 +28,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Coroutine
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,6 +53,8 @@ class BenchmarkServers:
         )
         self.error: BaseException | None = None
         self.stalled_release: asyncio.Event | None = None
+        self.connection_tasks: set[asyncio.Task[None]] = set()
+        self.connection_writers: set[asyncio.StreamWriter] = set()
         self.safety_timeout = safety_timeout
 
     def start(self) -> None:
@@ -104,19 +106,25 @@ class BenchmarkServers:
         self.loop = asyncio.get_running_loop()
         self.stop_event = asyncio.Event()
         destination = await asyncio.start_server(
-            self._handle_destination,
+            lambda reader, writer: self._spawn_connection(
+                self._handle_destination(reader, writer), writer
+            ),
             "127.0.0.1",
             0,
             backlog=65535,
         )
         proxy = await asyncio.start_server(
-            self._handle_proxy,
+            lambda reader, writer: self._spawn_connection(
+                self._handle_proxy(reader, writer), writer
+            ),
             "127.0.0.1",
             0,
             backlog=65535,
         )
         stalled = await asyncio.start_server(
-            self._handle_stalled_destination,
+            lambda reader, writer: self._spawn_connection(
+                self._handle_stalled_destination(reader, writer), writer
+            ),
             "127.0.0.1",
             0,
             backlog=65535,
@@ -129,9 +137,49 @@ class BenchmarkServers:
         destination.close()
         proxy.close()
         stalled.close()
+        writers = list(self.connection_writers)
+        for writer in writers:
+            writer.transport.abort()
+        tasks = list(self.connection_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if writers:
+            await asyncio.gather(
+                *(writer.wait_closed() for writer in writers),
+                return_exceptions=True,
+            )
         await destination.wait_closed()
         await proxy.wait_closed()
         await stalled.wait_closed()
+
+    def _spawn_connection(
+        self,
+        coroutine: Coroutine[Any, Any, None],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.create_task(coroutine)
+        self.connection_tasks.add(task)
+        self.connection_writers.add(writer)
+        task.add_done_callback(lambda completed: self._connection_done(completed, writer))
+
+    def _connection_done(
+        self,
+        task: asyncio.Task[None],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self.connection_tasks.discard(task)
+        self.connection_writers.discard(writer)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException as error:
+            if self.error is None:
+                self.error = error
+            if self.stop_event is not None:
+                self.stop_event.set()
 
     async def _handle_destination(
         self,

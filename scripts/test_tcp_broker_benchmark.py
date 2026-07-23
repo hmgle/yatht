@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import socket
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -92,6 +94,22 @@ class BenchmarkTests(unittest.TestCase):
 
         self.assertTrue(benchmark.workload_flows_are_valid(valid, 2))
         self.assertFalse(benchmark.workload_flows_are_valid(wrong_ids, 2))
+
+    def test_server_shutdown_joins_open_connection_handlers(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=1)
+        servers.start()
+        connection = socket.create_connection(("127.0.0.1", servers.destination_port))
+        try:
+            deadline = time.monotonic() + 1
+            while not servers.connection_tasks and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(servers.connection_tasks)
+            servers.stop()
+        finally:
+            connection.close()
+
+        self.assertFalse(servers.thread.is_alive())
+        self.assertEqual(servers.connection_tasks, set())
 
 
 if __name__ == "__main__":
