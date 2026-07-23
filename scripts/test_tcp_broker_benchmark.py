@@ -116,6 +116,31 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(servers.thread.is_alive())
         self.assertEqual(servers.connection_tasks, set())
 
+    def test_stalled_server_applies_backpressure_before_release(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=1)
+        servers.start()
+        servers.prepare_stalled_run()
+        connection = socket.create_connection(("127.0.0.1", servers.stalled_port))
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        connection.setblocking(False)
+        deadline = time.monotonic() + 1
+        while not servers.connection_tasks and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(servers.connection_tasks)
+        accepted = 0
+        payload = b"x" * 65536
+        try:
+            while accepted < 8 * 1024 * 1024:
+                try:
+                    accepted += connection.send(payload)
+                except BlockingIOError:
+                    break
+            self.assertLess(accepted, 8 * 1024 * 1024)
+        finally:
+            servers.release_stalled_run()
+            connection.close()
+            servers.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

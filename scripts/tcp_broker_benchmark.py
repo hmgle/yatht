@@ -122,13 +122,13 @@ class BenchmarkServers:
             backlog=65535,
         )
         stalled = await asyncio.start_server(
-            lambda reader, writer: self._spawn_connection(
-                self._handle_stalled_destination(reader, writer), writer
-            ),
+            self._spawn_stalled_connection,
             "127.0.0.1",
             0,
             backlog=65535,
         )
+        for stalled_socket in stalled.sockets:
+            stalled_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         self.destination_port = destination.sockets[0].getsockname()[1]
         self.proxy_port = proxy.sockets[0].getsockname()[1]
         self.stalled_port = stalled.sockets[0].getsockname()[1]
@@ -163,6 +163,14 @@ class BenchmarkServers:
         self.connection_tasks.add(task)
         self.connection_writers.add(writer)
         task.add_done_callback(lambda completed: self._connection_done(completed, writer))
+
+    def _spawn_stalled_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        writer.transport.pause_reading()
+        self._spawn_connection(self._handle_stalled_destination(reader, writer), writer)
 
     def _connection_done(
         self,
@@ -255,6 +263,7 @@ class BenchmarkServers:
             if release is None:
                 raise RuntimeError("stalled run was not prepared")
             await asyncio.wait_for(release.wait(), timeout=self.safety_timeout)
+            writer.transport.resume_reading()
             while await reader.read(65536):
                 pass
         except (ConnectionError, asyncio.TimeoutError, asyncio.CancelledError):
@@ -603,6 +612,7 @@ def run_one(
         started = time.perf_counter_ns()
         timed_out = False
         stalled_ready = False
+        stalled_ready_flows: int | None = None
         stalled_released = False
         release_at: float | None = None
         supervisor_peaks = empty_process_peaks()
@@ -656,8 +666,15 @@ def run_one(
                     now = time.monotonic()
                     if scenario["mode"] == "stalled" and not stalled_ready:
                         if stalled_ready_path.exists():
-                            stalled_ready = True
-                            release_at = now + scenario["hold_ms"] / 1000
+                            try:
+                                stalled_ready_flows = int(
+                                    stalled_ready_path.read_text().strip()
+                                )
+                            except (OSError, ValueError):
+                                pass
+                            else:
+                                stalled_ready = True
+                                release_at = now + scenario["hold_ms"] / 1000
                     if release_at is not None and now >= release_at and not stalled_released:
                         servers.release_stalled_run()
                         stalled_released = True
@@ -719,6 +736,7 @@ def run_one(
         ok = (
             ok
             and stalled_ready
+            and stalled_ready_flows == scenario["flows"]
             and stalled_released
             and workload_summary.get("blocked_flows") == scenario["flows"]
             and workload_summary.get("released") is True
@@ -752,6 +770,9 @@ def run_one(
         "returncode": completed.returncode,
         "timed_out": timed_out,
         "stalled_ready": stalled_ready if scenario["mode"] == "stalled" else None,
+        "stalled_ready_flows": (
+            stalled_ready_flows if scenario["mode"] == "stalled" else None
+        ),
         "stalled_released": stalled_released if scenario["mode"] == "stalled" else None,
         "application_backpressure_confirmed": (
             stalled_ready and workload_summary.get("blocked_flows") == scenario["flows"]
@@ -1145,6 +1166,7 @@ def main() -> None:
                                     "returncode",
                                     "timed_out",
                                     "stalled_ready",
+                                    "stalled_ready_flows",
                                     "stalled_released",
                                     "application_backpressure_confirmed",
                                     "successful_flows",
