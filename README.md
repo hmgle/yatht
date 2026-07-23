@@ -63,6 +63,7 @@ enable_dns = false
 enable_udp = false
 dns_server = "1.1.1.1:53"
 debug = false
+# metrics_file = "/tmp/yatht-metrics.jsonl"
 ```
 
 Important options:
@@ -77,9 +78,21 @@ Important options:
 - `--enable-udp`: redirect generic UDP through SOCKS5 UDP ASSOCIATE.
 - `--dns-server <addr>`: DNS-over-TCP upstream for `--enable-dns`.
 - `--debug`: print routing and notification diagnostics.
+- `--metrics-file <path>`: write experimental performance metrics as JSONL.
 
 CLI CIDR options extend file CIDR lists. CLI booleans enable their matching
 features. `--proxy-local` disables the default `bypass_local = true` behavior.
+
+The metrics file is opt-in and must not already exist. It contains versioned
+run metadata, TCP broker limits, one setup record per proxied TCP connection,
+and a final summary with queue, flow, pending-byte, relay, syscall, CPU, and
+failure counters. Event delivery uses a bounded queue; the final
+`dropped_metric_events` counter reports any records discarded under pressure.
+
+The TCP broker admits at most 16,384 active flows and reduces that limit when
+`RLIMIT_NOFILE` cannot preserve fd headroom. Registration is bounded to 128
+pending flows, and relay buffers share a 256 MiB global pending-byte budget.
+Resource exhaustion is fail-closed and is classified in the metrics summary.
 
 ## Compatibility and Limitations
 
@@ -125,6 +138,16 @@ allows the configured direct CIDRs and proxy endpoint.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
+
+The deterministic local TCP broker benchmark builds its C workload on demand
+and stores raw JSONL, CSV, commands, and environment metadata under `target/`:
+
+```sh
+cargo build --release --locked
+uv run scripts/tcp_broker_benchmark.py \
+  --yatht target/release/yatht \
+  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht
 ```
 
 See [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) for the current design,

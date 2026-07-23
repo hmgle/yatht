@@ -7,3 +7,4 @@ enable_dns = false
 enable_udp = false
 dns_server = "1.1.1.1:53"
 debug = false
+# metrics_file = "/tmp/yatht-metrics.jsonl"

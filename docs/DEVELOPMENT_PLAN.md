@@ -31,6 +31,7 @@ Options:
   --enable-udp                    Redirect generic UDP through SOCKS5 UDP ASSOCIATE
   --dns-server <addr>             DNS-over-TCP upstream, default 1.1.1.1:53
   --debug                         Print routing and notification diagnostics
+  --metrics-file <path>           Write experimental performance metrics as JSONL
 ```
 
 TOML configuration uses the same names where practical:
@@ -45,6 +46,7 @@ debug = false
 enable_dns = false
 enable_udp = false
 dns_server = "1.1.1.1:53"
+# metrics_file = "/tmp/yatht-metrics.jsonl"
 ```
 
 CLI values override or extend file values. If no proxy is provided, the default
@@ -83,6 +85,15 @@ is `socks5://127.0.0.1:1080`.
   natively preserves epoll registrations, descriptor aliases, bind state, and
   options on the target-side TCP leg. The reactor propagates half-closes and
   isolates ordinary flow errors without dedicating a thread to each flow.
+- Before proxy setup, the broker reserves an active-flow permit. The default
+  ceiling is 16,384 flows and is reduced from `RLIMIT_NOFILE` after preserving
+  the larger of 20% or 256 fds, plus setup-worker headroom. Registration has a
+  fixed capacity of 128, and buffered relay data shares a 256 MiB global
+  pending-byte budget. Rejections are fail-closed and separately classified.
+- Optional JSONL telemetry uses a bounded writer queue and records versioned run
+  metadata, detected broker limits, per-flow setup spans and socket cookies,
+  and a final resource/data/error summary. The destination path must not exist,
+  so separate runs cannot silently overwrite one another.
 - TCP proxy failures are fail-closed and return `ECONNREFUSED`; they do not
   fall back to direct connections.
 - Nonblocking notifications are dispatched through a bounded queue to a bounded
@@ -141,13 +152,29 @@ direct CIDRs and the configured proxy endpoint.
   redirection, and generic UDP over SOCKS5 UDP ASSOCIATE using local fake
   proxies. TCP integration also verifies stable socket identity, pre-connect
   epoll registration, explicit bind state, socket options, and an alias used
-  after fork/exec.
+  after fork/exec. It also verifies that telemetry is complete and that active
+  flows, queued registrations, actual pending bytes, and reserved pending-byte
+  budget all return to zero at shutdown.
 - Required local checks:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
+
+- The deterministic local TCP benchmark compares direct control, the fixed
+  pre-stable `b5554b9` ADDFD binary, and the current stable broker. It covers
+  short request/response flows, mostly-idle concurrency, and stalled readers;
+  randomizes variant order after three warmups; repeats each measurement ten
+  times; and archives raw samples, summaries, commands, environment metadata,
+  peak RSS/fd samples, and stable-broker diagnostics under `target/`.
+
+```sh
+cargo build --release --locked
+uv run scripts/tcp_broker_benchmark.py \
+  --yatht target/release/yatht \
+  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht
 ```
 
 - Manual integration check on Linux x86_64/kernel >= 5.9:
