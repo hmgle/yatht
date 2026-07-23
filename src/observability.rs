@@ -48,7 +48,11 @@ struct ObservabilityInner {
     tcp_upstream_to_target_bytes: AtomicU64,
     tcp_recv_syscalls: AtomicU64,
     tcp_send_syscalls: AtomicU64,
-    tcp_reactor_wakeups: AtomicU64,
+    tcp_command_wakeups: AtomicU64,
+    tcp_poll_calls: AtomicU64,
+    tcp_poll_ready_returns: AtomicU64,
+    tcp_poll_ready_fds: AtomicU64,
+    tcp_no_progress_iterations: AtomicU64,
     tcp_half_closes: AtomicU64,
     tcp_resets: AtomicU64,
     tcp_flow_failures: AtomicU64,
@@ -92,7 +96,11 @@ impl ObservabilityInner {
             tcp_upstream_to_target_bytes: AtomicU64::new(0),
             tcp_recv_syscalls: AtomicU64::new(0),
             tcp_send_syscalls: AtomicU64::new(0),
-            tcp_reactor_wakeups: AtomicU64::new(0),
+            tcp_command_wakeups: AtomicU64::new(0),
+            tcp_poll_calls: AtomicU64::new(0),
+            tcp_poll_ready_returns: AtomicU64::new(0),
+            tcp_poll_ready_fds: AtomicU64::new(0),
+            tcp_no_progress_iterations: AtomicU64::new(0),
             tcp_half_closes: AtomicU64::new(0),
             tcp_resets: AtomicU64::new(0),
             tcp_flow_failures: AtomicU64::new(0),
@@ -189,7 +197,11 @@ struct RunSummary {
     tcp_upstream_to_target_bytes: u64,
     tcp_recv_syscalls: u64,
     tcp_send_syscalls: u64,
-    tcp_reactor_wakeups: u64,
+    tcp_command_wakeups: u64,
+    poll_calls: u64,
+    poll_ready_returns: u64,
+    poll_ready_fds: u64,
+    no_progress_iterations: u64,
     tcp_half_closes: u64,
     tcp_resets: u64,
     tcp_flow_failures: u64,
@@ -311,7 +323,11 @@ impl ObservabilityRuntime {
                 .load(Ordering::Relaxed),
             tcp_recv_syscalls: inner.tcp_recv_syscalls.load(Ordering::Relaxed),
             tcp_send_syscalls: inner.tcp_send_syscalls.load(Ordering::Relaxed),
-            tcp_reactor_wakeups: inner.tcp_reactor_wakeups.load(Ordering::Relaxed),
+            tcp_command_wakeups: inner.tcp_command_wakeups.load(Ordering::Relaxed),
+            poll_calls: inner.tcp_poll_calls.load(Ordering::Relaxed),
+            poll_ready_returns: inner.tcp_poll_ready_returns.load(Ordering::Relaxed),
+            poll_ready_fds: inner.tcp_poll_ready_fds.load(Ordering::Relaxed),
+            no_progress_iterations: inner.tcp_no_progress_iterations.load(Ordering::Relaxed),
             tcp_half_closes: inner.tcp_half_closes.load(Ordering::Relaxed),
             tcp_resets: inner.tcp_resets.load(Ordering::Relaxed),
             tcp_flow_failures: inner.tcp_flow_failures.load(Ordering::Relaxed),
@@ -559,9 +575,32 @@ impl Observability {
         }
     }
 
-    pub fn tcp_reactor_wakeup(&self) {
+    pub fn tcp_command_wakeup(&self) {
         if let Some(inner) = &self.inner {
-            inner.tcp_reactor_wakeups.fetch_add(1, Ordering::Relaxed);
+            inner.tcp_command_wakeups.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_poll(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_poll_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_poll_ready(&self, ready_fds: usize) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_poll_ready_returns.fetch_add(1, Ordering::Relaxed);
+            inner
+                .tcp_poll_ready_fds
+                .fetch_add(ready_fds as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_no_progress_iteration(&self) {
+        if let Some(inner) = &self.inner {
+            inner
+                .tcp_no_progress_iterations
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 

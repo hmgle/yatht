@@ -446,6 +446,7 @@ impl TcpBrokerReactor {
                 pollfds.push(relay.upstream_pollfd(&self.resources));
             }
 
+            self.resources.observability.tcp_poll();
             let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
@@ -454,12 +455,15 @@ impl TcpBrokerReactor {
                 }
                 return self.fail(err);
             }
+            self.resources.observability.tcp_poll_ready(rc as usize);
 
+            let mut made_progress = false;
             if pollfds[0].revents & libc::POLLIN != 0 {
                 if let Err(err) = drain_eventfd(self.wake_fd.as_raw_fd()) {
                     return self.fail(err);
                 }
-                self.resources.observability.tcp_reactor_wakeup();
+                self.resources.observability.tcp_command_wakeup();
+                made_progress = true;
                 if self.drain_commands()? {
                     return Ok(());
                 }
@@ -471,6 +475,7 @@ impl TcpBrokerReactor {
                 let upstream_events = pollfds[2 + index * 2].revents;
                 let relay = &mut self.relays[index];
                 let result = relay.process(target_events, upstream_events);
+                made_progress |= result.as_ref().copied().unwrap_or(true);
                 let finished = result.is_ok() && relay.is_finished();
                 if let Err(err) = &result {
                     relay.record_outcome(Some(err));
@@ -480,6 +485,9 @@ impl TcpBrokerReactor {
                 if result.is_err() || finished {
                     self.relays.swap_remove(index);
                 }
+            }
+            if !made_progress {
+                self.resources.observability.tcp_no_progress_iteration();
             }
         }
     }
@@ -623,7 +631,7 @@ impl TcpRelay {
         &mut self,
         target_events: libc::c_short,
         upstream_events: libc::c_short,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if target_events & libc::POLLNVAL != 0 || upstream_events & libc::POLLNVAL != 0 {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
@@ -703,11 +711,12 @@ impl TcpRelay {
             ));
         }
 
-        self.propagate_half_closes();
-        Ok(())
+        let half_close_progress = self.propagate_half_closes();
+        Ok(target_progress || upstream_progress || half_close_progress)
     }
 
-    fn propagate_half_closes(&mut self) {
+    fn propagate_half_closes(&mut self) -> bool {
+        let mut progress = false;
         if self.target_read_eof
             && self.target_to_upstream.is_empty()
             && !self.upstream_write_shutdown
@@ -715,6 +724,7 @@ impl TcpRelay {
             let _ = self.upstream.shutdown(Shutdown::Write);
             self.upstream_write_shutdown = true;
             self.permit.resources.observability.tcp_half_close();
+            progress = true;
         }
         if self.upstream_read_eof
             && self.upstream_to_target.is_empty()
@@ -723,7 +733,9 @@ impl TcpRelay {
             let _ = self.target.shutdown(Shutdown::Write);
             self.target_write_shutdown = true;
             self.permit.resources.observability.tcp_half_close();
+            progress = true;
         }
+        progress
     }
 
     fn is_finished(&self) -> bool {
@@ -1154,6 +1166,11 @@ mod tests {
         assert_eq!(summary["tcp_flows_completed"], 1);
         assert_eq!(summary["tcp_flow_failures"], 0);
         assert_eq!(summary["tcp_flows_cancelled"], 0);
+        assert!(summary["tcp_command_wakeups"].as_u64().unwrap() > 0);
+        assert!(summary["poll_calls"].as_u64().unwrap() > 0);
+        assert!(summary["poll_ready_returns"].as_u64().unwrap() > 0);
+        assert!(summary["poll_ready_fds"].as_u64().unwrap() > 0);
+        assert_eq!(summary["no_progress_iterations"], 0);
     }
 
     #[test]
