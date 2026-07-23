@@ -40,6 +40,8 @@ struct ObservabilityInner {
     tcp_registration_queue_full: AtomicU64,
     tcp_pending_bytes: AtomicU64,
     tcp_peak_pending_bytes: AtomicU64,
+    tcp_reserved_pending_bytes: AtomicU64,
+    tcp_peak_reserved_pending_bytes: AtomicU64,
     tcp_target_to_upstream_bytes: AtomicU64,
     tcp_upstream_to_target_bytes: AtomicU64,
     tcp_recv_syscalls: AtomicU64,
@@ -125,6 +127,8 @@ struct RunSummary {
     tcp_registration_queue_full: u64,
     tcp_pending_bytes: u64,
     tcp_peak_pending_bytes: u64,
+    tcp_reserved_pending_bytes: u64,
+    tcp_peak_reserved_pending_bytes: u64,
     tcp_target_to_upstream_bytes: u64,
     tcp_upstream_to_target_bytes: u64,
     tcp_recv_syscalls: u64,
@@ -193,6 +197,8 @@ impl ObservabilityRuntime {
             tcp_registration_queue_full: AtomicU64::new(0),
             tcp_pending_bytes: AtomicU64::new(0),
             tcp_peak_pending_bytes: AtomicU64::new(0),
+            tcp_reserved_pending_bytes: AtomicU64::new(0),
+            tcp_peak_reserved_pending_bytes: AtomicU64::new(0),
             tcp_target_to_upstream_bytes: AtomicU64::new(0),
             tcp_upstream_to_target_bytes: AtomicU64::new(0),
             tcp_recv_syscalls: AtomicU64::new(0),
@@ -261,6 +267,10 @@ impl ObservabilityRuntime {
             tcp_registration_queue_full: inner.tcp_registration_queue_full.load(Ordering::Relaxed),
             tcp_pending_bytes: inner.tcp_pending_bytes.load(Ordering::Relaxed),
             tcp_peak_pending_bytes: inner.tcp_peak_pending_bytes.load(Ordering::Relaxed),
+            tcp_reserved_pending_bytes: inner.tcp_reserved_pending_bytes.load(Ordering::Relaxed),
+            tcp_peak_reserved_pending_bytes: inner
+                .tcp_peak_reserved_pending_bytes
+                .load(Ordering::Relaxed),
             tcp_target_to_upstream_bytes: inner
                 .tcp_target_to_upstream_bytes
                 .load(Ordering::Relaxed),
@@ -436,23 +446,43 @@ impl Observability {
         }
     }
 
-    pub fn tcp_pending_reserved(&self, reserved: usize) {
+    pub fn tcp_pending_budget_reserved(&self, reserved: usize) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner
+            .tcp_reserved_pending_bytes
+            .fetch_add(reserved as u64, Ordering::Relaxed)
+            .saturating_add(reserved as u64);
+        update_peak(&inner.tcp_peak_reserved_pending_bytes, current);
+    }
+
+    pub fn tcp_pending_budget_released(&self, released: usize) {
+        if let Some(inner) = &self.inner {
+            let previous = inner
+                .tcp_reserved_pending_bytes
+                .fetch_sub(released as u64, Ordering::Relaxed);
+            debug_assert!(previous >= released as u64);
+        }
+    }
+
+    pub fn tcp_pending_added(&self, added: usize) {
         let Some(inner) = &self.inner else {
             return;
         };
         let current = inner
             .tcp_pending_bytes
-            .fetch_add(reserved as u64, Ordering::Relaxed)
-            .saturating_add(reserved as u64);
+            .fetch_add(added as u64, Ordering::Relaxed)
+            .saturating_add(added as u64);
         update_peak(&inner.tcp_peak_pending_bytes, current);
     }
 
-    pub fn tcp_pending_released(&self, released: usize) {
+    pub fn tcp_pending_removed(&self, removed: usize) {
         if let Some(inner) = &self.inner {
             let previous = inner
                 .tcp_pending_bytes
-                .fetch_sub(released as u64, Ordering::Relaxed);
-            debug_assert!(previous >= released as u64);
+                .fetch_sub(removed as u64, Ordering::Relaxed);
+            debug_assert!(previous >= removed as u64);
         }
     }
 

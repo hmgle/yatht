@@ -315,7 +315,7 @@ impl BrokerResources {
                 .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.observability.tcp_pending_reserved(reserved);
+                self.observability.tcp_pending_budget_reserved(reserved);
                 return reserved;
             }
         }
@@ -327,7 +327,7 @@ impl BrokerResources {
         }
         let previous = self.pending_bytes.fetch_sub(released, Ordering::AcqRel);
         debug_assert!(previous >= released);
-        self.observability.tcp_pending_released(released);
+        self.observability.tcp_pending_budget_released(released);
     }
 
     fn reserve_registration_slot(&self) -> bool {
@@ -614,6 +614,10 @@ impl Drop for TcpRelay {
             .len()
             .saturating_add(self.upstream_to_target.len());
         self.permit.resources.release_pending(pending);
+        self.permit
+            .resources
+            .observability
+            .tcp_pending_removed(pending);
         if self.accepted_by_reactor && !self.outcome_recorded {
             let cancelled = io::Error::from_raw_os_error(libc::ECANCELED);
             self.permit
@@ -697,6 +701,7 @@ fn read_socket(
         if rc > 0 {
             resources.release_pending(reserved - rc as usize);
             pending.append(&chunk[..rc as usize]);
+            resources.observability.tcp_pending_added(rc as usize);
             return Ok(ReadOutcome::Progress);
         }
         if rc == 0 {
@@ -736,6 +741,7 @@ fn flush_socket(
         if rc > 0 {
             pending.consume(rc as usize);
             resources.release_pending(rc as usize);
+            resources.observability.tcp_pending_removed(rc as usize);
             return Ok(());
         }
         if rc == 0 {
