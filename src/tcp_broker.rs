@@ -383,16 +383,8 @@ impl TcpBrokerReactor {
                 revents: 0,
             });
             for relay in &self.relays {
-                pollfds.push(libc::pollfd {
-                    fd: relay.target.as_raw_fd(),
-                    events: relay.target_events(&self.resources),
-                    revents: 0,
-                });
-                pollfds.push(libc::pollfd {
-                    fd: relay.upstream.as_raw_fd(),
-                    events: relay.upstream_events(&self.resources),
-                    revents: 0,
-                });
+                pollfds.push(relay.target_pollfd(&self.resources));
+                pollfds.push(relay.upstream_pollfd(&self.resources));
             }
 
             let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) };
@@ -478,13 +470,36 @@ impl TcpRelay {
         })
     }
 
+    fn target_pollfd(&self, resources: &BrokerResources) -> libc::pollfd {
+        let events = self.target_events(resources);
+        libc::pollfd {
+            fd: if events != 0 {
+                self.target.as_raw_fd()
+            } else {
+                -1
+            },
+            events,
+            revents: 0,
+        }
+    }
+
+    fn upstream_pollfd(&self, resources: &BrokerResources) -> libc::pollfd {
+        let events = self.upstream_events(resources);
+        libc::pollfd {
+            fd: if events != 0 {
+                self.upstream.as_raw_fd()
+            } else {
+                -1
+            },
+            events,
+            revents: 0,
+        }
+    }
+
     fn target_events(&self, resources: &BrokerResources) -> libc::c_short {
-        let mut events = libc::POLLRDHUP;
-        if !self.target_read_eof
-            && !self.target_to_upstream.is_full()
-            && !resources.pending_is_saturated()
-        {
-            events |= libc::POLLIN;
+        let mut events = 0;
+        if self.can_read_target(resources) {
+            events |= libc::POLLIN | libc::POLLRDHUP;
         }
         if !self.target_write_shutdown && !self.upstream_to_target.is_empty() {
             events |= libc::POLLOUT;
@@ -493,17 +508,26 @@ impl TcpRelay {
     }
 
     fn upstream_events(&self, resources: &BrokerResources) -> libc::c_short {
-        let mut events = libc::POLLRDHUP;
-        if !self.upstream_read_eof
-            && !self.upstream_to_target.is_full()
-            && !resources.pending_is_saturated()
-        {
-            events |= libc::POLLIN;
+        let mut events = 0;
+        if self.can_read_upstream(resources) {
+            events |= libc::POLLIN | libc::POLLRDHUP;
         }
         if !self.upstream_write_shutdown && !self.target_to_upstream.is_empty() {
             events |= libc::POLLOUT;
         }
         events
+    }
+
+    fn can_read_target(&self, resources: &BrokerResources) -> bool {
+        !self.target_read_eof
+            && !self.target_to_upstream.is_full()
+            && !resources.pending_is_saturated()
+    }
+
+    fn can_read_upstream(&self, resources: &BrokerResources) -> bool {
+        !self.upstream_read_eof
+            && !self.upstream_to_target.is_full()
+            && !resources.pending_is_saturated()
     }
 
     fn process(
@@ -515,23 +539,30 @@ impl TcpRelay {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
 
-        if target_events & libc::POLLOUT != 0 {
-            flush_socket(
+        let mut target_progress = false;
+        let mut upstream_progress = false;
+        if !self.target_write_shutdown
+            && !self.upstream_to_target.is_empty()
+            && target_events & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+        {
+            target_progress = flush_socket(
                 &self.target,
                 &mut self.upstream_to_target,
                 &self.permit.resources,
-            )?;
+            )? == WriteOutcome::Progress;
         }
-        if upstream_events & libc::POLLOUT != 0 {
-            flush_socket(
+        if !self.upstream_write_shutdown
+            && !self.target_to_upstream.is_empty()
+            && upstream_events & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+        {
+            upstream_progress = flush_socket(
                 &self.upstream,
                 &mut self.target_to_upstream,
                 &self.permit.resources,
-            )?;
+            )? == WriteOutcome::Progress;
         }
-        let target_read = if target_events
-            & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)
-            != 0
+        let target_read = if self.can_read_target(&self.permit.resources)
+            && target_events & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
         {
             read_socket(
                 &self.target,
@@ -545,9 +576,10 @@ impl TcpRelay {
         if target_read == ReadOutcome::Eof {
             self.target_read_eof = true;
         }
-        let upstream_read = if upstream_events
-            & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)
-            != 0
+        target_progress |= target_read != ReadOutcome::Idle;
+        let upstream_read = if self.can_read_upstream(&self.permit.resources)
+            && upstream_events & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)
+                != 0
         {
             read_socket(
                 &self.upstream,
@@ -561,12 +593,25 @@ impl TcpRelay {
         if upstream_read == ReadOutcome::Eof {
             self.upstream_read_eof = true;
         }
+        upstream_progress |= upstream_read != ReadOutcome::Idle;
 
-        if target_events & libc::POLLERR != 0 && target_read != ReadOutcome::Progress {
+        if target_events & libc::POLLERR != 0 && !target_progress {
             return Err(socket_error(self.target.as_raw_fd()));
         }
-        if upstream_events & libc::POLLERR != 0 && upstream_read != ReadOutcome::Progress {
+        if upstream_events & libc::POLLERR != 0 && !upstream_progress {
             return Err(socket_error(self.upstream.as_raw_fd()));
+        }
+        if target_events & libc::POLLHUP != 0 && !target_progress {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "target hung up without relay progress",
+            ));
+        }
+        if upstream_events & libc::POLLHUP != 0 && !upstream_progress {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "upstream hung up without relay progress",
+            ));
         }
 
         self.propagate_half_closes();
@@ -630,6 +675,12 @@ enum ReadOutcome {
     Idle,
     Progress,
     Eof,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WriteOutcome {
+    Idle,
+    Progress,
 }
 
 impl PendingBuffer {
@@ -720,9 +771,9 @@ fn flush_socket(
     stream: &TcpStream,
     pending: &mut PendingBuffer,
     resources: &BrokerResources,
-) -> io::Result<()> {
+) -> io::Result<WriteOutcome> {
     if pending.is_empty() {
-        return Ok(());
+        return Ok(WriteOutcome::Idle);
     }
     loop {
         let rc = unsafe {
@@ -738,7 +789,7 @@ fn flush_socket(
             pending.consume(rc as usize);
             resources.release_pending(rc as usize);
             resources.observability.tcp_pending_removed(rc as usize);
-            return Ok(());
+            return Ok(WriteOutcome::Progress);
         }
         if rc == 0 {
             return Err(io::Error::new(
@@ -751,7 +802,7 @@ fn flush_socket(
             continue;
         }
         if err.kind() == io::ErrorKind::WouldBlock {
-            return Ok(());
+            return Ok(WriteOutcome::Idle);
         }
         return Err(err);
     }
@@ -837,10 +888,15 @@ fn drain_eventfd(fd: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
     use std::thread;
     use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use crate::observability::ObservabilityRuntime;
 
     use super::*;
 
@@ -871,6 +927,108 @@ mod tests {
 
         broker.shutdown().unwrap();
         reactor_thread.join().unwrap();
+    }
+
+    #[test]
+    fn half_close_does_not_repeat_eof_reads_while_response_is_delayed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
+        let limits = TcpBrokerLimits {
+            max_active_flows: 1,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            rlimit_nofile: 4096,
+            baseline_fds: 0,
+            reserved_fds: 256,
+        };
+        let (broker, reactor) = TcpBroker::new_with_limits(
+            runtime.observability(),
+            limits,
+            FlowLimitReason::ActiveFlow,
+        )
+        .unwrap();
+        let reactor_thread = thread::spawn(move || reactor.run().unwrap());
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&target);
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+
+        target.write_all(b"request").unwrap();
+        target.shutdown(Shutdown::Write).unwrap();
+        let remote_thread = thread::spawn(move || {
+            let mut request = Vec::new();
+            remote.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"request");
+            thread::sleep(Duration::from_millis(100));
+            remote.write_all(b"response").unwrap();
+            remote.shutdown(Shutdown::Write).unwrap();
+        });
+        let mut response = Vec::new();
+        target.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+        remote_thread.join().unwrap();
+
+        broker.shutdown().unwrap();
+        reactor_thread.join().unwrap();
+        runtime.finish().unwrap();
+        let summary = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "run_summary")
+            .unwrap();
+        assert!(summary["tcp_recv_syscalls"].as_u64().unwrap() <= 8);
+    }
+
+    #[test]
+    fn full_source_buffer_disables_rdhup_interest() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (broker_target, _target) = tcp_pair();
+        let (broker_upstream, _remote) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+        assert_eq!(
+            relay
+                .permit
+                .resources
+                .reserve_pending(RELAY_BUFFER_CAPACITY),
+            RELAY_BUFFER_CAPACITY
+        );
+        relay
+            .target_to_upstream
+            .append(&vec![0x5a; RELAY_BUFFER_CAPACITY]);
+
+        let pollfd = relay.target_pollfd(&broker.resources);
+        assert_eq!(pollfd.fd, -1);
+        assert_eq!(pollfd.events, 0);
+    }
+
+    #[test]
+    fn hup_with_pending_reverse_data_makes_terminal_progress() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (broker_target, target) = tcp_pair();
+        let (broker_upstream, _remote) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+        assert_eq!(relay.permit.resources.reserve_pending(8), 8);
+        relay.upstream_to_target.append(b"response");
+        drop(target);
+
+        let before = relay.upstream_to_target.len();
+        let result = relay.process(libc::POLLHUP, 0);
+        assert!(result.is_err() || relay.upstream_to_target.len() < before);
     }
 
     #[test]
