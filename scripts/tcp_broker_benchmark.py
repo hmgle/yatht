@@ -356,14 +356,14 @@ def process_resources(pid: int) -> dict[str, int] | None:
             "rss_hwm_kib": int(hwm_line.split()[1]),
             "fds": fd_count,
         }
-    except (FileNotFoundError, PermissionError, StopIteration):
+    except (OSError, StopIteration):
         return None
 
 
 def direct_child_pids(pid: int) -> list[int]:
     try:
         raw = Path(f"/proc/{pid}/task/{pid}/children").read_text()
-    except (FileNotFoundError, PermissionError):
+    except OSError:
         return []
     return [int(value) for value in raw.split()]
 

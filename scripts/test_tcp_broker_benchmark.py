@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("tcp_broker_benchmark.py")
@@ -78,6 +79,12 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_missing_process_resources_are_null(self) -> None:
         self.assertIsNone(benchmark.process_resources(2**31 - 1))
+
+    def test_process_exit_races_are_treated_as_missing_samples(self) -> None:
+        error = ProcessLookupError(3, "No such process")
+        with mock.patch.object(benchmark.Path, "read_text", side_effect=error):
+            self.assertIsNone(benchmark.process_resources(123))
+            self.assertEqual(benchmark.direct_child_pids(123), [])
 
     def test_flow_ids_must_cover_expected_range(self) -> None:
         valid = [{"flow": 0, "ok": True}, {"flow": 1, "ok": True}]
