@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel as channel;
 
 use crate::config::{EffectiveConfig, Route};
+use crate::observability::{Observability, ObservabilityRuntime};
 use crate::proxy;
 use crate::seccomp::{self, SeccompNotif, SeccompNotifAddfd};
 use crate::tcp_broker::TcpBroker;
@@ -48,6 +49,11 @@ struct NotificationFailure {
 struct BlockingRecvQueue {
     tx: channel::Sender<SeccompNotif>,
     wake_fd: Arc<OwnedFd>,
+}
+
+struct QueuedNotification {
+    notif: SeccompNotif,
+    received_at: Instant,
 }
 
 struct PendingBlockingRecv {
@@ -124,6 +130,21 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
         bail!("missing command");
     }
 
+    let observability_runtime = ObservabilityRuntime::start(cfg.metrics_file.as_deref())?;
+    let observability = observability_runtime.observability();
+    let result = run_with_observability(cfg, observability);
+    let finish_result = observability_runtime.finish();
+    match (result, finish_result) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(err)) => Err(err).context("finish performance metrics"),
+        (Err(err), Err(metrics_err)) => Err(err).context(format!(
+            "also failed to finish performance metrics: {metrics_err:#}"
+        )),
+    }
+}
+
+fn run_with_observability(cfg: EffectiveConfig, observability: Observability) -> Result<i32> {
     let target_path = resolve_target(&cfg.command[0])?;
     set_child_subreaper().context("become child subreaper")?;
     let argv = cfg.command.clone();
@@ -214,9 +235,17 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let loop_relays = Arc::clone(&relays);
     let loop_failure = Arc::clone(&failure);
     let loop_state = Arc::clone(&failure);
+    let loop_observability = observability;
     thread::spawn(move || {
         if std::panic::catch_unwind(|| {
-            notification_loop(listener_fd, loop_cfg, loop_relays, tcp_broker, loop_state)
+            notification_loop(
+                listener_fd,
+                loop_cfg,
+                loop_relays,
+                tcp_broker,
+                loop_state,
+                loop_observability,
+            )
         })
         .is_err()
         {
@@ -394,9 +423,10 @@ fn notification_loop(
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
     failure: Arc<NotificationFailure>,
+    observability: Observability,
 ) {
     let worker_count = notification_worker_count();
-    let (tx, rx) = channel::bounded::<SeccompNotif>(
+    let (tx, rx) = channel::bounded::<QueuedNotification>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
     for _ in 0..worker_count {
@@ -406,6 +436,7 @@ fn notification_loop(
         let worker_relays = Arc::clone(&relays);
         let worker_tcp_broker = tcp_broker.clone();
         let worker_failure = Arc::clone(&failure);
+        let worker_observability = observability.clone();
         thread::spawn(move || {
             notification_worker(
                 worker_listener_fd,
@@ -414,6 +445,7 @@ fn notification_loop(
                 worker_relays,
                 worker_tcp_broker,
                 worker_failure,
+                worker_observability,
             )
         });
     }
@@ -490,7 +522,12 @@ fn notification_loop(
                         continue;
                     }
                 }
-                if !try_queue_notification(&tx, listener_raw_fd, notif, cfg.debug, "notification") {
+                let queued = QueuedNotification {
+                    notif,
+                    received_at: Instant::now(),
+                };
+                if !try_queue_notification(&tx, listener_raw_fd, queued, cfg.debug, "notification")
+                {
                     if !report_thread_notification_error(&failure, "respond to notification") {
                         failure.report(
                             "notification workers stopped",
@@ -526,29 +563,29 @@ fn notification_loop(
 }
 
 fn try_queue_notification(
-    tx: &channel::Sender<SeccompNotif>,
+    tx: &channel::Sender<QueuedNotification>,
     listener_fd: RawFd,
-    notif: SeccompNotif,
+    queued: QueuedNotification,
     debug: bool,
     queue_name: &str,
 ) -> bool {
-    match tx.try_send(notif) {
+    match tx.try_send(queued) {
         Ok(()) => true,
-        Err(channel::TrySendError::Full(notif)) => {
-            if should_block_when_queue_full(&notif) {
-                return queue_notification_blocking(tx, listener_fd, notif, debug, queue_name);
+        Err(channel::TrySendError::Full(queued)) => {
+            if should_block_when_queue_full(&queued.notif) {
+                return queue_notification_blocking(tx, listener_fd, queued, debug, queue_name);
             }
             if debug {
                 eprintln!("yatht: {queue_name} queue full");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+            seccomp::send_errno(listener_fd, queued.notif.id, libc::EAGAIN);
             true
         }
-        Err(channel::TrySendError::Disconnected(notif)) => {
+        Err(channel::TrySendError::Disconnected(queued)) => {
             if debug {
                 eprintln!("yatht: {queue_name} workers stopped");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            seccomp::send_errno(listener_fd, queued.notif.id, libc::EIO);
             false
         }
     }
@@ -566,19 +603,19 @@ fn should_block_when_queue_full(notif: &SeccompNotif) -> bool {
 }
 
 fn queue_notification_blocking(
-    tx: &channel::Sender<SeccompNotif>,
+    tx: &channel::Sender<QueuedNotification>,
     listener_fd: RawFd,
-    notif: SeccompNotif,
+    queued: QueuedNotification,
     debug: bool,
     queue_name: &str,
 ) -> bool {
-    match tx.send(notif) {
+    match tx.send(queued) {
         Ok(()) => true,
-        Err(channel::SendError(notif)) => {
+        Err(channel::SendError(queued)) => {
             if debug {
                 eprintln!("yatht: {queue_name} workers stopped");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            seccomp::send_errno(listener_fd, queued.notif.id, libc::EIO);
             false
         }
     }
@@ -654,24 +691,28 @@ fn drain_eventfd(fd: RawFd) -> io::Result<()> {
 
 fn notification_worker(
     listener_fd: Arc<OwnedFd>,
-    rx: channel::Receiver<SeccompNotif>,
+    rx: channel::Receiver<QueuedNotification>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
     failure: Arc<NotificationFailure>,
+    observability: Observability,
 ) {
     loop {
-        let notif = rx.recv();
-        let Ok(notif) = notif else {
+        let queued = rx.recv();
+        let Ok(queued) = queued else {
             return;
         };
+        let queue_wait = queued.received_at.elapsed();
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle_notification(
                 listener_fd.as_raw_fd(),
-                notif,
+                queued.notif,
                 Arc::clone(&cfg),
                 Arc::clone(&relays),
                 tcp_broker.clone(),
+                observability.clone(),
+                queue_wait,
             );
         }))
         .is_err()
@@ -1007,9 +1048,19 @@ fn handle_notification(
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
+    observability: Observability,
+    queue_wait: Duration,
 ) {
     match notif.data.nr as libc::c_long {
-        libc::SYS_connect => handle_connect(listener_fd, notif, cfg, relays, tcp_broker),
+        libc::SYS_connect => handle_connect(
+            listener_fd,
+            notif,
+            cfg,
+            relays,
+            tcp_broker,
+            observability,
+            queue_wait,
+        ),
         libc::SYS_sendto => handle_sendto(listener_fd, notif, cfg, relays),
         libc::SYS_sendmsg => handle_sendmsg(listener_fd, notif, cfg, relays),
         libc::SYS_recvfrom => handle_recvfrom(listener_fd, notif, relays),
@@ -1058,7 +1109,10 @@ fn handle_connect(
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
+    observability: Observability,
+    queue_wait: Duration,
 ) {
+    let handler_started = Instant::now();
     let target_fd = notif.data.args[0] as RawFd;
     let addr = notif.data.args[1];
     let addr_len = notif.data.args[2] as usize;
@@ -1108,6 +1162,7 @@ fn handle_connect(
         return;
     }
 
+    let fd_inspection_started = Instant::now();
     match socket_type(notif.pid, target_fd) {
         Some(libc::SOCK_DGRAM) => {
             if let Some(kind) = udp_route_for(&cfg, dest) {
@@ -1197,6 +1252,14 @@ fn handle_connect(
         );
     }
 
+    let mut setup = observability.begin_tcp_setup(
+        notif.pid,
+        target_fd,
+        dest.authority(),
+        handler_started,
+        queue_wait,
+    );
+
     let target = match duplicate_remote_fd(notif.pid, target_fd) {
         Ok(target)
             if socket_type_from_fd(target.as_raw_fd()) == Some(libc::SOCK_STREAM)
@@ -1209,6 +1272,7 @@ fn handle_connect(
         }
         Ok(_) => {
             seccomp::send_continue(listener_fd, notif.id);
+            setup.failed("fd_inspection", "target fd changed during inspection");
             return;
         }
         Err(err) => {
@@ -1216,51 +1280,82 @@ fn handle_connect(
                 eprintln!("yatht: duplicate TCP target fd failed: {err}");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            setup.failed("fd_inspection", err);
             return;
         }
     };
     let target_domain = socket_domain_from_fd(target.as_raw_fd()).unwrap();
+    setup.set_fd_inspection(
+        fd_inspection_started.elapsed(),
+        socket_cookie(target.as_raw_fd()),
+    );
 
-    let stream = match proxy::dial(&cfg.proxy, dest, cfg.connect_timeout) {
-        Ok(stream) => stream,
-        Err(err) => {
-            disconnect_tcp_socket(target.as_raw_fd());
-            if cfg.debug {
-                eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
+    let mut dial_timings = proxy::DialTimings::default();
+    let stream =
+        match proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, &mut dial_timings) {
+            Ok(stream) => stream,
+            Err(err) => {
+                setup.set_proxy_timings(dial_timings.connect, dial_timings.handshake);
+                disconnect_tcp_socket(target.as_raw_fd());
+                if cfg.debug {
+                    eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
+                }
+                seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+                let stage = if dial_timings.handshake.is_some() {
+                    "proxy_handshake"
+                } else {
+                    "proxy_connect"
+                };
+                setup.failed(stage, format!("{err:#}"));
+                return;
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
-            return;
-        }
-    };
+        };
+    setup.set_proxy_timings(dial_timings.connect, dial_timings.handshake);
+    setup.set_proxy_cookie(socket_cookie(stream.as_raw_fd()));
 
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        setup.cancelled("notification_validation_after_proxy");
         return;
     }
 
+    let loopback_started = Instant::now();
     let broker_target = match connect_target_to_broker(target.as_raw_fd(), target_domain) {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            setup.set_loopback(loopback_started.elapsed());
+            stream
+        }
         Err(err) => {
             if cfg.debug {
                 eprintln!("yatht: connect target socket to local broker failed: {err}");
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            setup.set_loopback(loopback_started.elapsed());
+            setup.failed("loopback_connect_accept", err);
             return;
         }
     };
 
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         disconnect_tcp_socket(target.as_raw_fd());
+        setup.cancelled("notification_validation_after_loopback");
         return;
     }
+    let register_started = Instant::now();
     if let Err(err) = tcp_broker.register(broker_target, stream) {
+        setup.set_broker_register(register_started.elapsed());
         disconnect_tcp_socket(target.as_raw_fd());
         if cfg.debug {
             eprintln!("yatht: register TCP broker relay failed: {err}");
         }
         seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+        setup.failed("broker_register", err);
         return;
     }
+    setup.set_broker_register(register_started.elapsed());
+    let reply_started = Instant::now();
     seccomp::send_success(listener_fd, notif.id);
+    setup.set_notification_reply(reply_started.elapsed());
+    setup.completed();
 }
 
 fn handle_sendto(
@@ -2987,6 +3082,21 @@ fn socket_domain_from_fd(fd: RawFd) -> Option<i32> {
     }
 }
 
+fn socket_cookie(fd: RawFd) -> Option<u64> {
+    let mut cookie = 0_u64;
+    let mut len = std::mem::size_of_val(&cookie) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_COOKIE,
+            (&mut cookie as *mut u64).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of_val(&cookie)).then_some(cookie)
+}
+
 fn connect_target_to_broker(target_fd: RawFd, domain: i32) -> io::Result<TcpStream> {
     let bind_addr = match domain {
         libc::AF_INET => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -4045,6 +4155,7 @@ mod tests {
             enable_udp: false,
             dns_server: enable_dns.then(|| SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53))),
             debug: false,
+            metrics_file: None,
             command: Vec::new(),
         }
     }

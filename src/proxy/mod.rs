@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -10,19 +10,35 @@ use crate::config::ProxyConfig;
 use crate::supervisor::Destination;
 
 pub fn dial(proxy: &ProxyConfig, dest: Destination, timeout: Duration) -> Result<TcpStream> {
+    dial_with_timings(proxy, dest, timeout, &mut DialTimings::default())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DialTimings {
+    pub connect: Option<Duration>,
+    pub handshake: Option<Duration>,
+}
+
+pub fn dial_with_timings(
+    proxy: &ProxyConfig,
+    dest: Destination,
+    timeout: Duration,
+    timings: &mut DialTimings,
+) -> Result<TcpStream> {
     match proxy {
         ProxyConfig::Socks5 {
             addr,
             username,
             password,
-        } => dial_socks5(
+        } => dial_socks5_with_timings(
             addr,
             username.as_deref(),
             password.as_deref(),
             dest,
             timeout,
+            timings,
         ),
-        ProxyConfig::Http { addr } => dial_http_connect(addr, dest, timeout),
+        ProxyConfig::Http { addr } => dial_http_connect_with_timings(addr, dest, timeout, timings),
     }
 }
 
@@ -125,37 +141,46 @@ impl Socks5UdpAssociation {
     }
 }
 
-fn dial_socks5(
+fn dial_socks5_with_timings(
     proxy_addr: &str,
     username: Option<&str>,
     password: Option<&str>,
     dest: Destination,
     timeout: Duration,
+    timings: &mut DialTimings,
 ) -> Result<TcpStream> {
-    let mut stream = connect_with_timeout(proxy_addr, timeout)
-        .with_context(|| format!("connect SOCKS5 proxy {proxy_addr}"))?;
+    let connect_started = Instant::now();
+    let connected = connect_with_timeout(proxy_addr, timeout);
+    timings.connect = Some(connect_started.elapsed());
+    let mut stream = connected.with_context(|| format!("connect SOCKS5 proxy {proxy_addr}"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    socks5_greet(&mut stream, username, password)?;
+    let handshake_started = Instant::now();
+    let result: Result<()> = (|| {
+        socks5_greet(&mut stream, username, password)?;
 
-    let mut req = vec![0x05, 0x01, 0x00];
-    match dest.ip {
-        IpAddr::V4(ip) => {
-            req.push(0x01);
-            req.extend_from_slice(&ip.octets());
+        let mut req = vec![0x05, 0x01, 0x00];
+        match dest.ip {
+            IpAddr::V4(ip) => {
+                req.push(0x01);
+                req.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                req.push(0x04);
+                req.extend_from_slice(&ip.octets());
+            }
         }
-        IpAddr::V6(ip) => {
-            req.push(0x04);
-            req.extend_from_slice(&ip.octets());
-        }
-    }
-    req.extend_from_slice(&dest.port.to_be_bytes());
-    stream.write_all(&req)?;
+        req.extend_from_slice(&dest.port.to_be_bytes());
+        stream.write_all(&req)?;
 
-    let _ = read_socks5_reply_addr(&mut stream)?;
+        let _ = read_socks5_reply_addr(&mut stream)?;
 
-    clear_handshake_timeouts(&stream)?;
+        clear_handshake_timeouts(&stream)?;
+        Ok(())
+    })();
+    timings.handshake = Some(handshake_started.elapsed());
+    result?;
     Ok(stream)
 }
 
@@ -296,47 +321,60 @@ fn decode_socks5_udp_payload(packet: &[u8]) -> Result<&[u8]> {
     Ok(&packet[payload_offset..])
 }
 
-fn dial_http_connect(proxy_addr: &str, dest: Destination, timeout: Duration) -> Result<TcpStream> {
-    let mut stream = connect_with_timeout(proxy_addr, timeout)
-        .with_context(|| format!("connect HTTP proxy {proxy_addr}"))?;
+fn dial_http_connect_with_timings(
+    proxy_addr: &str,
+    dest: Destination,
+    timeout: Duration,
+    timings: &mut DialTimings,
+) -> Result<TcpStream> {
+    let connect_started = Instant::now();
+    let connected = connect_with_timeout(proxy_addr, timeout);
+    timings.connect = Some(connect_started.elapsed());
+    let mut stream = connected.with_context(|| format!("connect HTTP proxy {proxy_addr}"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    let authority = dest.authority();
-    let req = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes())?;
+    let handshake_started = Instant::now();
+    let result: Result<()> = (|| {
+        let authority = dest.authority();
+        let req = format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes())?;
 
-    let mut buf = Vec::with_capacity(1024);
-    let mut byte = [0_u8; 1];
-    while !buf.ends_with(b"\r\n\r\n") {
-        if buf.len() >= 8192 {
-            bail!("HTTP proxy response header too large");
+        let mut buf = Vec::with_capacity(1024);
+        let mut byte = [0_u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            if buf.len() >= 8192 {
+                bail!("HTTP proxy response header too large");
+            }
+            let n = stream.read(&mut byte)?;
+            if n == 0 {
+                bail!("HTTP proxy closed before completing CONNECT response");
+            }
+            buf.push(byte[0]);
         }
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            bail!("HTTP proxy closed before completing CONNECT response");
+
+        let header = String::from_utf8_lossy(&buf);
+        let status = header
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow!("empty HTTP proxy response"))?;
+        let mut parts = status.split_whitespace();
+        let _version = parts.next();
+        let code = parts
+            .next()
+            .ok_or_else(|| anyhow!("HTTP proxy response missing status code"))?;
+        if code != "200" {
+            let _ = stream.shutdown(Shutdown::Both);
+            bail!("HTTP CONNECT failed: {status}");
         }
-        buf.push(byte[0]);
-    }
 
-    let header = String::from_utf8_lossy(&buf);
-    let status = header
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("empty HTTP proxy response"))?;
-    let mut parts = status.split_whitespace();
-    let _version = parts.next();
-    let code = parts
-        .next()
-        .ok_or_else(|| anyhow!("HTTP proxy response missing status code"))?;
-    if code != "200" {
-        let _ = stream.shutdown(Shutdown::Both);
-        bail!("HTTP CONNECT failed: {status}");
-    }
-
-    clear_handshake_timeouts(&stream)?;
+        clear_handshake_timeouts(&stream)?;
+        Ok(())
+    })();
+    timings.handshake = Some(handshake_started.elapsed());
+    result?;
     Ok(stream)
 }
 
@@ -388,15 +426,19 @@ mod tests {
                 .unwrap();
         });
 
-        let stream = dial_http_connect(
+        let mut timings = DialTimings::default();
+        let stream = dial_http_connect_with_timings(
             &addr.to_string(),
             Destination {
                 ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
                 port: 443,
             },
             Duration::from_secs(2),
+            &mut timings,
         )
         .unwrap();
+        assert!(timings.connect.is_some());
+        assert!(timings.handshake.is_some());
         assert_eq!(stream.read_timeout().unwrap(), None);
         assert_eq!(stream.write_timeout().unwrap(), None);
         drop(stream);
@@ -420,7 +462,8 @@ mod tests {
             conn.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
         });
 
-        let stream = dial_socks5(
+        let mut timings = DialTimings::default();
+        let stream = dial_socks5_with_timings(
             &addr.to_string(),
             None,
             None,
@@ -429,8 +472,11 @@ mod tests {
                 port: 443,
             },
             Duration::from_secs(2),
+            &mut timings,
         )
         .unwrap();
+        assert!(timings.connect.is_some());
+        assert!(timings.handshake.is_some());
         assert_eq!(stream.read_timeout().unwrap(), None);
         assert_eq!(stream.write_timeout().unwrap(), None);
         drop(stream);

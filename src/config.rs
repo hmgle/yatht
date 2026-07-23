@@ -50,6 +50,9 @@ pub struct Cli {
     #[arg(long)]
     pub debug: bool,
 
+    #[arg(long, help = "Write experimental performance metrics as JSONL")]
+    pub metrics_file: Option<PathBuf>,
+
     #[arg(last = true, required = true)]
     pub command: Vec<OsString>,
 }
@@ -65,6 +68,7 @@ pub struct EffectiveConfig {
     pub enable_udp: bool,
     pub dns_server: Option<SocketAddr>,
     pub debug: bool,
+    pub metrics_file: Option<PathBuf>,
     pub command: Vec<OsString>,
 }
 
@@ -92,6 +96,7 @@ struct FileConfig {
     enable_udp: Option<bool>,
     dns_server: Option<String>,
     debug: Option<bool>,
+    metrics_file: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -153,6 +158,7 @@ impl EffectiveConfig {
             enable_udp: cli.enable_udp || file_cfg.enable_udp.unwrap_or(false),
             dns_server,
             debug: cli.debug || file_cfg.debug.unwrap_or(false),
+            metrics_file: cli.metrics_file.or(file_cfg.metrics_file),
             command: cli.command,
         };
         cfg.validate()?;
@@ -352,6 +358,7 @@ mod tests {
             enable_udp: false,
             dns_server: Some("127.0.0.1:5353".to_string()),
             debug: false,
+            metrics_file: None,
             command: vec![OsString::from("true")],
         };
 
@@ -375,6 +382,7 @@ mod tests {
             enable_udp: false,
             dns_server: None,
             debug: false,
+            metrics_file: None,
             command: vec![OsString::from("true")],
         };
 
@@ -414,6 +422,7 @@ mod tests {
             enable_udp: false,
             dns_server: None,
             debug: false,
+            metrics_file: None,
             command: vec![OsString::from("true")],
         }
     }

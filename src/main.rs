@@ -1,4 +1,5 @@
 mod config;
+mod observability;
 mod proxy;
 mod seccomp;
 mod supervisor;

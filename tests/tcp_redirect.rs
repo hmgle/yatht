@@ -45,12 +45,16 @@ fn redirects_local_tcp_connect_through_socks5() {
             .unwrap();
         handle_socks5_connect(&mut client, dest_tx);
     });
+    let metrics_dir = tempfile::tempdir().unwrap();
+    let metrics_path = metrics_dir.path().join("tcp-setup.jsonl");
 
     let bin = env!("CARGO_BIN_EXE_yatht");
     let output = Command::new(bin)
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))
         .arg("--proxy-local")
+        .arg("--metrics-file")
+        .arg(&metrics_path)
         .arg("--")
         .arg(curl)
         .arg("-fsS")
@@ -72,6 +76,23 @@ fn redirects_local_tcp_connect_through_socks5() {
 
     socks_thread.join().unwrap();
     target_thread.join().unwrap();
+
+    let events = fs::read_to_string(metrics_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let setup = events
+        .iter()
+        .find(|event| event["event"] == "tcp_setup")
+        .expect("missing TCP setup metric");
+    assert_eq!(setup["outcome"], "completed");
+    assert!(setup["target_cookie"].as_u64().is_some());
+    assert!(setup["proxy_cookie"].as_u64().is_some());
+    let summary = events.last().unwrap();
+    assert_eq!(summary["event"], "run_summary");
+    assert_eq!(summary["tcp_setup_completed"], 1);
+    assert_eq!(summary["dropped_metric_events"], 0);
 }
 
 #[test]
