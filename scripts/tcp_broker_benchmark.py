@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import suppress
 import csv
 import json
 import math
@@ -16,12 +17,14 @@ import os
 from pathlib import Path
 import random
 import resource
+import signal
 import shlex
 import shutil
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -40,6 +43,7 @@ class BenchmarkServers:
         self.stop_event: asyncio.Event | None = None
         self.destination_port = 0
         self.proxy_port = 0
+        self.stalled_port = 0
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._thread_main, name="benchmark-servers")
         self.error: BaseException | None = None
@@ -91,14 +95,23 @@ class BenchmarkServers:
             0,
             backlog=65535,
         )
+        stalled = await asyncio.start_server(
+            self._handle_stalled_destination,
+            "127.0.0.1",
+            0,
+            backlog=65535,
+        )
         self.destination_port = destination.sockets[0].getsockname()[1]
         self.proxy_port = proxy.sockets[0].getsockname()[1]
+        self.stalled_port = stalled.sockets[0].getsockname()[1]
         self.ready.set()
         await self.stop_event.wait()
         destination.close()
         proxy.close()
+        stalled.close()
         await destination.wait_closed()
         await proxy.wait_closed()
+        await stalled.wait_closed()
 
     async def _handle_destination(
         self,
@@ -116,7 +129,8 @@ class BenchmarkServers:
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            with suppress(ConnectionError, OSError):
+                await writer.wait_closed()
 
     async def _handle_proxy(
         self,
@@ -146,6 +160,9 @@ class BenchmarkServers:
                 return
             port = int.from_bytes(await reader.readexactly(2), "big")
             upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
+            if port == self.stalled_port:
+                upstream_socket = upstream_writer.get_extra_info("socket")
+                upstream_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
             writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
             await writer.drain()
             await asyncio.gather(
@@ -157,9 +174,25 @@ class BenchmarkServers:
         finally:
             if upstream_writer is not None:
                 upstream_writer.close()
-                await upstream_writer.wait_closed()
+                with suppress(ConnectionError, OSError):
+                    await upstream_writer.wait_closed()
             writer.close()
-            await writer.wait_closed()
+            with suppress(ConnectionError, OSError):
+                await writer.wait_closed()
+
+    async def _handle_stalled_destination(
+        self,
+        _reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        destination_socket = writer.get_extra_info("socket")
+        destination_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        try:
+            await asyncio.sleep(1)
+        finally:
+            writer.close()
+            with suppress(ConnectionError, OSError):
+                await writer.wait_closed()
 
     async def _copy_stream(
         self,
@@ -230,6 +263,17 @@ def system_cpu_ticks() -> list[int]:
     return [int(value) for value in fields]
 
 
+def process_resources(pid: int) -> tuple[int, int]:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text().splitlines()
+        rss_line = next(line for line in status if line.startswith("VmRSS:"))
+        rss_kib = int(rss_line.split()[1])
+        fd_count = len(list(Path(f"/proc/{pid}/fd").iterdir()))
+        return rss_kib, fd_count
+    except (FileNotFoundError, PermissionError, StopIteration):
+        return 0, 0
+
+
 def percentile(values: list[int | float], fraction: float) -> float:
     ordered = sorted(float(value) for value in values)
     index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))
@@ -252,14 +296,19 @@ def variant_command(
     scenario: dict[str, Any],
     metrics_path: Path | None = None,
 ) -> list[str]:
+    destination_port = (
+        servers.stalled_port if scenario["mode"] == "stalled" else servers.destination_port
+    )
     workload = [
         str(args.workload),
         scenario["mode"],
         "127.0.0.1",
-        str(servers.destination_port),
+        str(destination_port),
         str(scenario["flows"]),
         str(scenario["value"]),
     ]
+    if scenario["mode"] == "stalled":
+        workload.append(str(scenario["hold_ms"]))
     if variant == "direct":
         return workload
     yatht = args.yatht if variant == "stable" else args.addfd_yatht
@@ -293,23 +342,37 @@ def run_one(
     system_before = system_cpu_ticks()
     started = time.perf_counter_ns()
     timed_out = False
-    try:
-        completed = subprocess.run(
+    peak_rss_kib = 0
+    peak_fds = 0
+    with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(
+        mode="w+"
+    ) as stderr_file:
+        process = subprocess.Popen(
             command,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=args.timeout,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as error:
-        timed_out = True
-        stdout = error.stdout or ""
-        stderr = error.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        completed = subprocess.CompletedProcess(command, 124, stdout, stderr)
+        deadline = time.monotonic() + args.timeout
+        while process.poll() is None:
+            rss_kib, fd_count = process_resources(process.pid)
+            peak_rss_kib = max(peak_rss_kib, rss_kib)
+            peak_fds = max(peak_fds, fd_count)
+            if time.monotonic() >= deadline:
+                timed_out = True
+                os.killpg(process.pid, signal.SIGKILL)
+                break
+            time.sleep(0.005)
+        returncode = process.wait()
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        completed = subprocess.CompletedProcess(
+            command,
+            124 if timed_out else returncode,
+            stdout_file.read(),
+            stderr_file.read(),
+        )
     wall_ns = time.perf_counter_ns() - started
     system_after = system_cpu_ticks()
     proxy_cpu_ns = servers.cpu_ns() - proxy_before
@@ -362,6 +425,8 @@ def run_one(
         "wall_ns": wall_ns,
         "child_cpu_ns": child_delta_ns,
         "proxy_cpu_ns": proxy_cpu_ns,
+        "process_peak_rss_kib": peak_rss_kib,
+        "process_peak_fds": peak_fds,
         "system_cpu_ticks": sum(system_after) - sum(system_before),
         "target_user_cpu_ns": workload_summary.get("user_cpu_ns"),
         "target_system_cpu_ns": workload_summary.get("system_cpu_ns"),
@@ -404,6 +469,16 @@ def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
         }
         for flows in args.idle_flows
     ]
+    if args.stalled_flows > 0:
+        result.append(
+            {
+                "name": f"stalled-{args.stalled_flows}-flows",
+                "mode": "stalled",
+                "flows": args.stalled_flows,
+                "value": args.stalled_bytes,
+                "hold_ms": args.stalled_hold_ms,
+            }
+        )
     return result
 
 
@@ -467,6 +542,18 @@ def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) ->
                     if wall
                     else None
                 ),
+                "process_peak_rss_median_kib": (
+                    statistics.median(
+                        run["process_peak_rss_kib"] for run in selected_runs if run["ok"]
+                    )
+                    if wall
+                    else None
+                ),
+                "process_peak_fds_max": (
+                    max(run["process_peak_fds"] for run in selected_runs if run["ok"])
+                    if wall
+                    else None
+                ),
             }
         )
     return rows
@@ -506,6 +593,9 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "connections": args.connections,
         "payload_sizes": args.payload_sizes,
         "idle_flows": args.idle_flows,
+        "stalled_flows": args.stalled_flows,
+        "stalled_bytes": args.stalled_bytes,
+        "stalled_hold_ms": args.stalled_hold_ms,
         "random_seed": args.seed,
     }
 
@@ -519,6 +609,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payload-sizes", type=comma_sizes, default=comma_sizes("0,1,1024,16384,65536"))
     parser.add_argument("--idle-flows", type=comma_sizes, default=comma_sizes("1000"))
     parser.add_argument("--idle-hold-ms", type=int, default=100)
+    parser.add_argument("--stalled-flows", type=int, default=128)
+    parser.add_argument("--stalled-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--stalled-hold-ms", type=int, default=250)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=120.0)

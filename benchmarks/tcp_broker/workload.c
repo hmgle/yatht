@@ -240,23 +240,96 @@ static int run_idle(const struct endpoint *endpoint, size_t flows, size_t hold_m
     return successful == flows ? 0 : 1;
 }
 
+static int run_stalled(const struct endpoint *endpoint, size_t flows,
+                       size_t bytes_per_flow, size_t hold_ms) {
+    int *fds = malloc(flows * sizeof(*fds));
+    uint8_t *payload = malloc(65536);
+    if (fds == NULL || payload == NULL) {
+        perror("malloc");
+        free(fds);
+        free(payload);
+        return 2;
+    }
+    memset(payload, 0x5a, 65536);
+    for (size_t index = 0; index < flows; ++index) {
+        fds[index] = -1;
+    }
+
+    size_t successful = 0;
+    uint64_t total_bytes = 0;
+    for (size_t flow = 0; flow < flows; ++flow) {
+        uint64_t connect_ns = 0;
+        fds[flow] = connect_endpoint(endpoint, &connect_ns);
+        int error = fds[flow] < 0 ? errno : 0;
+        size_t sent = 0;
+        while (error == 0 && sent < bytes_per_flow) {
+            size_t chunk = (bytes_per_flow - sent) < 65536 ?
+                           (bytes_per_flow - sent) : 65536;
+            if (write_all(fds[flow], payload, chunk) != 0) {
+                error = errno;
+                break;
+            }
+            sent += chunk;
+        }
+        if (error == 0) {
+            ++successful;
+            total_bytes += sent;
+        }
+        printf("{\"event\":\"flow\",\"flow\":%zu,\"ok\":%s,"
+               "\"errno\":%d,\"connect_ns\":%" PRIu64
+               ",\"bytes\":%zu}\n",
+               flow, error == 0 ? "true" : "false", error, connect_ns, sent);
+    }
+
+    struct timespec hold = {
+        .tv_sec = (time_t)(hold_ms / 1000),
+        .tv_nsec = (long)((hold_ms % 1000) * 1000000),
+    };
+    while (nanosleep(&hold, &hold) != 0 && errno == EINTR) {
+    }
+    for (size_t flow = 0; flow < flows; ++flow) {
+        if (fds[flow] >= 0) {
+            close(fds[flow]);
+        }
+    }
+    free(fds);
+    free(payload);
+
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        perror("getrusage");
+        return 2;
+    }
+    printf("{\"event\":\"workload_summary\",\"mode\":\"stalled\","
+           "\"flows\":%zu,\"successful\":%zu,\"bytes\":%" PRIu64
+           ",\"user_cpu_ns\":%" PRIu64 ",\"system_cpu_ns\":%" PRIu64 "}\n",
+           flows, successful, total_bytes, timeval_ns(usage.ru_utime),
+           timeval_ns(usage.ru_stime));
+    return successful == flows ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
-    if (argc != 6) {
+    if (argc != 6 && argc != 7) {
         fprintf(stderr,
                 "usage: %s request HOST PORT FLOWS PAYLOAD_BYTES\n"
-                "       %s idle HOST PORT FLOWS HOLD_MS\n",
-                argv[0], argv[0]);
+                "       %s idle HOST PORT FLOWS HOLD_MS\n"
+                "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
     struct endpoint endpoint = resolve_endpoint(argv[2], argv[3]);
     size_t flows = parse_size(argv[4], "flows");
     size_t value = parse_size(argv[5], "payload bytes or hold milliseconds");
-    if (strcmp(argv[1], "request") == 0) {
+    if (strcmp(argv[1], "request") == 0 && argc == 6) {
         return run_request(&endpoint, flows, value);
     }
-    if (strcmp(argv[1], "idle") == 0) {
+    if (strcmp(argv[1], "idle") == 0 && argc == 6) {
         return run_idle(&endpoint, flows, value);
+    }
+    if (strcmp(argv[1], "stalled") == 0 && argc == 7) {
+        return run_stalled(&endpoint, flows, value,
+                           parse_size(argv[6], "hold milliseconds"));
     }
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;
