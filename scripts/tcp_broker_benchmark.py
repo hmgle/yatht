@@ -11,6 +11,7 @@ import argparse
 import asyncio
 from contextlib import suppress
 import csv
+import hashlib
 import json
 import math
 import os
@@ -45,7 +46,11 @@ class BenchmarkServers:
         self.proxy_port = 0
         self.stalled_port = 0
         self.ready = threading.Event()
-        self.thread = threading.Thread(target=self._thread_main, name="benchmark-servers")
+        self.thread = threading.Thread(
+            target=self._thread_main,
+            name="benchmark-servers",
+            daemon=True,
+        )
         self.error: BaseException | None = None
         self.stalled_release: asyncio.Event | None = None
         self.safety_timeout = safety_timeout
@@ -249,25 +254,70 @@ def comma_sizes(raw: str) -> list[int]:
     return values
 
 
+def comma_variants(raw: str) -> list[str]:
+    values = raw.split(",")
+    if not raw or any(not value for value in values):
+        raise argparse.ArgumentTypeError("variants must not be empty")
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("variants must not contain duplicates")
+    unknown = sorted(set(values) - set(VARIANT_ORDER))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown variants: {', '.join(unknown)}")
+    return values
+
+
+def ensure_fd_limit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    selected_flow_counts = list(args.idle_flows)
+    if args.payload_sizes:
+        selected_flow_counts.append(args.connections)
+    if args.stalled_flows > 0:
+        selected_flow_counts.append(args.stalled_flows)
+    max_flows = max(selected_flow_counts)
+    target_need = max_flows + 64
+    server_multiplier = 3 if any(variant != "direct" for variant in args.variants) else 1
+    server_need = server_multiplier * max_flows + 128
+    stable_need = 4 * max_flows + 512 if "stable" in args.variants else 0
+    required = max(target_need, server_need, stable_need)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and required > hard:
+        parser.error(
+            f"selected variants and flows need about {required} fds; hard limit is {hard}"
+        )
+    if soft != resource.RLIM_INFINITY and soft < required:
+        new_soft = required if hard == resource.RLIM_INFINITY else min(required, hard)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        except (OSError, ValueError) as error:
+            parser.error(f"cannot raise RLIMIT_NOFILE from {soft} to {new_soft}: {error}")
+    args.estimated_fd_limit = required
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_workload(cc: str, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists() and output.stat().st_mtime_ns >= WORKLOAD_SOURCE.stat().st_mtime_ns:
-        return
-    subprocess.run(
-        [
-            cc,
-            "-O2",
-            "-std=c11",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pthread",
-            str(WORKLOAD_SOURCE),
-            "-o",
-            str(output),
-        ],
-        check=True,
-    )
+    flags = ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"]
+    compiler = command_output([cc, "--version"])
+    cache_key = {
+        "compiler": compiler,
+        "flags": flags,
+        "source_sha256": sha256_file(WORKLOAD_SOURCE),
+    }
+    cache_path = output.with_suffix(output.suffix + ".build.json")
+    if output.exists() and cache_path.exists():
+        try:
+            if json.loads(cache_path.read_text()) == cache_key:
+                return
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    subprocess.run([cc, *flags, str(WORKLOAD_SOURCE), "-o", str(output)], check=True)
+    cache_path.write_text(json.dumps(cache_key, indent=2, sort_keys=True) + "\n")
 
 
 def child_cpu_ns() -> int:
@@ -375,6 +425,60 @@ def parse_workload_output(stdout: str) -> tuple[list[dict[str, Any]], dict[str, 
     return flows, summaries[0]
 
 
+def workload_flows_are_valid(flows: list[dict[str, Any]], expected: int) -> bool:
+    return (
+        len(flows) == expected
+        and {flow.get("flow") for flow in flows} == set(range(expected))
+        and all(flow.get("ok") for flow in flows)
+    )
+
+
+def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError as error:
+        return events, [{"line": None, "error": str(error), "fragment": None}]
+    for line_number, raw in enumerate(lines, start=1):
+        if not raw.strip():
+            continue
+        try:
+            line = raw.decode("utf-8")
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("JSONL record is not an object")
+            events.append(event)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            errors.append(
+                {
+                    "line": line_number,
+                    "error": str(error),
+                    "fragment": raw[:200].decode("utf-8", errors="backslashreplace"),
+                }
+            )
+    return events, errors
+
+
+def terminate_process_group(process: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    if process.poll() is not None:
+        return
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+
+
+def interrupt_benchmark(_signum: int, _frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
 def variant_command(
     variant: str,
     args: argparse.Namespace,
@@ -456,57 +560,63 @@ def run_one(
         with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(
             mode="w+"
         ) as stderr_file:
-            process = subprocess.Popen(
-                command,
-                text=True,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-            )
-            if variant == "direct":
-                target_pid = process.pid
-            else:
-                supervisor_pid = process.pid
-            deadline = time.monotonic() + args.timeout
-            while process.poll() is None:
-                if supervisor_pid is not None:
-                    update_process_peak(supervisor_peaks, process_resources(supervisor_pid))
-                    if target_pid is None:
-                        children = direct_child_pids(supervisor_pid)
-                        if children:
-                            target_pid = children[0]
-                if target_pid is not None:
-                    update_process_peak(target_peaks, process_resources(target_pid))
-                update_process_peak(server_peaks, process_resources(os.getpid()))
-                tree_samples = [
-                    sample
-                    for pid in process_tree_pids(process.pid)
-                    if (sample := process_resources(pid)) is not None
-                ]
-                if tree_samples:
-                    tree_rss = sum(sample["rss_kib"] for sample in tree_samples)
-                    tree_fds = sum(sample["fds"] for sample in tree_samples)
-                    process_tree_rss_sampled_peak_kib = max(
-                        process_tree_rss_sampled_peak_kib or 0, tree_rss
-                    )
-                    process_tree_fd_sampled_peak = max(
-                        process_tree_fd_sampled_peak or 0, tree_fds
-                    )
-                now = time.monotonic()
-                if scenario["mode"] == "stalled" and not stalled_ready:
-                    if stalled_ready_path.exists():
-                        stalled_ready = True
-                        release_at = now + scenario["hold_ms"] / 1000
-                if release_at is not None and now >= release_at and not stalled_released:
+            process: subprocess.Popen[str] | None = None
+            try:
+                process = subprocess.Popen(
+                    command,
+                    text=True,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+                if variant == "direct":
+                    target_pid = process.pid
+                else:
+                    supervisor_pid = process.pid
+                deadline = time.monotonic() + args.timeout
+                while process.poll() is None:
+                    if supervisor_pid is not None:
+                        update_process_peak(supervisor_peaks, process_resources(supervisor_pid))
+                        if target_pid is None:
+                            children = direct_child_pids(supervisor_pid)
+                            if children:
+                                target_pid = children[0]
+                    if target_pid is not None:
+                        update_process_peak(target_peaks, process_resources(target_pid))
+                    update_process_peak(server_peaks, process_resources(os.getpid()))
+                    tree_samples = [
+                        sample
+                        for pid in process_tree_pids(process.pid)
+                        if (sample := process_resources(pid)) is not None
+                    ]
+                    if tree_samples:
+                        tree_rss = sum(sample["rss_kib"] for sample in tree_samples)
+                        tree_fds = sum(sample["fds"] for sample in tree_samples)
+                        process_tree_rss_sampled_peak_kib = max(
+                            process_tree_rss_sampled_peak_kib or 0, tree_rss
+                        )
+                        process_tree_fd_sampled_peak = max(
+                            process_tree_fd_sampled_peak or 0, tree_fds
+                        )
+                    now = time.monotonic()
+                    if scenario["mode"] == "stalled" and not stalled_ready:
+                        if stalled_ready_path.exists():
+                            stalled_ready = True
+                            release_at = now + scenario["hold_ms"] / 1000
+                    if release_at is not None and now >= release_at and not stalled_released:
+                        servers.release_stalled_run()
+                        stalled_released = True
+                    if now >= deadline:
+                        timed_out = True
+                        terminate_process_group(process)
+                        break
+                    time.sleep(0.005)
+            finally:
+                if scenario["mode"] == "stalled" and not stalled_released:
                     servers.release_stalled_run()
-                    stalled_released = True
-                if now >= deadline:
-                    timed_out = True
-                    os.killpg(process.pid, signal.SIGKILL)
-                    break
-                time.sleep(0.005)
-            if scenario["mode"] == "stalled" and not stalled_released:
-                servers.release_stalled_run()
+                if process is not None:
+                    terminate_process_group(process)
+            assert process is not None
             returncode = process.wait()
             stdout_file.seek(0)
             stderr_file.seek(0)
@@ -529,21 +639,26 @@ def run_one(
         parse_error = str(error)
 
     metric_summary: dict[str, Any] | None = None
-    if metrics_path is not None and metrics_path.exists():
-        metric_events = [
-            json.loads(line)
-            for line in metrics_path.read_text().splitlines()
-            if line.strip()
-        ]
+    metric_parse_errors: list[dict[str, Any]] = []
+    if metrics_path is not None:
+        metric_events, metric_parse_errors = parse_jsonl(metrics_path)
         summaries = [event for event in metric_events if event.get("event") == "run_summary"]
-        if summaries:
-            metric_summary = summaries[-1]
+        if len(summaries) == 1:
+            metric_summary = summaries[0]
+        else:
+            metric_parse_errors.append(
+                {
+                    "line": None,
+                    "error": f"expected one run summary, got {len(summaries)}",
+                    "fragment": None,
+                }
+            )
 
     successful = [flow for flow in flows if flow.get("ok")]
     ok = (
         completed.returncode == 0
         and parse_error is None
-        and len(successful) == scenario["flows"]
+        and workload_flows_are_valid(flows, scenario["flows"])
     )
     if scenario["mode"] == "stalled":
         ok = (
@@ -556,7 +671,7 @@ def run_one(
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
     if metrics_path is not None:
-        ok = ok and metric_summary is not None
+        ok = ok and metric_summary is not None and not metric_parse_errors
         if metric_summary is not None:
             ok = ok and metric_summary.get("tcp_setup_completed") == scenario["flows"]
             ok = ok and metric_summary.get("tcp_active_flows") == 0
@@ -615,6 +730,7 @@ def run_one(
         "command": command,
         "metrics_file": str(metrics_path) if metrics_path is not None else None,
         "metric_summary": metric_summary,
+        "metric_parse_errors": metric_parse_errors,
     }
     enriched = [
         {
@@ -661,7 +777,10 @@ def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
     return result
 
 
-def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def summarize(
+    runs: list[dict[str, Any]],
+    flow_samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     keys = sorted(
         {
@@ -678,6 +797,16 @@ def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) ->
             and run["variant"] == variant
             and run["measurement_kind"] == "measurement"
         ]
+        valid_run_keys = {
+            (
+                run["scenario"],
+                run["variant"],
+                run["repetition"],
+                run["measurement_kind"],
+            )
+            for run in selected_runs
+            if run["ok"]
+        }
         selected_flows = [
             flow
             for flow in flow_samples
@@ -685,6 +814,13 @@ def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) ->
             and flow["variant"] == variant
             and flow["measurement_kind"] == "measurement"
             and flow.get("ok")
+            and (
+                flow["scenario"],
+                flow["variant"],
+                flow["repetition"],
+                flow["measurement_kind"],
+            )
+            in valid_run_keys
         ]
         connect = [flow["connect_ns"] for flow in selected_flows]
         first = [
@@ -703,6 +839,7 @@ def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) ->
                 "valid_runs": sum(run["ok"] for run in selected_runs),
                 "total_runs": len(selected_runs),
                 "valid_flows": len(selected_flows),
+                "valid_flow_count_consistent": len(selected_flows) == successful,
                 "connect_p50_ns": percentile(connect, 0.50) if connect else None,
                 "connect_p95_ns": percentile(connect, 0.95) if connect else None,
                 "connect_p99_ns": percentile(connect, 0.99) if connect else None,
@@ -762,7 +899,19 @@ def command_output(command: list[str]) -> str | None:
         return None
 
 
-def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
+def binary_metadata(path: str | None, commit: str | None, build_command: str | None) -> Any:
+    if path is None:
+        return None
+    binary = Path(path)
+    return {
+        "path": str(binary),
+        "sha256": sha256_file(binary),
+        "commit": commit,
+        "build_command": build_command,
+    }
+
+
+def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "created_unix_ns": time.time_ns(),
@@ -776,9 +925,19 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
         "rlimit_nofile": resource.getrlimit(resource.RLIMIT_NOFILE),
         "perf_available": shutil.which("perf") is not None,
-        "yatht": args.yatht,
-        "addfd_yatht": args.addfd_yatht,
-        "workload": str(args.workload),
+        "yatht": binary_metadata(args.yatht, args.yatht_commit, args.yatht_build_command),
+        "addfd_yatht": binary_metadata(
+            args.addfd_yatht,
+            args.addfd_commit,
+            args.addfd_build_command,
+        ),
+        "workload": {
+            "path": str(args.workload),
+            "sha256": sha256_file(args.workload),
+            "source": str(WORKLOAD_SOURCE),
+            "source_sha256": sha256_file(WORKLOAD_SOURCE),
+        },
+        "dirty_diff_artifact": str(dirty_diff_path),
         "warmups": args.warmups,
         "repetitions": args.repetitions,
         "connections": args.connections,
@@ -788,6 +947,7 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
         "random_seed": args.seed,
+        "estimated_fd_limit": args.estimated_fd_limit,
         "resource_sampling": {
             "interval_ms": 5,
             "direct_target_role": "root process",
@@ -801,11 +961,19 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--yatht", type=executable, default=str(ROOT / "target/release/yatht"))
-    parser.add_argument("--addfd-yatht", type=executable)
-    parser.add_argument("--variants", default="direct,addfd,stable")
+    parser.add_argument("--yatht", default=str(ROOT / "target/release/yatht"))
+    parser.add_argument("--yatht-commit")
+    parser.add_argument("--yatht-build-command", default="cargo build --release")
+    parser.add_argument("--addfd-yatht")
+    parser.add_argument("--addfd-commit")
+    parser.add_argument("--addfd-build-command")
+    parser.add_argument("--variants", type=comma_variants, default="direct,addfd,stable")
     parser.add_argument("--connections", type=int, default=1000)
-    parser.add_argument("--payload-sizes", type=comma_sizes, default=comma_sizes("0,1,1024,16384,65536"))
+    parser.add_argument(
+        "--payload-sizes",
+        type=comma_sizes,
+        default=comma_sizes("0,1,1024,16384,65536"),
+    )
     parser.add_argument("--idle-flows", type=comma_sizes, default=comma_sizes("1000"))
     parser.add_argument("--idle-hold-ms", type=int, default=100)
     parser.add_argument("--stalled-flows", type=int, default=128)
@@ -820,14 +988,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--skip-diagnostics", action="store_true")
     args = parser.parse_args()
-    args.variants = [variant for variant in args.variants.split(",") if variant]
-    unknown = sorted(set(args.variants) - set(VARIANT_ORDER))
-    if unknown:
-        parser.error(f"unknown variants: {', '.join(unknown)}")
-    if "addfd" in args.variants and args.addfd_yatht is None:
-        parser.error("--addfd-yatht is required when the addfd variant is enabled")
+    if isinstance(args.variants, str):
+        args.variants = comma_variants(args.variants)
+    if "stable" in args.variants:
+        try:
+            args.yatht = executable(args.yatht)
+        except argparse.ArgumentTypeError as error:
+            parser.error(str(error))
+        args.yatht_commit = args.yatht_commit or command_output(["git", "rev-parse", "HEAD"])
+    else:
+        args.yatht = None
+        args.yatht_commit = None
+    if "addfd" in args.variants:
+        if (
+            args.addfd_yatht is None
+            or args.addfd_commit is None
+            or args.addfd_build_command is None
+        ):
+            parser.error("addfd requires --addfd-yatht, --addfd-commit, and --addfd-build-command")
+        try:
+            args.addfd_yatht = executable(args.addfd_yatht)
+        except argparse.ArgumentTypeError as error:
+            parser.error(str(error))
+    else:
+        args.addfd_yatht = None
+        args.addfd_commit = None
     if args.connections <= 0 or args.warmups < 0 or args.repetitions <= 0:
         parser.error("connections/repetitions must be positive and warmups nonnegative")
+    if any(flows <= 0 for flows in args.idle_flows):
+        parser.error("idle flow counts must be positive")
+    if args.idle_hold_ms < 0 or args.stalled_hold_ms < 0:
+        parser.error("hold times must be nonnegative")
+    if args.stalled_flows < 0 or (args.stalled_flows > 0 and args.stalled_bytes <= 0):
+        parser.error("stalled flows must be nonnegative and stalled bytes positive")
+    if args.timeout <= 0:
+        parser.error("timeout must be positive")
+    if not args.payload_sizes and not args.idle_flows and args.stalled_flows == 0:
+        parser.error("at least one scenario must be enabled")
+    ensure_fd_limit(args, parser)
     return args
 
 
@@ -839,16 +1037,25 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     metrics_dir = output_dir / "metrics"
     metrics_dir.mkdir()
+    dirty_diff_path = output_dir / "workspace.diff"
+    dirty_diff = command_output(["git", "diff", "--binary", "HEAD"])
+    dirty_diff_path.write_text((dirty_diff or "") + "\n")
     (output_dir / "environment.json").write_text(
-        json.dumps(environment_metadata(args), indent=2, sort_keys=True) + "\n"
+        json.dumps(environment_metadata(args, dirty_diff_path), indent=2, sort_keys=True) + "\n"
     )
+    for name in ("runs.jsonl", "flow_samples.jsonl", "commands.txt"):
+        (output_dir / name).write_text("")
 
     servers = BenchmarkServers(args.timeout + 30)
-    servers.start()
     rng = random.Random(args.seed)
     runs: list[dict[str, Any]] = []
     flow_samples: list[dict[str, Any]] = []
+    execution_error: BaseException | None = None
+    servers_started = False
+    previous_sigterm = signal.signal(signal.SIGTERM, interrupt_benchmark)
     try:
+        servers.start()
+        servers_started = True
         with (
             (output_dir / "runs.jsonl").open("w") as run_file,
             (output_dir / "flow_samples.jsonl").open("w") as flow_file,
@@ -915,8 +1122,18 @@ def main() -> None:
                     run_file.write(json.dumps(run, sort_keys=True) + "\n")
                     for flow in flows:
                         flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
+                    run_file.flush()
+                    flow_file.flush()
+    except BaseException as error:
+        execution_error = error
     finally:
-        servers.stop()
+        if servers_started:
+            try:
+                servers.stop()
+            except BaseException as error:
+                if execution_error is None:
+                    execution_error = error
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
     summary = summarize(runs, flow_samples)
     (output_dir / "summary.json").write_text(
@@ -934,6 +1151,11 @@ def main() -> None:
         if run["measurement_kind"] in {"measurement", "diagnostic"} and not run["ok"]
     ]
     print(f"results: {output_dir}")
+    if execution_error is not None:
+        print(f"benchmark interrupted: {execution_error}", file=sys.stderr)
+        if isinstance(execution_error, KeyboardInterrupt):
+            raise SystemExit(130)
+        raise execution_error
     if failed:
         print(f"failed runs: {len(failed)}", file=sys.stderr)
         raise SystemExit(1)
