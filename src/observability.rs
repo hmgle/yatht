@@ -51,6 +51,7 @@ struct ObservabilityInner {
     tcp_resets: AtomicU64,
     tcp_flow_failures: AtomicU64,
     tcp_flows_completed: AtomicU64,
+    tcp_flows_cancelled: AtomicU64,
     tcp_active_flow_rejections: AtomicU64,
     tcp_fd_headroom_rejections: AtomicU64,
     tcp_pending_byte_rejections: AtomicU64,
@@ -138,6 +139,7 @@ struct RunSummary {
     tcp_resets: u64,
     tcp_flow_failures: u64,
     tcp_flows_completed: u64,
+    tcp_flows_cancelled: u64,
     tcp_active_flow_rejections: u64,
     tcp_fd_headroom_rejections: u64,
     tcp_pending_byte_rejections: u64,
@@ -208,6 +210,7 @@ impl ObservabilityRuntime {
             tcp_resets: AtomicU64::new(0),
             tcp_flow_failures: AtomicU64::new(0),
             tcp_flows_completed: AtomicU64::new(0),
+            tcp_flows_cancelled: AtomicU64::new(0),
             tcp_active_flow_rejections: AtomicU64::new(0),
             tcp_fd_headroom_rejections: AtomicU64::new(0),
             tcp_pending_byte_rejections: AtomicU64::new(0),
@@ -284,6 +287,7 @@ impl ObservabilityRuntime {
             tcp_resets: inner.tcp_resets.load(Ordering::Relaxed),
             tcp_flow_failures: inner.tcp_flow_failures.load(Ordering::Relaxed),
             tcp_flows_completed: inner.tcp_flows_completed.load(Ordering::Relaxed),
+            tcp_flows_cancelled: inner.tcp_flows_cancelled.load(Ordering::Relaxed),
             tcp_active_flow_rejections: inner.tcp_active_flow_rejections.load(Ordering::Relaxed),
             tcp_fd_headroom_rejections: inner.tcp_fd_headroom_rejections.load(Ordering::Relaxed),
             tcp_pending_byte_rejections: inner.tcp_pending_byte_rejections.load(Ordering::Relaxed),
@@ -536,6 +540,12 @@ impl Observability {
         }
     }
 
+    pub fn tcp_flow_cancelled(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_flows_cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn tcp_resource_rejection(&self, reason: &'static str) {
         let Some(inner) = &self.inner else {
             return;
@@ -726,6 +736,7 @@ mod tests {
         );
         setup.set_proxy_cookie(Some(12));
         setup.completed();
+        metrics.tcp_flow_cancelled();
         runtime.finish().unwrap();
 
         let events = fs::read_to_string(path)
@@ -739,6 +750,7 @@ mod tests {
         assert_eq!(events[1]["target_cookie"], 11);
         assert_eq!(events[2]["event"], "run_summary");
         assert_eq!(events[2]["tcp_setup_completed"], 1);
+        assert_eq!(events[2]["tcp_flows_cancelled"], 1);
     }
 
     #[test]

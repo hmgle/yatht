@@ -619,11 +619,7 @@ impl Drop for TcpRelay {
             .observability
             .tcp_pending_removed(pending);
         if self.accepted_by_reactor && !self.outcome_recorded {
-            let cancelled = io::Error::from_raw_os_error(libc::ECANCELED);
-            self.permit
-                .resources
-                .observability
-                .tcp_flow_finished(Some(&cancelled));
+            self.permit.resources.observability.tcp_flow_cancelled();
             self.outcome_recorded = true;
         }
     }
