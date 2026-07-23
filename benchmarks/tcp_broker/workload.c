@@ -1,9 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
 #include <signal.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -241,58 +243,163 @@ static int run_idle(const struct endpoint *endpoint, size_t flows, size_t hold_m
 }
 
 static int run_stalled(const struct endpoint *endpoint, size_t flows,
-                       size_t bytes_per_flow, size_t hold_ms) {
-    int *fds = malloc(flows * sizeof(*fds));
+                       size_t bytes_per_flow, size_t hold_ms,
+                       const char *ready_path) {
+    struct stalled_flow {
+        int fd;
+        int error;
+        int blocked;
+        uint64_t started_ns;
+        uint64_t connect_ns;
+        uint64_t first_eagain_ns;
+        size_t attempted;
+        size_t accepted;
+    };
+    struct stalled_flow *states = calloc(flows, sizeof(*states));
     uint8_t *payload = malloc(65536);
-    if (fds == NULL || payload == NULL) {
+    if (states == NULL || payload == NULL) {
         perror("malloc");
-        free(fds);
+        free(states);
         free(payload);
         return 2;
     }
     memset(payload, 0x5a, 65536);
     for (size_t index = 0; index < flows; ++index) {
-        fds[index] = -1;
+        states[index].fd = -1;
+    }
+
+    for (size_t flow = 0; flow < flows; ++flow) {
+        struct stalled_flow *state = &states[flow];
+        state->started_ns = monotonic_ns();
+        state->fd = connect_endpoint(endpoint, &state->connect_ns);
+        if (state->fd < 0) {
+            state->error = errno;
+            continue;
+        }
+        int send_buffer = 4096;
+        if (setsockopt(state->fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) != 0) {
+            state->error = errno;
+            continue;
+        }
+        int flags = fcntl(state->fd, F_GETFL);
+        if (flags < 0 || fcntl(state->fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            state->error = errno;
+        }
+    }
+
+    size_t settled = 0;
+    while (settled < flows) {
+        settled = 0;
+        for (size_t flow = 0; flow < flows; ++flow) {
+            struct stalled_flow *state = &states[flow];
+            if (state->error != 0 || state->blocked ||
+                state->accepted == bytes_per_flow) {
+                ++settled;
+                continue;
+            }
+            size_t chunk = bytes_per_flow - state->accepted;
+            if (chunk > 65536) {
+                chunk = 65536;
+            }
+            state->attempted += chunk;
+            ssize_t written = send(state->fd, payload, chunk, MSG_NOSIGNAL);
+            if (written > 0) {
+                state->accepted += (size_t)written;
+            } else if (written == 0) {
+                state->error = EIO;
+            } else if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                state->blocked = 1;
+                state->first_eagain_ns = monotonic_ns() - state->started_ns;
+            } else {
+                state->error = errno;
+            }
+        }
+    }
+
+    size_t blocked_flows = 0;
+    for (size_t flow = 0; flow < flows; ++flow) {
+        blocked_flows += states[flow].blocked != 0;
+    }
+    FILE *ready = fopen(ready_path, "w");
+    if (ready == NULL) {
+        perror("fopen stalled ready path");
+        for (size_t flow = 0; flow < flows; ++flow) {
+            if (states[flow].fd >= 0) {
+                close(states[flow].fd);
+            }
+        }
+        free(states);
+        free(payload);
+        return 2;
+    }
+    fprintf(ready, "%zu\n", blocked_flows);
+    if (fclose(ready) != 0) {
+        perror("close stalled ready path");
+        free(states);
+        free(payload);
+        return 2;
     }
 
     size_t successful = 0;
     uint64_t total_bytes = 0;
     for (size_t flow = 0; flow < flows; ++flow) {
-        uint64_t connect_ns = 0;
-        fds[flow] = connect_endpoint(endpoint, &connect_ns);
-        int error = fds[flow] < 0 ? errno : 0;
-        size_t sent = 0;
-        while (error == 0 && sent < bytes_per_flow) {
-            size_t chunk = (bytes_per_flow - sent) < 65536 ?
-                           (bytes_per_flow - sent) : 65536;
-            if (write_all(fds[flow], payload, chunk) != 0) {
-                error = errno;
-                break;
+        struct stalled_flow *state = &states[flow];
+        if (state->fd >= 0 && state->error == 0) {
+            int flags = fcntl(state->fd, F_GETFL);
+            if (flags < 0 || fcntl(state->fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+                state->error = errno;
             }
-            sent += chunk;
         }
-        if (error == 0) {
+        while (state->error == 0 && state->accepted < bytes_per_flow) {
+            size_t chunk = bytes_per_flow - state->accepted;
+            if (chunk > 65536) {
+                chunk = 65536;
+            }
+            state->attempted += chunk;
+            ssize_t written = send(state->fd, payload, chunk, MSG_NOSIGNAL);
+            if (written > 0) {
+                state->accepted += (size_t)written;
+            } else if (written < 0 && errno == EINTR) {
+                continue;
+            } else {
+                state->error = written == 0 ? EIO : errno;
+            }
+        }
+        if (state->error == 0 && shutdown(state->fd, SHUT_WR) != 0) {
+            state->error = errno;
+        }
+        uint8_t drain[1];
+        while (state->error == 0) {
+            ssize_t count = recv(state->fd, drain, sizeof(drain), 0);
+            if (count > 0) {
+                state->error = EPROTO;
+            } else if (count == 0) {
+                break;
+            } else if (errno != EINTR) {
+                state->error = errno;
+            }
+        }
+        if (state->fd >= 0) {
+            close(state->fd);
+        }
+        int ok = state->error == 0 && state->blocked &&
+                 state->accepted == bytes_per_flow;
+        if (ok) {
             ++successful;
-            total_bytes += sent;
+            total_bytes += state->accepted;
         }
         printf("{\"event\":\"flow\",\"flow\":%zu,\"ok\":%s,"
                "\"errno\":%d,\"connect_ns\":%" PRIu64
-               ",\"bytes\":%zu}\n",
-               flow, error == 0 ? "true" : "false", error, connect_ns, sent);
+               ",\"attempted_bytes\":%zu,\"accepted_bytes\":%zu,"
+               "\"blocked\":%s,\"first_eagain_ns\":%" PRIu64 "}\n",
+               flow, ok ? "true" : "false", state->error,
+               state->connect_ns, state->attempted, state->accepted,
+               state->blocked ? "true" : "false", state->first_eagain_ns);
     }
-
-    struct timespec hold = {
-        .tv_sec = (time_t)(hold_ms / 1000),
-        .tv_nsec = (long)((hold_ms % 1000) * 1000000),
-    };
-    while (nanosleep(&hold, &hold) != 0 && errno == EINTR) {
-    }
-    for (size_t flow = 0; flow < flows; ++flow) {
-        if (fds[flow] >= 0) {
-            close(fds[flow]);
-        }
-    }
-    free(fds);
+    free(states);
     free(payload);
 
     struct rusage usage;
@@ -302,19 +409,20 @@ static int run_stalled(const struct endpoint *endpoint, size_t flows,
     }
     printf("{\"event\":\"workload_summary\",\"mode\":\"stalled\","
            "\"flows\":%zu,\"successful\":%zu,\"bytes\":%" PRIu64
+           ",\"blocked_flows\":%zu,\"hold_ms\":%zu,\"released\":true"
            ",\"user_cpu_ns\":%" PRIu64 ",\"system_cpu_ns\":%" PRIu64 "}\n",
-           flows, successful, total_bytes, timeval_ns(usage.ru_utime),
-           timeval_ns(usage.ru_stime));
+           flows, successful, total_bytes, blocked_flows, hold_ms,
+           timeval_ns(usage.ru_utime), timeval_ns(usage.ru_stime));
     return successful == flows ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
-    if (argc != 6 && argc != 7) {
+    if (argc != 6 && argc != 8) {
         fprintf(stderr,
                 "usage: %s request HOST PORT FLOWS PAYLOAD_BYTES\n"
                 "       %s idle HOST PORT FLOWS HOLD_MS\n"
-                "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS\n",
+                "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS READY_PATH\n",
                 argv[0], argv[0], argv[0]);
         return 2;
     }
@@ -327,9 +435,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "idle") == 0 && argc == 6) {
         return run_idle(&endpoint, flows, value);
     }
-    if (strcmp(argv[1], "stalled") == 0 && argc == 7) {
+    if (strcmp(argv[1], "stalled") == 0 && argc == 8) {
         return run_stalled(&endpoint, flows, value,
-                           parse_size(argv[6], "hold milliseconds"));
+                           parse_size(argv[6], "hold milliseconds"), argv[7]);
     }
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;

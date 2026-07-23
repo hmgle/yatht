@@ -38,7 +38,7 @@ VARIANT_ORDER = ("direct", "addfd", "stable")
 
 
 class BenchmarkServers:
-    def __init__(self) -> None:
+    def __init__(self, safety_timeout: float) -> None:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: asyncio.Event | None = None
         self.destination_port = 0
@@ -47,6 +47,8 @@ class BenchmarkServers:
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._thread_main, name="benchmark-servers")
         self.error: BaseException | None = None
+        self.stalled_release: asyncio.Event | None = None
+        self.safety_timeout = safety_timeout
 
     def start(self) -> None:
         self.thread.start()
@@ -69,6 +71,19 @@ class BenchmarkServers:
             return 0
         future = asyncio.run_coroutine_threadsafe(self._thread_cpu_ns(), self.loop)
         return int(future.result(timeout=5))
+
+    def prepare_stalled_run(self) -> None:
+        if self.loop is None:
+            raise RuntimeError("benchmark servers are not running")
+        future = asyncio.run_coroutine_threadsafe(self._prepare_stalled_run(), self.loop)
+        future.result(timeout=5)
+
+    async def _prepare_stalled_run(self) -> None:
+        self.stalled_release = asyncio.Event()
+
+    def release_stalled_run(self) -> None:
+        if self.loop is not None and self.stalled_release is not None:
+            self.loop.call_soon_threadsafe(self.stalled_release.set)
 
     async def _thread_cpu_ns(self) -> int:
         return time.thread_time_ns()
@@ -160,9 +175,6 @@ class BenchmarkServers:
                 return
             port = int.from_bytes(await reader.readexactly(2), "big")
             upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
-            if port == self.stalled_port:
-                upstream_socket = upstream_writer.get_extra_info("socket")
-                upstream_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
             writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
             await writer.drain()
             await asyncio.gather(
@@ -182,13 +194,18 @@ class BenchmarkServers:
 
     async def _handle_stalled_destination(
         self,
-        _reader: asyncio.StreamReader,
+        reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        destination_socket = writer.get_extra_info("socket")
-        destination_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         try:
-            await asyncio.sleep(1)
+            release = self.stalled_release
+            if release is None:
+                raise RuntimeError("stalled run was not prepared")
+            await asyncio.wait_for(release.wait(), timeout=self.safety_timeout)
+            while await reader.read(65536):
+                pass
+        except (ConnectionError, asyncio.TimeoutError, asyncio.CancelledError):
+            pass
         finally:
             writer.close()
             with suppress(ConnectionError, OSError):
@@ -295,6 +312,7 @@ def variant_command(
     servers: BenchmarkServers,
     scenario: dict[str, Any],
     metrics_path: Path | None = None,
+    stalled_ready_path: Path | None = None,
 ) -> list[str]:
     destination_port = (
         servers.stalled_port if scenario["mode"] == "stalled" else servers.destination_port
@@ -309,6 +327,9 @@ def variant_command(
     ]
     if scenario["mode"] == "stalled":
         workload.append(str(scenario["hold_ms"]))
+        if stalled_ready_path is None:
+            raise ValueError("stalled workload requires a ready path")
+        workload.append(str(stalled_ready_path))
     if variant == "direct":
         return workload
     yatht = args.yatht if variant == "stable" else args.addfd_yatht
@@ -334,45 +355,69 @@ def run_one(
     measurement_kind: str,
     metrics_path: Path | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    command = variant_command(variant, args, servers, scenario, metrics_path)
-    args.command_log.write(shlex.join(command) + "\n")
-    args.command_log.flush()
-    child_before = child_cpu_ns()
-    proxy_before = servers.cpu_ns()
-    system_before = system_cpu_ticks()
-    started = time.perf_counter_ns()
-    timed_out = False
-    peak_rss_kib = 0
-    peak_fds = 0
-    with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(
-        mode="w+"
-    ) as stderr_file:
-        process = subprocess.Popen(
-            command,
-            text=True,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            start_new_session=True,
+    with tempfile.TemporaryDirectory(prefix="yatht-benchmark-control-") as control_dir:
+        stalled_ready_path = Path(control_dir) / "stalled-ready"
+        if scenario["mode"] == "stalled":
+            servers.prepare_stalled_run()
+        command = variant_command(
+            variant,
+            args,
+            servers,
+            scenario,
+            metrics_path,
+            stalled_ready_path if scenario["mode"] == "stalled" else None,
         )
-        deadline = time.monotonic() + args.timeout
-        while process.poll() is None:
-            rss_kib, fd_count = process_resources(process.pid)
-            peak_rss_kib = max(peak_rss_kib, rss_kib)
-            peak_fds = max(peak_fds, fd_count)
-            if time.monotonic() >= deadline:
-                timed_out = True
-                os.killpg(process.pid, signal.SIGKILL)
-                break
-            time.sleep(0.005)
-        returncode = process.wait()
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        completed = subprocess.CompletedProcess(
-            command,
-            124 if timed_out else returncode,
-            stdout_file.read(),
-            stderr_file.read(),
-        )
+        args.command_log.write(shlex.join(command) + "\n")
+        args.command_log.flush()
+        child_before = child_cpu_ns()
+        proxy_before = servers.cpu_ns()
+        system_before = system_cpu_ticks()
+        started = time.perf_counter_ns()
+        timed_out = False
+        stalled_ready = False
+        stalled_released = False
+        release_at: float | None = None
+        peak_rss_kib = 0
+        peak_fds = 0
+        with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(
+            mode="w+"
+        ) as stderr_file:
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + args.timeout
+            while process.poll() is None:
+                rss_kib, fd_count = process_resources(process.pid)
+                peak_rss_kib = max(peak_rss_kib, rss_kib)
+                peak_fds = max(peak_fds, fd_count)
+                now = time.monotonic()
+                if scenario["mode"] == "stalled" and not stalled_ready:
+                    if stalled_ready_path.exists():
+                        stalled_ready = True
+                        release_at = now + scenario["hold_ms"] / 1000
+                if release_at is not None and now >= release_at and not stalled_released:
+                    servers.release_stalled_run()
+                    stalled_released = True
+                if now >= deadline:
+                    timed_out = True
+                    os.killpg(process.pid, signal.SIGKILL)
+                    break
+                time.sleep(0.005)
+            if scenario["mode"] == "stalled" and not stalled_released:
+                servers.release_stalled_run()
+            returncode = process.wait()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            completed = subprocess.CompletedProcess(
+                command,
+                124 if timed_out else returncode,
+                stdout_file.read(),
+                stderr_file.read(),
+            )
     wall_ns = time.perf_counter_ns() - started
     system_after = system_cpu_ticks()
     proxy_cpu_ns = servers.cpu_ns() - proxy_before
@@ -402,6 +447,14 @@ def run_one(
         and parse_error is None
         and len(successful) == scenario["flows"]
     )
+    if scenario["mode"] == "stalled":
+        ok = (
+            ok
+            and stalled_ready
+            and stalled_released
+            and workload_summary.get("blocked_flows") == scenario["flows"]
+            and workload_summary.get("released") is True
+        )
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
     if metrics_path is not None:
@@ -411,6 +464,16 @@ def run_one(
             ok = ok and metric_summary.get("tcp_active_flows") == 0
             ok = ok and metric_summary.get("tcp_pending_bytes") == 0
             ok = ok and metric_summary.get("tcp_reserved_pending_bytes") == 0
+            ok = ok and metric_summary.get("tcp_buffer_capacity_bytes") == 0
+            outcomes = sum(
+                metric_summary.get(field, 0)
+                for field in (
+                    "tcp_flows_completed",
+                    "tcp_flow_failures",
+                    "tcp_flows_cancelled",
+                )
+            )
+            ok = ok and outcomes == metric_summary.get("tcp_flows_started")
     run = {
         "scenario": scenario["name"],
         "mode": scenario["mode"],
@@ -420,6 +483,18 @@ def run_one(
         "ok": ok,
         "returncode": completed.returncode,
         "timed_out": timed_out,
+        "stalled_ready": stalled_ready if scenario["mode"] == "stalled" else None,
+        "stalled_released": stalled_released if scenario["mode"] == "stalled" else None,
+        "application_backpressure_confirmed": (
+            stalled_ready and workload_summary.get("blocked_flows") == scenario["flows"]
+            if scenario["mode"] == "stalled"
+            else None
+        ),
+        "broker_pending_peak_bytes": (
+            metric_summary.get("tcp_peak_pending_bytes")
+            if scenario["mode"] == "stalled" and metric_summary is not None
+            else None
+        ),
         "expected_flows": scenario["flows"],
         "successful_flows": len(successful),
         "wall_ns": wall_ns,
@@ -644,7 +719,7 @@ def main() -> None:
         json.dumps(environment_metadata(args), indent=2, sort_keys=True) + "\n"
     )
 
-    servers = BenchmarkServers()
+    servers = BenchmarkServers(args.timeout + 30)
     servers.start()
     rng = random.Random(args.seed)
     runs: list[dict[str, Any]] = []
