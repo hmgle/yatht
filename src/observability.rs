@@ -30,12 +30,35 @@ struct ObservabilityInner {
     setup_completed: AtomicU64,
     setup_failed: AtomicU64,
     setup_cancelled: AtomicU64,
+    notification_queue_depth: AtomicU64,
+    notification_queue_peak: AtomicU64,
+    notification_queue_full: AtomicU64,
+    tcp_active_flows: AtomicU64,
+    tcp_peak_flows: AtomicU64,
+    tcp_registration_queue_depth: AtomicU64,
+    tcp_registration_queue_peak: AtomicU64,
+    tcp_registration_queue_full: AtomicU64,
+    tcp_pending_bytes: AtomicU64,
+    tcp_peak_pending_bytes: AtomicU64,
+    tcp_target_to_upstream_bytes: AtomicU64,
+    tcp_upstream_to_target_bytes: AtomicU64,
+    tcp_recv_syscalls: AtomicU64,
+    tcp_send_syscalls: AtomicU64,
+    tcp_reactor_wakeups: AtomicU64,
+    tcp_half_closes: AtomicU64,
+    tcp_resets: AtomicU64,
+    tcp_flow_failures: AtomicU64,
+    tcp_flows_completed: AtomicU64,
+    tcp_active_flow_rejections: AtomicU64,
+    tcp_fd_headroom_rejections: AtomicU64,
+    tcp_pending_byte_rejections: AtomicU64,
+    tcp_reactor_stopped_rejections: AtomicU64,
     started: Instant,
 }
 
 enum WriterCommand {
     Event(MetricEvent),
-    Finish(RunSummary),
+    Finish(Box<RunSummary>),
 }
 
 #[derive(Serialize)]
@@ -47,6 +70,15 @@ enum MetricEvent {
         package_version: &'static str,
         started_unix_ns: u64,
         metric_queue_capacity: usize,
+    },
+    TcpBrokerLimits {
+        schema_version: u32,
+        max_active_flows: usize,
+        max_pending_bytes: usize,
+        registration_queue_capacity: usize,
+        rlimit_nofile: u64,
+        baseline_fds: usize,
+        reserved_fds: usize,
     },
     TcpSetup(Box<TcpSetupEvent>),
 }
@@ -83,6 +115,30 @@ struct RunSummary {
     tcp_setup_completed: u64,
     tcp_setup_failed: u64,
     tcp_setup_cancelled: u64,
+    notification_queue_depth: u64,
+    notification_queue_peak: u64,
+    notification_queue_full: u64,
+    tcp_active_flows: u64,
+    tcp_peak_flows: u64,
+    tcp_registration_queue_depth: u64,
+    tcp_registration_queue_peak: u64,
+    tcp_registration_queue_full: u64,
+    tcp_pending_bytes: u64,
+    tcp_peak_pending_bytes: u64,
+    tcp_target_to_upstream_bytes: u64,
+    tcp_upstream_to_target_bytes: u64,
+    tcp_recv_syscalls: u64,
+    tcp_send_syscalls: u64,
+    tcp_reactor_wakeups: u64,
+    tcp_half_closes: u64,
+    tcp_resets: u64,
+    tcp_flow_failures: u64,
+    tcp_flows_completed: u64,
+    tcp_active_flow_rejections: u64,
+    tcp_fd_headroom_rejections: u64,
+    tcp_pending_byte_rejections: u64,
+    tcp_reactor_stopped_rejections: u64,
+    tcp_cpu_ns_per_byte: Option<f64>,
     dropped_metric_events: u64,
 }
 
@@ -127,6 +183,29 @@ impl ObservabilityRuntime {
             setup_completed: AtomicU64::new(0),
             setup_failed: AtomicU64::new(0),
             setup_cancelled: AtomicU64::new(0),
+            notification_queue_depth: AtomicU64::new(0),
+            notification_queue_peak: AtomicU64::new(0),
+            notification_queue_full: AtomicU64::new(0),
+            tcp_active_flows: AtomicU64::new(0),
+            tcp_peak_flows: AtomicU64::new(0),
+            tcp_registration_queue_depth: AtomicU64::new(0),
+            tcp_registration_queue_peak: AtomicU64::new(0),
+            tcp_registration_queue_full: AtomicU64::new(0),
+            tcp_pending_bytes: AtomicU64::new(0),
+            tcp_peak_pending_bytes: AtomicU64::new(0),
+            tcp_target_to_upstream_bytes: AtomicU64::new(0),
+            tcp_upstream_to_target_bytes: AtomicU64::new(0),
+            tcp_recv_syscalls: AtomicU64::new(0),
+            tcp_send_syscalls: AtomicU64::new(0),
+            tcp_reactor_wakeups: AtomicU64::new(0),
+            tcp_half_closes: AtomicU64::new(0),
+            tcp_resets: AtomicU64::new(0),
+            tcp_flow_failures: AtomicU64::new(0),
+            tcp_flows_completed: AtomicU64::new(0),
+            tcp_active_flow_rejections: AtomicU64::new(0),
+            tcp_fd_headroom_rejections: AtomicU64::new(0),
+            tcp_pending_byte_rejections: AtomicU64::new(0),
+            tcp_reactor_stopped_rejections: AtomicU64::new(0),
             started: Instant::now(),
         });
         let start = MetricEvent::RunStart {
@@ -156,6 +235,11 @@ impl ObservabilityRuntime {
             return Ok(());
         };
         let (user_cpu_ns, system_cpu_ns) = process_cpu_time();
+        let total_bytes = inner
+            .tcp_target_to_upstream_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(inner.tcp_upstream_to_target_bytes.load(Ordering::Relaxed));
+        let total_cpu_ns = user_cpu_ns.saturating_add(system_cpu_ns);
         let summary = RunSummary {
             event: "run_summary",
             schema_version: SCHEMA_VERSION,
@@ -165,11 +249,44 @@ impl ObservabilityRuntime {
             tcp_setup_completed: inner.setup_completed.load(Ordering::Relaxed),
             tcp_setup_failed: inner.setup_failed.load(Ordering::Relaxed),
             tcp_setup_cancelled: inner.setup_cancelled.load(Ordering::Relaxed),
+            notification_queue_depth: inner.notification_queue_depth.load(Ordering::Relaxed),
+            notification_queue_peak: inner.notification_queue_peak.load(Ordering::Relaxed),
+            notification_queue_full: inner.notification_queue_full.load(Ordering::Relaxed),
+            tcp_active_flows: inner.tcp_active_flows.load(Ordering::Relaxed),
+            tcp_peak_flows: inner.tcp_peak_flows.load(Ordering::Relaxed),
+            tcp_registration_queue_depth: inner
+                .tcp_registration_queue_depth
+                .load(Ordering::Relaxed),
+            tcp_registration_queue_peak: inner.tcp_registration_queue_peak.load(Ordering::Relaxed),
+            tcp_registration_queue_full: inner.tcp_registration_queue_full.load(Ordering::Relaxed),
+            tcp_pending_bytes: inner.tcp_pending_bytes.load(Ordering::Relaxed),
+            tcp_peak_pending_bytes: inner.tcp_peak_pending_bytes.load(Ordering::Relaxed),
+            tcp_target_to_upstream_bytes: inner
+                .tcp_target_to_upstream_bytes
+                .load(Ordering::Relaxed),
+            tcp_upstream_to_target_bytes: inner
+                .tcp_upstream_to_target_bytes
+                .load(Ordering::Relaxed),
+            tcp_recv_syscalls: inner.tcp_recv_syscalls.load(Ordering::Relaxed),
+            tcp_send_syscalls: inner.tcp_send_syscalls.load(Ordering::Relaxed),
+            tcp_reactor_wakeups: inner.tcp_reactor_wakeups.load(Ordering::Relaxed),
+            tcp_half_closes: inner.tcp_half_closes.load(Ordering::Relaxed),
+            tcp_resets: inner.tcp_resets.load(Ordering::Relaxed),
+            tcp_flow_failures: inner.tcp_flow_failures.load(Ordering::Relaxed),
+            tcp_flows_completed: inner.tcp_flows_completed.load(Ordering::Relaxed),
+            tcp_active_flow_rejections: inner.tcp_active_flow_rejections.load(Ordering::Relaxed),
+            tcp_fd_headroom_rejections: inner.tcp_fd_headroom_rejections.load(Ordering::Relaxed),
+            tcp_pending_byte_rejections: inner.tcp_pending_byte_rejections.load(Ordering::Relaxed),
+            tcp_reactor_stopped_rejections: inner
+                .tcp_reactor_stopped_rejections
+                .load(Ordering::Relaxed),
+            tcp_cpu_ns_per_byte: (total_bytes != 0)
+                .then_some(total_cpu_ns as f64 / total_bytes as f64),
             dropped_metric_events: inner.dropped_events.load(Ordering::Relaxed),
         };
         inner
             .tx
-            .send(WriterCommand::Finish(summary))
+            .send(WriterCommand::Finish(Box::new(summary)))
             .map_err(|_| anyhow!("metrics writer stopped before final summary"))?;
         let writer = self.writer.take().expect("enabled metrics writer missing");
         writer
@@ -180,6 +297,66 @@ impl ObservabilityRuntime {
 }
 
 impl Observability {
+    pub fn notification_queued(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner
+            .notification_queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        update_peak(&inner.notification_queue_peak, current);
+    }
+
+    pub fn notification_dequeued(&self) {
+        if let Some(inner) = &self.inner {
+            let previous = inner
+                .notification_queue_depth
+                .fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0);
+        }
+    }
+
+    pub fn notification_queue_full(&self) {
+        if let Some(inner) = &self.inner {
+            inner
+                .notification_queue_full
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn wait_for_tcp_idle(&self, timeout: Duration) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let deadline = Instant::now() + timeout;
+        while inner.tcp_active_flows.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tcp_broker_limits(
+        &self,
+        max_active_flows: usize,
+        max_pending_bytes: usize,
+        registration_queue_capacity: usize,
+        rlimit_nofile: u64,
+        baseline_fds: usize,
+        reserved_fds: usize,
+    ) {
+        let event = MetricEvent::TcpBrokerLimits {
+            schema_version: SCHEMA_VERSION,
+            max_active_flows,
+            max_pending_bytes,
+            registration_queue_capacity,
+            rlimit_nofile,
+            baseline_fds,
+            reserved_fds,
+        };
+        self.try_record(event);
+    }
+
     pub fn begin_tcp_setup(
         &self,
         target_pid: u32,
@@ -221,11 +398,133 @@ impl Observability {
             _ => &inner.setup_cancelled,
         }
         .fetch_add(1, Ordering::Relaxed);
-        if inner
-            .tx
-            .try_send(WriterCommand::Event(MetricEvent::TcpSetup(Box::new(event))))
-            .is_err()
-        {
+        self.try_record(MetricEvent::TcpSetup(Box::new(event)));
+    }
+
+    pub fn tcp_flow_acquired(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner.tcp_active_flows.fetch_add(1, Ordering::Relaxed) + 1;
+        update_peak(&inner.tcp_peak_flows, current);
+    }
+
+    pub fn tcp_flow_released(&self) {
+        if let Some(inner) = &self.inner {
+            let previous = inner.tcp_active_flows.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0);
+        }
+    }
+
+    pub fn tcp_registration_queued(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner
+            .tcp_registration_queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        update_peak(&inner.tcp_registration_queue_peak, current);
+    }
+
+    pub fn tcp_registration_dequeued(&self) {
+        if let Some(inner) = &self.inner {
+            let previous = inner
+                .tcp_registration_queue_depth
+                .fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0);
+        }
+    }
+
+    pub fn tcp_pending_reserved(&self, reserved: usize) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner
+            .tcp_pending_bytes
+            .fetch_add(reserved as u64, Ordering::Relaxed)
+            .saturating_add(reserved as u64);
+        update_peak(&inner.tcp_peak_pending_bytes, current);
+    }
+
+    pub fn tcp_pending_released(&self, released: usize) {
+        if let Some(inner) = &self.inner {
+            let previous = inner
+                .tcp_pending_bytes
+                .fetch_sub(released as u64, Ordering::Relaxed);
+            debug_assert!(previous >= released as u64);
+        }
+    }
+
+    pub fn tcp_recv(&self, bytes: usize, target_to_upstream: bool) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.tcp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
+        if bytes != 0 {
+            let counter = if target_to_upstream {
+                &inner.tcp_target_to_upstream_bytes
+            } else {
+                &inner.tcp_upstream_to_target_bytes
+            };
+            counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_send(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_send_syscalls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_reactor_wakeup(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_reactor_wakeups.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_half_close(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_half_closes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_flow_finished(&self, error: Option<&io::Error>) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        match error {
+            None => {
+                inner.tcp_flows_completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(error) => {
+                inner.tcp_flow_failures.fetch_add(1, Ordering::Relaxed);
+                if error.raw_os_error() == Some(libc::ECONNRESET) {
+                    inner.tcp_resets.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn tcp_resource_rejection(&self, reason: &'static str) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let counter = match reason {
+            "active_flow" => &inner.tcp_active_flow_rejections,
+            "fd_headroom" => &inner.tcp_fd_headroom_rejections,
+            "pending_bytes" => &inner.tcp_pending_byte_rejections,
+            "registration_queue" => &inner.tcp_registration_queue_full,
+            _ => &inner.tcp_reactor_stopped_rejections,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn try_record(&self, event: MetricEvent) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if inner.tx.try_send(WriterCommand::Event(event)).is_err() {
             inner.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -346,6 +645,12 @@ fn unix_time_ns() -> u64 {
 
 fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn update_peak(peak: &AtomicU64, value: u64) {
+    let _ = peak.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        (value > current).then_some(value)
+    });
 }
 
 fn process_cpu_time() -> (u64, u64) {

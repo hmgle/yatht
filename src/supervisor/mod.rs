@@ -54,6 +54,7 @@ struct BlockingRecvQueue {
 struct QueuedNotification {
     notif: SeccompNotif,
     received_at: Instant,
+    observability: Observability,
 }
 
 struct PendingBlockingRecv {
@@ -132,7 +133,8 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
 
     let observability_runtime = ObservabilityRuntime::start(cfg.metrics_file.as_deref())?;
     let observability = observability_runtime.observability();
-    let result = run_with_observability(cfg, observability);
+    let result = run_with_observability(cfg, observability.clone());
+    observability.wait_for_tcp_idle(Duration::from_secs(1));
     let finish_result = observability_runtime.finish();
     match (result, finish_result) {
         (Ok(code), Ok(())) => Ok(code),
@@ -211,7 +213,9 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         shutting_down: AtomicBool::new(false),
         tx: failure_tx,
     });
-    let (tcp_broker, tcp_broker_reactor) = TcpBroker::new().context("create TCP broker")?;
+    let worker_count = notification_worker_count();
+    let (tcp_broker, tcp_broker_reactor) =
+        TcpBroker::new(observability.clone(), worker_count).context("create TCP broker")?;
     let reactor_failure = Arc::clone(&failure);
     let panic_failure = Arc::clone(&failure);
     thread::spawn(
@@ -245,6 +249,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
                 tcp_broker,
                 loop_state,
                 loop_observability,
+                worker_count,
             )
         })
         .is_err()
@@ -424,8 +429,8 @@ fn notification_loop(
     tcp_broker: TcpBroker,
     failure: Arc<NotificationFailure>,
     observability: Observability,
+    worker_count: usize,
 ) {
-    let worker_count = notification_worker_count();
     let (tx, rx) = channel::bounded::<QueuedNotification>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
@@ -525,6 +530,7 @@ fn notification_loop(
                 let queued = QueuedNotification {
                     notif,
                     received_at: Instant::now(),
+                    observability: observability.clone(),
                 };
                 if !try_queue_notification(&tx, listener_raw_fd, queued, cfg.debug, "notification")
                 {
@@ -569,12 +575,15 @@ fn try_queue_notification(
     debug: bool,
     queue_name: &str,
 ) -> bool {
+    queued.observability.notification_queued();
     match tx.try_send(queued) {
         Ok(()) => true,
         Err(channel::TrySendError::Full(queued)) => {
+            queued.observability.notification_queue_full();
             if should_block_when_queue_full(&queued.notif) {
                 return queue_notification_blocking(tx, listener_fd, queued, debug, queue_name);
             }
+            queued.observability.notification_dequeued();
             if debug {
                 eprintln!("yatht: {queue_name} queue full");
             }
@@ -582,6 +591,7 @@ fn try_queue_notification(
             true
         }
         Err(channel::TrySendError::Disconnected(queued)) => {
+            queued.observability.notification_dequeued();
             if debug {
                 eprintln!("yatht: {queue_name} workers stopped");
             }
@@ -612,6 +622,7 @@ fn queue_notification_blocking(
     match tx.send(queued) {
         Ok(()) => true,
         Err(channel::SendError(queued)) => {
+            queued.observability.notification_dequeued();
             if debug {
                 eprintln!("yatht: {queue_name} workers stopped");
             }
@@ -703,6 +714,7 @@ fn notification_worker(
         let Ok(queued) = queued else {
             return;
         };
+        queued.observability.notification_dequeued();
         let queue_wait = queued.received_at.elapsed();
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle_notification(
@@ -1260,6 +1272,18 @@ fn handle_connect(
         queue_wait,
     );
 
+    let flow_permit = match tcp_broker.reserve_flow() {
+        Ok(permit) => permit,
+        Err(err) => {
+            if cfg.debug {
+                eprintln!("yatht: TCP broker admission rejected flow: {err}");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            setup.failed("resource_admission", err);
+            return;
+        }
+    };
+
     let target = match duplicate_remote_fd(notif.pid, target_fd) {
         Ok(target)
             if socket_type_from_fd(target.as_raw_fd()) == Some(libc::SOCK_STREAM)
@@ -1341,7 +1365,7 @@ fn handle_connect(
         return;
     }
     let register_started = Instant::now();
-    if let Err(err) = tcp_broker.register(broker_target, stream) {
+    if let Err(err) = tcp_broker.register(broker_target, stream, flow_permit) {
         setup.set_broker_register(register_started.elapsed());
         disconnect_tcp_socket(target.as_raw_fd());
         if cfg.debug {

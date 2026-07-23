@@ -82,6 +82,12 @@ fn redirects_local_tcp_connect_through_socks5() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
+    let limits = events
+        .iter()
+        .find(|event| event["event"] == "tcp_broker_limits")
+        .expect("missing TCP broker limit metric");
+    assert!(limits["max_active_flows"].as_u64().unwrap() > 0);
+    assert_eq!(limits["max_pending_bytes"], 256 * 1024 * 1024_u64);
     let setup = events
         .iter()
         .find(|event| event["event"] == "tcp_setup")
@@ -92,6 +98,12 @@ fn redirects_local_tcp_connect_through_socks5() {
     let summary = events.last().unwrap();
     assert_eq!(summary["event"], "run_summary");
     assert_eq!(summary["tcp_setup_completed"], 1);
+    assert_eq!(summary["tcp_active_flows"], 0);
+    assert_eq!(summary["tcp_pending_bytes"], 0);
+    assert_eq!(summary["notification_queue_depth"], 0);
+    assert_eq!(summary["tcp_registration_queue_depth"], 0);
+    assert!(summary["tcp_recv_syscalls"].as_u64().unwrap() > 0);
+    assert!(summary["tcp_send_syscalls"].as_u64().unwrap() > 0);
     assert_eq!(summary["dropped_metric_events"], 0);
 }
 
