@@ -79,6 +79,11 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(benchmark.argparse.ArgumentTypeError):
             benchmark.comma_variants("direct,direct")
 
+    def test_git_commit_parser_normalizes_and_rejects_revisions(self) -> None:
+        self.assertEqual(len(benchmark.git_commit("HEAD")), 40)
+        with self.assertRaises(benchmark.argparse.ArgumentTypeError):
+            benchmark.git_commit("definitely-not-a-commit")
+
     def test_missing_process_resources_are_null(self) -> None:
         self.assertIsNone(benchmark.process_resources(2**31 - 1))
 

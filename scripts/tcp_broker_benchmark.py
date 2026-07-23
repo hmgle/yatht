@@ -290,6 +290,13 @@ def executable(value: str) -> str:
     raise argparse.ArgumentTypeError(f"executable not found: {value}")
 
 
+def git_commit(value: str) -> str:
+    resolved = command_output(["git", "rev-parse", "--verify", f"{value}^{{commit}}"])
+    if resolved is None:
+        raise argparse.ArgumentTypeError(f"git commit not found: {value}")
+    return resolved
+
+
 def comma_sizes(raw: str) -> list[int]:
     if not raw:
         return []
@@ -1010,10 +1017,10 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--yatht", default=str(ROOT / "target/release/yatht"))
-    parser.add_argument("--yatht-commit")
+    parser.add_argument("--yatht-commit", type=git_commit)
     parser.add_argument("--yatht-build-command", default="cargo build --release")
     parser.add_argument("--addfd-yatht")
-    parser.add_argument("--addfd-commit")
+    parser.add_argument("--addfd-commit", type=git_commit)
     parser.add_argument("--addfd-build-command")
     parser.add_argument("--variants", type=comma_variants, default="direct,addfd,stable")
     parser.add_argument("--connections", type=int, default=1000)
@@ -1043,7 +1050,7 @@ def parse_args() -> argparse.Namespace:
             args.yatht = executable(args.yatht)
         except argparse.ArgumentTypeError as error:
             parser.error(str(error))
-        args.yatht_commit = args.yatht_commit or command_output(["git", "rev-parse", "HEAD"])
+        args.yatht_commit = args.yatht_commit or git_commit("HEAD")
     else:
         args.yatht = None
         args.yatht_commit = None
