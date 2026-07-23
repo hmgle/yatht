@@ -1122,7 +1122,7 @@ def main() -> None:
                     order = list(args.variants)
                     rng.shuffle(order)
                     for variant in order:
-                        warmup_run, _ = run_one(
+                        warmup_run, warmup_flows = run_one(
                             variant,
                             args,
                             servers,
@@ -1131,10 +1131,30 @@ def main() -> None:
                             "warmup",
                             None,
                         )
+                        runs.append(warmup_run)
+                        flow_samples.extend(warmup_flows)
+                        run_file.write(json.dumps(warmup_run, sort_keys=True) + "\n")
+                        for flow in warmup_flows:
+                            flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
+                        run_file.flush()
+                        flow_file.flush()
                         if not warmup_run["ok"]:
+                            failure = {
+                                key: warmup_run[key]
+                                for key in (
+                                    "returncode",
+                                    "timed_out",
+                                    "stalled_ready",
+                                    "stalled_released",
+                                    "application_backpressure_confirmed",
+                                    "successful_flows",
+                                    "parse_error",
+                                    "stderr",
+                                )
+                            }
                             raise RuntimeError(
                                 f"warmup failed for {scenario['name']}/{variant}: "
-                                f"{warmup_run['stderr']}"
+                                f"{json.dumps(failure, sort_keys=True)}"
                             )
                 for repetition in range(args.repetitions):
                     order = list(args.variants)
