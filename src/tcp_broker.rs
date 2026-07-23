@@ -1201,6 +1201,33 @@ mod tests {
     }
 
     #[test]
+    fn saturated_pending_budget_defers_half_close_until_capacity_returns() {
+        let (broker, mut reactor) = test_broker(1, 4);
+        let (broker_target, target) = tcp_pair();
+        let (broker_upstream, _remote) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+
+        assert_eq!(relay.permit.resources.reserve_pending(4), 4);
+        target.shutdown(Shutdown::Write).unwrap();
+        let saturated = relay.target_pollfd(&broker.resources);
+        assert_eq!(saturated.fd, -1);
+        assert_eq!(saturated.events, 0);
+
+        relay.permit.resources.release_pending(4);
+        let resumed = relay.target_pollfd(&broker.resources);
+        assert!(resumed.fd >= 0);
+        assert_ne!(resumed.events & libc::POLLRDHUP, 0);
+        assert!(relay.process(libc::POLLRDHUP, 0).unwrap());
+        assert!(relay.target_read_eof);
+        assert!(relay.upstream_write_shutdown);
+    }
+
+    #[test]
     fn hup_with_pending_reverse_data_makes_terminal_progress() {
         let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
         let (broker_target, target) = tcp_pair();
