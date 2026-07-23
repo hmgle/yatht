@@ -275,26 +275,95 @@ def child_cpu_ns() -> int:
     return int((usage.ru_utime + usage.ru_stime) * 1_000_000_000)
 
 
-def system_cpu_ticks() -> list[int]:
+def host_cpu_ticks() -> dict[str, int]:
     fields = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
-    return [int(value) for value in fields]
+    names = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
+    values = [int(value) for value in fields]
+    return {name: values[index] if index < len(values) else 0 for index, name in enumerate(names)}
 
 
-def process_resources(pid: int) -> tuple[int, int]:
+def host_cpu_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    delta = {name: after[name] - before[name] for name in before}
+    total = sum(delta.values())
+    idle = delta["idle"]
+    iowait = delta["iowait"]
+    return {
+        "host_cpu_total_ticks": total,
+        "host_cpu_idle_ticks": idle,
+        "host_cpu_iowait_ticks": iowait,
+        "host_cpu_non_idle_ticks": total - idle - iowait,
+    }
+
+
+def process_resources(pid: int) -> dict[str, int] | None:
     try:
         status = Path(f"/proc/{pid}/status").read_text().splitlines()
         rss_line = next(line for line in status if line.startswith("VmRSS:"))
-        rss_kib = int(rss_line.split()[1])
+        hwm_line = next(line for line in status if line.startswith("VmHWM:"))
         fd_count = len(list(Path(f"/proc/{pid}/fd").iterdir()))
-        return rss_kib, fd_count
+        return {
+            "rss_kib": int(rss_line.split()[1]),
+            "rss_hwm_kib": int(hwm_line.split()[1]),
+            "fds": fd_count,
+        }
     except (FileNotFoundError, PermissionError, StopIteration):
-        return 0, 0
+        return None
+
+
+def direct_child_pids(pid: int) -> list[int]:
+    try:
+        raw = Path(f"/proc/{pid}/task/{pid}/children").read_text()
+    except (FileNotFoundError, PermissionError):
+        return []
+    return [int(value) for value in raw.split()]
+
+
+def process_tree_pids(root_pid: int) -> list[int]:
+    found: list[int] = []
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.append(pid)
+        pending.extend(direct_child_pids(pid))
+    return found
+
+
+def update_process_peak(peaks: dict[str, int | None], sample: dict[str, int] | None) -> None:
+    if sample is None:
+        return
+    for source, destination in (
+        ("rss_kib", "rss_sampled_peak_kib"),
+        ("rss_hwm_kib", "rss_hwm_kib"),
+        ("fds", "fd_sampled_peak"),
+    ):
+        previous = peaks[destination]
+        peaks[destination] = sample[source] if previous is None else max(previous, sample[source])
+
+
+def empty_process_peaks() -> dict[str, int | None]:
+    return {
+        "rss_sampled_peak_kib": None,
+        "rss_hwm_kib": None,
+        "fd_sampled_peak": None,
+    }
 
 
 def percentile(values: list[int | float], fraction: float) -> float:
     ordered = sorted(float(value) for value in values)
     index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))
     return ordered[index]
+
+
+def median_field(runs: list[dict[str, Any]], field: str) -> float | None:
+    values = [run[field] for run in runs if run.get(field) is not None]
+    return statistics.median(values) if values else None
+
+
+def max_field(runs: list[dict[str, Any]], field: str) -> int | None:
+    values = [run[field] for run in runs if run.get(field) is not None]
+    return max(values) if values else None
 
 
 def parse_workload_output(stdout: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -370,15 +439,20 @@ def run_one(
         args.command_log.write(shlex.join(command) + "\n")
         args.command_log.flush()
         child_before = child_cpu_ns()
-        proxy_before = servers.cpu_ns()
-        system_before = system_cpu_ticks()
+        benchmark_server_before = servers.cpu_ns()
+        host_cpu_before = host_cpu_ticks()
         started = time.perf_counter_ns()
         timed_out = False
         stalled_ready = False
         stalled_released = False
         release_at: float | None = None
-        peak_rss_kib = 0
-        peak_fds = 0
+        supervisor_peaks = empty_process_peaks()
+        target_peaks = empty_process_peaks()
+        server_peaks = empty_process_peaks()
+        process_tree_rss_sampled_peak_kib: int | None = None
+        process_tree_fd_sampled_peak: int | None = None
+        supervisor_pid: int | None = None
+        target_pid: int | None = None
         with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(
             mode="w+"
         ) as stderr_file:
@@ -389,11 +463,35 @@ def run_one(
                 stderr=stderr_file,
                 start_new_session=True,
             )
+            if variant == "direct":
+                target_pid = process.pid
+            else:
+                supervisor_pid = process.pid
             deadline = time.monotonic() + args.timeout
             while process.poll() is None:
-                rss_kib, fd_count = process_resources(process.pid)
-                peak_rss_kib = max(peak_rss_kib, rss_kib)
-                peak_fds = max(peak_fds, fd_count)
+                if supervisor_pid is not None:
+                    update_process_peak(supervisor_peaks, process_resources(supervisor_pid))
+                    if target_pid is None:
+                        children = direct_child_pids(supervisor_pid)
+                        if children:
+                            target_pid = children[0]
+                if target_pid is not None:
+                    update_process_peak(target_peaks, process_resources(target_pid))
+                update_process_peak(server_peaks, process_resources(os.getpid()))
+                tree_samples = [
+                    sample
+                    for pid in process_tree_pids(process.pid)
+                    if (sample := process_resources(pid)) is not None
+                ]
+                if tree_samples:
+                    tree_rss = sum(sample["rss_kib"] for sample in tree_samples)
+                    tree_fds = sum(sample["fds"] for sample in tree_samples)
+                    process_tree_rss_sampled_peak_kib = max(
+                        process_tree_rss_sampled_peak_kib or 0, tree_rss
+                    )
+                    process_tree_fd_sampled_peak = max(
+                        process_tree_fd_sampled_peak or 0, tree_fds
+                    )
                 now = time.monotonic()
                 if scenario["mode"] == "stalled" and not stalled_ready:
                     if stalled_ready_path.exists():
@@ -419,8 +517,8 @@ def run_one(
                 stderr_file.read(),
             )
     wall_ns = time.perf_counter_ns() - started
-    system_after = system_cpu_ticks()
-    proxy_cpu_ns = servers.cpu_ns() - proxy_before
+    host_cpu_after = host_cpu_ticks()
+    benchmark_server_cpu_ns = servers.cpu_ns() - benchmark_server_before
     child_delta_ns = child_cpu_ns() - child_before
 
     parse_error = None
@@ -499,10 +597,16 @@ def run_one(
         "successful_flows": len(successful),
         "wall_ns": wall_ns,
         "child_cpu_ns": child_delta_ns,
-        "proxy_cpu_ns": proxy_cpu_ns,
-        "process_peak_rss_kib": peak_rss_kib,
-        "process_peak_fds": peak_fds,
-        "system_cpu_ticks": sum(system_after) - sum(system_before),
+        "benchmark_server_cpu_ns": benchmark_server_cpu_ns,
+        "supervisor_pid": supervisor_pid,
+        "target_pid": target_pid,
+        "benchmark_server_pid": os.getpid(),
+        **{f"supervisor_{key}": value for key, value in supervisor_peaks.items()},
+        **{f"target_{key}": value for key, value in target_peaks.items()},
+        **{f"benchmark_server_{key}": value for key, value in server_peaks.items()},
+        "process_tree_rss_sampled_peak_kib": process_tree_rss_sampled_peak_kib,
+        "process_tree_fd_sampled_peak": process_tree_fd_sampled_peak,
+        **host_cpu_delta(host_cpu_before, host_cpu_after),
         "target_user_cpu_ns": workload_summary.get("user_cpu_ns"),
         "target_system_cpu_ns": workload_summary.get("system_cpu_ns"),
         "bytes": workload_summary.get("bytes", 0),
@@ -589,7 +693,8 @@ def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) ->
             if "first_response_ns" in flow
         ]
         wall = [run["wall_ns"] for run in selected_runs if run["ok"]]
-        successful = sum(run["successful_flows"] for run in selected_runs if run["ok"])
+        valid_runs = [run for run in selected_runs if run["ok"]]
+        successful = sum(run["successful_flows"] for run in valid_runs)
         wall_total = sum(wall)
         rows.append(
             {
@@ -607,27 +712,37 @@ def summarize(runs: list[dict[str, Any]], flow_samples: list[dict[str, Any]]) ->
                 "connections_per_second": (
                     successful / (wall_total / 1_000_000_000) if wall_total else None
                 ),
-                "child_cpu_median_ns": (
-                    statistics.median(run["child_cpu_ns"] for run in selected_runs if run["ok"])
-                    if wall
-                    else None
+                "child_cpu_median_ns": median_field(valid_runs, "child_cpu_ns"),
+                "benchmark_server_cpu_median_ns": median_field(
+                    valid_runs, "benchmark_server_cpu_ns"
                 ),
-                "proxy_cpu_median_ns": (
-                    statistics.median(run["proxy_cpu_ns"] for run in selected_runs if run["ok"])
-                    if wall
-                    else None
+                "supervisor_rss_hwm_median_kib": median_field(
+                    valid_runs, "supervisor_rss_hwm_kib"
                 ),
-                "process_peak_rss_median_kib": (
-                    statistics.median(
-                        run["process_peak_rss_kib"] for run in selected_runs if run["ok"]
-                    )
-                    if wall
-                    else None
+                "supervisor_rss_sampled_peak_median_kib": median_field(
+                    valid_runs, "supervisor_rss_sampled_peak_kib"
                 ),
-                "process_peak_fds_max": (
-                    max(run["process_peak_fds"] for run in selected_runs if run["ok"])
-                    if wall
-                    else None
+                "supervisor_fd_sampled_peak_max": max_field(
+                    valid_runs, "supervisor_fd_sampled_peak"
+                ),
+                "target_rss_hwm_median_kib": median_field(
+                    valid_runs, "target_rss_hwm_kib"
+                ),
+                "target_rss_sampled_peak_median_kib": median_field(
+                    valid_runs, "target_rss_sampled_peak_kib"
+                ),
+                "target_fd_sampled_peak_max": max_field(valid_runs, "target_fd_sampled_peak"),
+                "process_tree_rss_sampled_peak_median_kib": median_field(
+                    valid_runs, "process_tree_rss_sampled_peak_kib"
+                ),
+                "process_tree_fd_sampled_peak_max": max_field(
+                    valid_runs, "process_tree_fd_sampled_peak"
+                ),
+                "benchmark_server_rss_hwm_median_kib": median_field(
+                    valid_runs, "benchmark_server_rss_hwm_kib"
+                ),
+                "benchmark_server_fd_sampled_peak_max": max_field(
+                    valid_runs, "benchmark_server_fd_sampled_peak"
                 ),
             }
         )
@@ -649,7 +764,7 @@ def command_output(command: list[str]) -> str | None:
 
 def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_unix_ns": time.time_ns(),
         "git_commit": command_output(["git", "rev-parse", "HEAD"]),
         "git_status": command_output(["git", "status", "--short"]),
@@ -658,6 +773,7 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "cc": command_output([args.cc, "--version"]),
         "python": sys.version,
         "cpu_count": os.cpu_count(),
+        "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
         "rlimit_nofile": resource.getrlimit(resource.RLIMIT_NOFILE),
         "perf_available": shutil.which("perf") is not None,
         "yatht": args.yatht,
@@ -672,6 +788,14 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
         "random_seed": args.seed,
+        "resource_sampling": {
+            "interval_ms": 5,
+            "direct_target_role": "root process",
+            "proxied_supervisor_role": "root process",
+            "proxied_target_role": "first direct child",
+            "benchmark_server_role": "persistent harness process",
+            "process_tree_rss_note": "sum of VmRSS may double-count shared pages",
+        },
     }
 
 
