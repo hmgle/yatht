@@ -11,7 +11,7 @@ use crossbeam_channel as channel;
 use serde::Serialize;
 
 const METRIC_QUEUE_CAPACITY: usize = 4096;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Default)]
 pub struct Observability {
@@ -42,6 +42,8 @@ struct ObservabilityInner {
     tcp_peak_pending_bytes: AtomicU64,
     tcp_reserved_pending_bytes: AtomicU64,
     tcp_peak_reserved_pending_bytes: AtomicU64,
+    tcp_buffer_capacity_bytes: AtomicU64,
+    tcp_peak_buffer_capacity_bytes: AtomicU64,
     tcp_target_to_upstream_bytes: AtomicU64,
     tcp_upstream_to_target_bytes: AtomicU64,
     tcp_recv_syscalls: AtomicU64,
@@ -55,6 +57,7 @@ struct ObservabilityInner {
     tcp_active_flow_rejections: AtomicU64,
     tcp_fd_headroom_rejections: AtomicU64,
     tcp_pending_byte_rejections: AtomicU64,
+    tcp_buffer_capacity_rejections: AtomicU64,
     tcp_reactor_stopped_rejections: AtomicU64,
     started: Instant,
 }
@@ -80,6 +83,8 @@ impl ObservabilityInner {
             tcp_peak_pending_bytes: AtomicU64::new(0),
             tcp_reserved_pending_bytes: AtomicU64::new(0),
             tcp_peak_reserved_pending_bytes: AtomicU64::new(0),
+            tcp_buffer_capacity_bytes: AtomicU64::new(0),
+            tcp_peak_buffer_capacity_bytes: AtomicU64::new(0),
             tcp_target_to_upstream_bytes: AtomicU64::new(0),
             tcp_upstream_to_target_bytes: AtomicU64::new(0),
             tcp_recv_syscalls: AtomicU64::new(0),
@@ -93,6 +98,7 @@ impl ObservabilityInner {
             tcp_active_flow_rejections: AtomicU64::new(0),
             tcp_fd_headroom_rejections: AtomicU64::new(0),
             tcp_pending_byte_rejections: AtomicU64::new(0),
+            tcp_buffer_capacity_rejections: AtomicU64::new(0),
             tcp_reactor_stopped_rejections: AtomicU64::new(0),
             started: Instant::now(),
         }
@@ -118,6 +124,7 @@ enum MetricEvent {
         schema_version: u32,
         max_active_flows: usize,
         max_pending_bytes: usize,
+        max_buffer_capacity_bytes: usize,
         registration_queue_capacity: usize,
         rlimit_nofile: u64,
         baseline_fds: usize,
@@ -170,6 +177,8 @@ struct RunSummary {
     tcp_peak_pending_bytes: u64,
     tcp_reserved_pending_bytes: u64,
     tcp_peak_reserved_pending_bytes: u64,
+    tcp_buffer_capacity_bytes: u64,
+    tcp_peak_buffer_capacity_bytes: u64,
     tcp_target_to_upstream_bytes: u64,
     tcp_upstream_to_target_bytes: u64,
     tcp_recv_syscalls: u64,
@@ -183,6 +192,7 @@ struct RunSummary {
     tcp_active_flow_rejections: u64,
     tcp_fd_headroom_rejections: u64,
     tcp_pending_byte_rejections: u64,
+    tcp_buffer_capacity_rejections: u64,
     tcp_reactor_stopped_rejections: u64,
     tcp_cpu_ns_per_byte: Option<f64>,
     dropped_metric_events: u64,
@@ -280,6 +290,10 @@ impl ObservabilityRuntime {
             tcp_peak_reserved_pending_bytes: inner
                 .tcp_peak_reserved_pending_bytes
                 .load(Ordering::Relaxed),
+            tcp_buffer_capacity_bytes: inner.tcp_buffer_capacity_bytes.load(Ordering::Relaxed),
+            tcp_peak_buffer_capacity_bytes: inner
+                .tcp_peak_buffer_capacity_bytes
+                .load(Ordering::Relaxed),
             tcp_target_to_upstream_bytes: inner
                 .tcp_target_to_upstream_bytes
                 .load(Ordering::Relaxed),
@@ -297,6 +311,9 @@ impl ObservabilityRuntime {
             tcp_active_flow_rejections: inner.tcp_active_flow_rejections.load(Ordering::Relaxed),
             tcp_fd_headroom_rejections: inner.tcp_fd_headroom_rejections.load(Ordering::Relaxed),
             tcp_pending_byte_rejections: inner.tcp_pending_byte_rejections.load(Ordering::Relaxed),
+            tcp_buffer_capacity_rejections: inner
+                .tcp_buffer_capacity_rejections
+                .load(Ordering::Relaxed),
             tcp_reactor_stopped_rejections: inner
                 .tcp_reactor_stopped_rejections
                 .load(Ordering::Relaxed),
@@ -351,6 +368,7 @@ impl Observability {
         &self,
         max_active_flows: usize,
         max_pending_bytes: usize,
+        max_buffer_capacity_bytes: usize,
         registration_queue_capacity: usize,
         rlimit_nofile: u64,
         baseline_fds: usize,
@@ -360,6 +378,7 @@ impl Observability {
             schema_version: SCHEMA_VERSION,
             max_active_flows,
             max_pending_bytes,
+            max_buffer_capacity_bytes,
             registration_queue_capacity,
             rlimit_nofile,
             baseline_fds,
@@ -467,6 +486,26 @@ impl Observability {
         }
     }
 
+    pub fn tcp_buffer_capacity_reserved(&self, reserved: usize) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner
+            .tcp_buffer_capacity_bytes
+            .fetch_add(reserved as u64, Ordering::Relaxed)
+            .saturating_add(reserved as u64);
+        update_peak(&inner.tcp_peak_buffer_capacity_bytes, current);
+    }
+
+    pub fn tcp_buffer_capacity_released(&self, released: usize) {
+        if let Some(inner) = &self.inner {
+            let previous = inner
+                .tcp_buffer_capacity_bytes
+                .fetch_sub(released as u64, Ordering::Relaxed);
+            debug_assert!(previous >= released as u64);
+        }
+    }
+
     pub fn tcp_pending_added(&self, added: usize) {
         let Some(inner) = &self.inner else {
             return;
@@ -551,6 +590,7 @@ impl Observability {
             "active_flow" => &inner.tcp_active_flow_rejections,
             "fd_headroom" => &inner.tcp_fd_headroom_rejections,
             "pending_bytes" => &inner.tcp_pending_byte_rejections,
+            "buffer_capacity" => &inner.tcp_buffer_capacity_rejections,
             "registration_queue" => &inner.tcp_registration_queue_full,
             _ => &inner.tcp_reactor_stopped_rejections,
         };

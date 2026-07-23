@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -13,6 +14,7 @@ const RELAY_BUFFER_CAPACITY: usize = 64 * 1024;
 const READ_CHUNK_SIZE: usize = 16 * 1024;
 const DEFAULT_MAX_ACTIVE_FLOWS: usize = 16_384;
 const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MAX_BUFFER_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const SETUP_EXTRA_FDS_PER_WORKER: usize = 3;
 const BROKER_FDS_PER_FLOW: usize = 2;
 
@@ -35,6 +37,7 @@ struct BrokerResources {
     flow_limit_reason: FlowLimitReason,
     active_flows: AtomicUsize,
     pending_bytes: AtomicUsize,
+    buffer_capacity_bytes: AtomicUsize,
     registration_queue_depth: AtomicUsize,
     observability: Observability,
 }
@@ -43,6 +46,7 @@ struct BrokerResources {
 struct TcpBrokerLimits {
     max_active_flows: usize,
     max_pending_bytes: usize,
+    max_buffer_capacity_bytes: usize,
     rlimit_nofile: u64,
     baseline_fds: usize,
     reserved_fds: usize,
@@ -80,8 +84,14 @@ struct TcpRelay {
 
 #[derive(Default)]
 struct PendingBuffer {
-    bytes: Vec<u8>,
-    offset: usize,
+    chunks: VecDeque<PendingChunk>,
+    len: usize,
+}
+
+struct PendingChunk {
+    bytes: Box<[u8]>,
+    start: usize,
+    end: usize,
 }
 
 impl TcpBroker {
@@ -105,12 +115,14 @@ impl TcpBroker {
             flow_limit_reason,
             active_flows: AtomicUsize::new(0),
             pending_bytes: AtomicUsize::new(0),
+            buffer_capacity_bytes: AtomicUsize::new(0),
             registration_queue_depth: AtomicUsize::new(0),
             observability,
         });
         resources.observability.record_tcp_broker_limits(
             limits.max_active_flows,
             limits.max_pending_bytes,
+            limits.max_buffer_capacity_bytes,
             REGISTRATION_QUEUE_CAPACITY,
             limits.rlimit_nofile,
             limits.baseline_fds,
@@ -255,6 +267,7 @@ impl TcpBrokerLimits {
             Self {
                 max_active_flows,
                 max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+                max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
                 rlimit_nofile,
                 baseline_fds,
                 reserved_fds,
@@ -299,6 +312,10 @@ impl BrokerResources {
         self.pending_bytes.load(Ordering::Acquire) >= self.limits.max_pending_bytes
     }
 
+    fn buffer_capacity_is_saturated(&self) -> bool {
+        self.buffer_capacity_bytes.load(Ordering::Acquire) >= self.limits.max_buffer_capacity_bytes
+    }
+
     fn reserve_pending(&self, requested: usize) -> usize {
         loop {
             let current = self.pending_bytes.load(Ordering::Acquire);
@@ -326,6 +343,36 @@ impl BrokerResources {
         let previous = self.pending_bytes.fetch_sub(released, Ordering::AcqRel);
         debug_assert!(previous >= released);
         self.observability.tcp_pending_budget_released(released);
+    }
+
+    fn reserve_buffer_capacity(&self) -> bool {
+        let reserved = self.buffer_capacity_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                current
+                    .checked_add(READ_CHUNK_SIZE)
+                    .filter(|next| *next <= self.limits.max_buffer_capacity_bytes)
+            },
+        );
+        if reserved.is_err() {
+            self.observability.tcp_resource_rejection("buffer_capacity");
+            return false;
+        }
+        self.observability
+            .tcp_buffer_capacity_reserved(READ_CHUNK_SIZE);
+        true
+    }
+
+    fn release_buffer_capacity(&self, released: usize) {
+        if released == 0 {
+            return;
+        }
+        let previous = self
+            .buffer_capacity_bytes
+            .fetch_sub(released, Ordering::AcqRel);
+        debug_assert!(previous >= released);
+        self.observability.tcp_buffer_capacity_released(released);
     }
 
     fn reserve_registration_slot(&self) -> bool {
@@ -519,12 +566,16 @@ impl TcpRelay {
         !self.target_read_eof
             && !self.target_to_upstream.is_full()
             && !resources.pending_is_saturated()
+            && (self.target_to_upstream.has_writable_capacity()
+                || !resources.buffer_capacity_is_saturated())
     }
 
     fn can_read_upstream(&self, resources: &BrokerResources) -> bool {
         !self.upstream_read_eof
             && !self.upstream_to_target.is_full()
             && !resources.pending_is_saturated()
+            && (self.upstream_to_target.has_writable_capacity()
+                || !resources.buffer_capacity_is_saturated())
     }
 
     fn process(
@@ -656,6 +707,10 @@ impl Drop for TcpRelay {
             .len()
             .saturating_add(self.upstream_to_target.len());
         self.permit.resources.release_pending(pending);
+        self.target_to_upstream
+            .release_capacity(&self.permit.resources);
+        self.upstream_to_target
+            .release_capacity(&self.permit.resources);
         self.permit
             .resources
             .observability
@@ -682,11 +737,12 @@ enum WriteOutcome {
 
 impl PendingBuffer {
     fn pending(&self) -> &[u8] {
-        &self.bytes[self.offset..]
+        let chunk = self.chunks.front().expect("pending buffer is empty");
+        &chunk.bytes[chunk.start..chunk.end]
     }
 
     fn len(&self) -> usize {
-        self.bytes.len() - self.offset
+        self.len
     }
 
     fn is_empty(&self) -> bool {
@@ -697,20 +753,85 @@ impl PendingBuffer {
         self.len() >= RELAY_BUFFER_CAPACITY
     }
 
-    fn append(&mut self, bytes: &[u8]) {
-        if self.offset > 0 && self.bytes.len() + bytes.len() > RELAY_BUFFER_CAPACITY {
-            self.bytes.copy_within(self.offset.., 0);
-            self.bytes.truncate(self.len());
-            self.offset = 0;
-        }
-        self.bytes.extend_from_slice(bytes);
+    fn has_writable_capacity(&self) -> bool {
+        self.chunks
+            .back()
+            .is_some_and(|chunk| chunk.end < chunk.bytes.len())
     }
 
-    fn consume(&mut self, length: usize) {
-        self.offset += length;
-        if self.offset == self.bytes.len() {
-            self.bytes.clear();
-            self.offset = 0;
+    fn prepare_read<'a>(
+        &'a mut self,
+        resources: &BrokerResources,
+    ) -> io::Result<Option<&'a mut [u8]>> {
+        if self.is_full() {
+            return Ok(None);
+        }
+        if !self.has_writable_capacity() {
+            if !resources.reserve_buffer_capacity() {
+                return Ok(None);
+            }
+            let mut bytes = Vec::new();
+            if let Err(err) = bytes.try_reserve_exact(READ_CHUNK_SIZE) {
+                resources.release_buffer_capacity(READ_CHUNK_SIZE);
+                return Err(io::Error::other(err));
+            }
+            bytes.resize(READ_CHUNK_SIZE, 0);
+            self.chunks.push_back(PendingChunk {
+                bytes: bytes.into_boxed_slice(),
+                start: 0,
+                end: 0,
+            });
+        }
+        let available = RELAY_BUFFER_CAPACITY - self.len;
+        let chunk = self.chunks.back_mut().unwrap();
+        let end = (chunk.end + available).min(chunk.bytes.len());
+        Ok(Some(&mut chunk.bytes[chunk.end..end]))
+    }
+
+    fn commit_read(&mut self, length: usize) {
+        let chunk = self.chunks.back_mut().expect("missing read buffer chunk");
+        debug_assert!(chunk.end + length <= chunk.bytes.len());
+        chunk.end += length;
+        self.len += length;
+    }
+
+    fn discard_empty_tail(&mut self, resources: &BrokerResources) {
+        if self
+            .chunks
+            .back()
+            .is_some_and(|chunk| chunk.start == chunk.end)
+        {
+            self.chunks.pop_back();
+            resources.release_buffer_capacity(READ_CHUNK_SIZE);
+        }
+    }
+
+    fn consume(&mut self, length: usize, resources: &BrokerResources) {
+        let chunk = self.chunks.front_mut().expect("pending buffer is empty");
+        debug_assert!(length <= chunk.end - chunk.start);
+        chunk.start += length;
+        self.len -= length;
+        if chunk.start == chunk.end {
+            self.chunks.pop_front();
+            resources.release_buffer_capacity(READ_CHUNK_SIZE);
+        }
+    }
+
+    fn release_capacity(&mut self, resources: &BrokerResources) {
+        let capacity = self.chunks.len().saturating_mul(READ_CHUNK_SIZE);
+        self.chunks.clear();
+        self.len = 0;
+        resources.release_buffer_capacity(capacity);
+    }
+
+    #[cfg(test)]
+    fn append(&mut self, mut bytes: &[u8], resources: &BrokerResources) {
+        while !bytes.is_empty() {
+            let destination = self.prepare_read(resources).unwrap().unwrap();
+            let copied = bytes.len().min(destination.len());
+            destination[..copied].copy_from_slice(&bytes[..copied]);
+            self.commit_read(copied);
+            bytes = &bytes[copied..];
         }
     }
 }
@@ -724,10 +845,12 @@ fn read_socket(
     if pending.is_full() {
         return Ok(ReadOutcome::Idle);
     }
-    let mut chunk = [0_u8; READ_CHUNK_SIZE];
-    let available = RELAY_BUFFER_CAPACITY - pending.len();
-    let reserved = resources.reserve_pending(chunk.len().min(available));
+    let Some(chunk) = pending.prepare_read(resources)? else {
+        return Ok(ReadOutcome::Idle);
+    };
+    let reserved = resources.reserve_pending(chunk.len());
     if reserved == 0 {
+        pending.discard_empty_tail(resources);
         return Ok(ReadOutcome::Idle);
     }
     loop {
@@ -744,12 +867,13 @@ fn read_socket(
             .tcp_recv(rc.max(0) as usize, target_to_upstream);
         if rc > 0 {
             resources.release_pending(reserved - rc as usize);
-            pending.append(&chunk[..rc as usize]);
+            pending.commit_read(rc as usize);
             resources.observability.tcp_pending_added(rc as usize);
             return Ok(ReadOutcome::Progress);
         }
         if rc == 0 {
             resources.release_pending(reserved);
+            pending.discard_empty_tail(resources);
             return Ok(ReadOutcome::Eof);
         }
         let err = io::Error::last_os_error();
@@ -758,8 +882,10 @@ fn read_socket(
         }
         resources.release_pending(reserved);
         if err.kind() == io::ErrorKind::WouldBlock {
+            pending.discard_empty_tail(resources);
             return Ok(ReadOutcome::Idle);
         }
+        pending.discard_empty_tail(resources);
         return Err(err);
     }
 }
@@ -783,7 +909,7 @@ fn flush_socket(
         };
         resources.observability.tcp_send();
         if rc > 0 {
-            pending.consume(rc as usize);
+            pending.consume(rc as usize, resources);
             resources.release_pending(rc as usize);
             resources.observability.tcp_pending_removed(rc as usize);
             return Ok(WriteOutcome::Progress);
@@ -934,6 +1060,7 @@ mod tests {
         let limits = TcpBrokerLimits {
             max_active_flows: 1,
             max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
             rlimit_nofile: 4096,
             baseline_fds: 0,
             reserved_fds: 256,
@@ -979,6 +1106,8 @@ mod tests {
             .find(|event| event["event"] == "run_summary")
             .unwrap();
         assert!(summary["tcp_recv_syscalls"].as_u64().unwrap() <= 8);
+        assert_eq!(summary["tcp_buffer_capacity_bytes"], 0);
+        assert!(summary["tcp_peak_buffer_capacity_bytes"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -1001,7 +1130,7 @@ mod tests {
         );
         relay
             .target_to_upstream
-            .append(&vec![0x5a; RELAY_BUFFER_CAPACITY]);
+            .append(&vec![0x5a; RELAY_BUFFER_CAPACITY], &broker.resources);
 
         let pollfd = relay.target_pollfd(&broker.resources);
         assert_eq!(pollfd.fd, -1);
@@ -1020,7 +1149,9 @@ mod tests {
         assert!(!reactor.drain_commands().unwrap());
         let relay = &mut reactor.relays[0];
         assert_eq!(relay.permit.resources.reserve_pending(8), 8);
-        relay.upstream_to_target.append(b"response");
+        relay
+            .upstream_to_target
+            .append(b"response", &broker.resources);
         drop(target);
 
         let before = relay.upstream_to_target.len();
@@ -1036,6 +1167,7 @@ mod tests {
         let limits = TcpBrokerLimits {
             max_active_flows: 1,
             max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
             rlimit_nofile: 4096,
             baseline_fds: 0,
             reserved_fds: 256,
@@ -1066,6 +1198,7 @@ mod tests {
         assert_eq!(summary["tcp_active_flows"], 0);
         assert_eq!(summary["tcp_pending_bytes"], 0);
         assert_eq!(summary["tcp_reserved_pending_bytes"], 0);
+        assert_eq!(summary["tcp_buffer_capacity_bytes"], 0);
         assert_eq!(summary["tcp_registration_queue_depth"], 0);
         assert_eq!(summary["tcp_flows_cancelled"], 1);
     }
@@ -1142,7 +1275,53 @@ mod tests {
         broker.shutdown().unwrap();
         reactor_thread.join().unwrap();
         assert_eq!(resources.pending_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(resources.buffer_capacity_bytes.load(Ordering::Acquire), 0);
         assert_eq!(resources.active_flows.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounds_and_releases_allocated_buffer_capacity() {
+        let limits = TcpBrokerLimits {
+            max_active_flows: 1,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_buffer_capacity_bytes: READ_CHUNK_SIZE,
+            rlimit_nofile: 4096,
+            baseline_fds: 0,
+            reserved_fds: 256,
+        };
+        let (broker, _reactor) = TcpBroker::new_with_limits(
+            Observability::default(),
+            limits,
+            FlowLimitReason::ActiveFlow,
+        )
+        .unwrap();
+        let mut first = PendingBuffer::default();
+        let mut second = PendingBuffer::default();
+
+        {
+            let writable = first.prepare_read(&broker.resources).unwrap().unwrap();
+            writable[..4].copy_from_slice(b"data");
+        }
+        first.commit_read(4);
+        assert!(second.prepare_read(&broker.resources).unwrap().is_none());
+        assert_eq!(
+            broker
+                .resources
+                .buffer_capacity_bytes
+                .load(Ordering::Acquire),
+            READ_CHUNK_SIZE
+        );
+
+        first.consume(4, &broker.resources);
+        assert_eq!(
+            broker
+                .resources
+                .buffer_capacity_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(second.prepare_read(&broker.resources).unwrap().is_some());
+        second.discard_empty_tail(&broker.resources);
     }
 
     #[test]
@@ -1199,6 +1378,7 @@ mod tests {
             TcpBrokerLimits {
                 max_active_flows,
                 max_pending_bytes,
+                max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
                 rlimit_nofile: 4096,
                 baseline_fds: 0,
                 reserved_fds: 256,

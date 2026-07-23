@@ -85,14 +85,15 @@ features. `--proxy-local` disables the default `bypass_local = true` behavior.
 
 The metrics file is opt-in and must not already exist. It contains versioned
 run metadata, TCP broker limits, one setup record per proxied TCP connection,
-and a final summary with queue, flow, pending-byte, relay, syscall, CPU, and
-failure counters. Event delivery uses a bounded queue; the final
+and a final summary with queue, flow, pending-byte, allocated-buffer, relay,
+syscall, CPU, and failure counters. Event delivery uses a bounded queue; the final
 `dropped_metric_events` counter reports any records discarded under pressure.
 
 The TCP broker admits at most 16,384 active flows and reduces that limit when
 `RLIMIT_NOFILE` cannot preserve fd headroom. Registration is bounded to 128
-pending flows, and relay buffers share a 256 MiB global pending-byte budget.
-Resource exhaustion is fail-closed and is classified in the metrics summary.
+pending flows. Relay buffers have separate 256 MiB global limits for logical
+pending bytes and allocated payload capacity. Empty 16 KiB blocks are released
+immediately. Resource exhaustion is fail-closed and classified in the summary.
 
 ## Compatibility and Limitations
 
