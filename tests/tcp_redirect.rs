@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
@@ -105,6 +106,46 @@ fn redirects_local_tcp_connect_through_socks5() {
     assert!(summary["tcp_recv_syscalls"].as_u64().unwrap() > 0);
     assert!(summary["tcp_send_syscalls"].as_u64().unwrap() > 0);
     assert_eq!(summary["dropped_metric_events"], 0);
+}
+
+#[test]
+fn broker_initialization_failure_does_not_exec_target() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("target.pid");
+    let script = format!(
+        "echo $$ > {}; exec sleep 30",
+        pid_path.to_string_lossy().escape_default()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    command
+        .args(["--proxy", "socks5://127.0.0.1:9", "--", "sh", "-c"])
+        .arg(script);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("RLIMIT_NOFILE leaves no TCP broker flow capacity"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!pid_path.exists(), "target unexpectedly reached exec");
 }
 
 #[test]

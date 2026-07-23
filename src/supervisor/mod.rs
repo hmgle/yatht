@@ -75,6 +75,11 @@ struct BlockingRecvCompletion {
     handling: RecvHandling,
 }
 
+struct TargetGuard {
+    child: Child,
+    armed: bool,
+}
+
 enum RecvHandling {
     Completed,
     Deferred {
@@ -89,6 +94,30 @@ impl NotificationFailure {
             return;
         }
         let _ = self.tx.try_send(format!("{context}: {err}"));
+    }
+}
+
+impl TargetGuard {
+    fn new(child: Child) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TargetGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut target_status = None;
+        let _ = terminate_target_tree(&mut self.child, &mut target_status);
     }
 }
 
@@ -184,21 +213,26 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         });
     }
 
-    let mut child = command.spawn().context("spawn child stage")?;
+    let mut target = TargetGuard::new(command.spawn().context("spawn child stage")?);
     close_fd(child_sock);
 
-    let listener_fd = match recv_listener_fd(parent_sock, child.id()) {
+    let listener_fd = match recv_listener_fd(parent_sock, target.child.id()) {
         Ok(fd) => fd,
         Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
             close_fd(parent_sock);
             return Err(err).context("duplicate seccomp listener fd");
         }
     };
+    let worker_count = notification_worker_count();
+    let (tcp_broker, tcp_broker_reactor) = match TcpBroker::new(observability.clone(), worker_count)
+    {
+        Ok(broker) => broker,
+        Err(err) => {
+            close_fd(parent_sock);
+            return Err(err).context("create TCP broker");
+        }
+    };
     if let Err(err) = write_all_fd(parent_sock, b"G") {
-        let _ = child.kill();
-        let _ = child.wait();
         close_fd(parent_sock);
         return Err(err).context("ack child stage");
     }
@@ -213,9 +247,6 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         shutting_down: AtomicBool::new(false),
         tx: failure_tx,
     });
-    let worker_count = notification_worker_count();
-    let (tcp_broker, tcp_broker_reactor) =
-        TcpBroker::new(observability.clone(), worker_count).context("create TCP broker")?;
     let reactor_failure = Arc::clone(&failure);
     let panic_failure = Arc::clone(&failure);
     thread::spawn(
@@ -261,7 +292,8 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         }
     });
 
-    let status = monitor_target_tree(&mut child, &failure_rx, &failure)?;
+    let status = monitor_target_tree(target.child_mut(), &failure_rx, &failure)?;
+    target.disarm();
     if let Some(code) = status.code() {
         Ok(code)
     } else if let Some(signal) = status.signal() {
