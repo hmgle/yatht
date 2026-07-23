@@ -339,16 +339,6 @@ impl Observability {
         }
     }
 
-    pub fn wait_for_tcp_idle(&self, timeout: Duration) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        let deadline = Instant::now() + timeout;
-        while inner.tcp_active_flows.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn record_tcp_broker_limits(
         &self,

@@ -60,7 +60,6 @@ pub struct TcpFlowPermit {
 
 enum BrokerCommand {
     Register(TcpRelay),
-    #[cfg(test)]
     Shutdown,
 }
 
@@ -212,8 +211,7 @@ impl TcpBroker {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn shutdown(&self) -> io::Result<()> {
+    pub fn shutdown(&self) -> io::Result<()> {
         self.tx
             .send(BrokerCommand::Shutdown)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker stopped"))?;
@@ -434,7 +432,6 @@ impl TcpBrokerReactor {
                     relay.accepted_by_reactor = true;
                     self.relays.push(relay);
                 }
-                #[cfg(test)]
                 Ok(BrokerCommand::Shutdown) => return Ok(true),
                 Err(channel::TryRecvError::Empty) => return Ok(false),
                 Err(channel::TryRecvError::Disconnected) => return Ok(true),
@@ -1029,6 +1026,48 @@ mod tests {
         let before = relay.upstream_to_target.len();
         let result = relay.process(libc::POLLHUP, 0);
         assert!(result.is_err() || relay.upstream_to_target.len() < before);
+    }
+
+    #[test]
+    fn shutdown_joins_after_cancelling_active_relays() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
+        let limits = TcpBrokerLimits {
+            max_active_flows: 1,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            rlimit_nofile: 4096,
+            baseline_fds: 0,
+            reserved_fds: 256,
+        };
+        let (broker, reactor) = TcpBroker::new_with_limits(
+            runtime.observability(),
+            limits,
+            FlowLimitReason::ActiveFlow,
+        )
+        .unwrap();
+        let reactor_thread = thread::spawn(move || reactor.run().unwrap());
+        let (broker_target, _target) = tcp_pair();
+        let (broker_upstream, _remote) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+
+        broker.shutdown().unwrap();
+        reactor_thread.join().unwrap();
+        runtime.finish().unwrap();
+        let summary = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "run_summary")
+            .unwrap();
+        assert_eq!(summary["tcp_active_flows"], 0);
+        assert_eq!(summary["tcp_pending_bytes"], 0);
+        assert_eq!(summary["tcp_reserved_pending_bytes"], 0);
+        assert_eq!(summary["tcp_registration_queue_depth"], 0);
+        assert_eq!(summary["tcp_flows_cancelled"], 1);
     }
 
     #[test]

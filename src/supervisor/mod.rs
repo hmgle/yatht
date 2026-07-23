@@ -163,7 +163,6 @@ pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     let observability_runtime = ObservabilityRuntime::start(cfg.metrics_file.as_deref())?;
     let observability = observability_runtime.observability();
     let result = run_with_observability(cfg, observability.clone());
-    observability.wait_for_tcp_idle(Duration::from_secs(1));
     let finish_result = observability_runtime.finish();
     match (result, finish_result) {
         (Ok(code), Ok(())) => Ok(code),
@@ -249,35 +248,37 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     });
     let reactor_failure = Arc::clone(&failure);
     let panic_failure = Arc::clone(&failure);
-    thread::spawn(
-        move || match std::panic::catch_unwind(|| tcp_broker_reactor.run()) {
-            Ok(Ok(())) => {
-                if !reactor_failure.shutting_down.load(Ordering::Acquire) {
-                    reactor_failure.report(
-                        "TCP broker reactor stopped",
-                        io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker channel closed"),
-                    );
+    let reactor_thread =
+        thread::spawn(
+            move || match std::panic::catch_unwind(|| tcp_broker_reactor.run()) {
+                Ok(Ok(())) => {
+                    if !reactor_failure.shutting_down.load(Ordering::Acquire) {
+                        reactor_failure.report(
+                            "TCP broker reactor stopped",
+                            io::Error::new(io::ErrorKind::BrokenPipe, "TCP broker channel closed"),
+                        );
+                    }
                 }
-            }
-            Ok(Err(err)) => reactor_failure.report("TCP broker reactor failed", err),
-            Err(_) => panic_failure.report(
-                "TCP broker reactor panicked",
-                io::Error::other("TCP broker reactor panicked"),
-            ),
-        },
-    );
+                Ok(Err(err)) => reactor_failure.report("TCP broker reactor failed", err),
+                Err(_) => panic_failure.report(
+                    "TCP broker reactor panicked",
+                    io::Error::other("TCP broker reactor panicked"),
+                ),
+            },
+        );
     let loop_cfg = Arc::clone(&cfg);
     let loop_relays = Arc::clone(&relays);
     let loop_failure = Arc::clone(&failure);
     let loop_state = Arc::clone(&failure);
     let loop_observability = observability;
-    thread::spawn(move || {
+    let worker_tcp_broker = tcp_broker.clone();
+    let notification_thread = thread::spawn(move || {
         if std::panic::catch_unwind(|| {
             notification_loop(
                 listener_fd,
                 loop_cfg,
                 loop_relays,
-                tcp_broker,
+                worker_tcp_broker,
                 loop_state,
                 loop_observability,
                 worker_count,
@@ -292,7 +293,22 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         }
     });
 
-    let status = monitor_target_tree(target.child_mut(), &failure_rx, &failure)?;
+    let monitor_result = monitor_target_tree(target.child_mut(), &failure_rx, &failure);
+    failure.shutting_down.store(true, Ordering::Release);
+    let notification_join_result = notification_thread
+        .join()
+        .map_err(|_| anyhow!("seccomp notification thread panicked"));
+    let shutdown_result = tcp_broker.shutdown();
+    let reactor_join_result = reactor_thread
+        .join()
+        .map_err(|_| anyhow!("TCP broker reactor thread panicked"));
+    let status = monitor_result?;
+    notification_join_result?;
+    reactor_join_result?;
+    shutdown_result.context("shut down TCP broker reactor")?;
+    if let Ok(message) = failure_rx.try_recv() {
+        bail!("seccomp notification handling failed during shutdown: {message}");
+    }
     target.disarm();
     if let Some(code) = status.code() {
         Ok(code)
@@ -466,6 +482,7 @@ fn notification_loop(
     let (tx, rx) = channel::bounded::<QueuedNotification>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
+    let mut worker_threads = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let worker_rx = rx.clone();
         let worker_listener_fd = Arc::clone(&listener_fd);
@@ -474,7 +491,7 @@ fn notification_loop(
         let worker_tcp_broker = tcp_broker.clone();
         let worker_failure = Arc::clone(&failure);
         let worker_observability = observability.clone();
-        thread::spawn(move || {
+        worker_threads.push(thread::spawn(move || {
             notification_worker(
                 worker_listener_fd,
                 worker_rx,
@@ -484,14 +501,17 @@ fn notification_loop(
                 worker_failure,
                 worker_observability,
             )
-        });
+        }));
     }
+    let mut blocking_thread = None;
     let blocking_queue = if cfg.enable_dns || cfg.enable_udp {
         let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
         let wake_fd = match create_eventfd() {
             Ok(fd) => Arc::new(fd),
             Err(err) => {
                 failure.report("create blocking receive wake fd", err);
+                drop(tx);
+                join_notification_workers(worker_threads, &failure);
                 return;
             }
         };
@@ -500,7 +520,7 @@ fn notification_loop(
         let reactor_failure = Arc::clone(&failure);
         let loop_failure = Arc::clone(&failure);
         let reactor_wake_fd = Arc::clone(&wake_fd);
-        thread::spawn(move || {
+        blocking_thread = Some(thread::spawn(move || {
             if std::panic::catch_unwind(|| {
                 blocking_recv_reactor(
                     reactor_listener_fd,
@@ -518,7 +538,7 @@ fn notification_loop(
                     io::Error::other("blocking receive reactor panicked"),
                 );
             }
-        });
+        }));
         Some(BlockingRecvQueue {
             tx: blocking_tx,
             wake_fd,
@@ -527,7 +547,7 @@ fn notification_loop(
         None
     };
 
-    loop {
+    'notifications: loop {
         let listener_raw_fd = listener_fd.as_raw_fd();
         match seccomp::notif_recv(listener_raw_fd) {
             Ok(notif) => {
@@ -551,10 +571,10 @@ fn notification_loop(
                                     ),
                                 );
                             }
-                            return;
+                            break 'notifications;
                         }
                         if report_thread_notification_error(&failure, "respond to notification") {
-                            return;
+                            break 'notifications;
                         }
                         continue;
                     }
@@ -575,16 +595,16 @@ fn notification_loop(
                             ),
                         );
                     }
-                    return;
+                    break 'notifications;
                 }
                 if report_thread_notification_error(&failure, "respond to notification") {
-                    return;
+                    break 'notifications;
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
                 if failure.shutting_down.load(Ordering::Acquire) {
-                    return;
+                    break 'notifications;
                 }
                 thread::sleep(Duration::from_millis(1));
                 continue;
@@ -594,8 +614,31 @@ fn notification_loop(
                     eprintln!("yatht: notification loop stopped: {err}");
                 }
                 failure.report("receive seccomp notification", err);
-                return;
+                break 'notifications;
             }
+        }
+    }
+    drop(tx);
+    drop(blocking_queue);
+    join_notification_workers(worker_threads, &failure);
+    if blocking_thread.is_some_and(|thread| thread.join().is_err()) {
+        failure.report(
+            "blocking receive reactor panicked",
+            io::Error::other("blocking receive reactor panicked"),
+        );
+    }
+}
+
+fn join_notification_workers(
+    worker_threads: Vec<thread::JoinHandle<()>>,
+    failure: &NotificationFailure,
+) {
+    for worker in worker_threads {
+        if worker.join().is_err() {
+            failure.report(
+                "seccomp notification worker panicked",
+                io::Error::other("notification worker panicked"),
+            );
         }
     }
 }
@@ -890,6 +933,7 @@ fn blocking_recv_reactor(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
     );
     let (completion_tx, completion_rx) = channel::unbounded::<BlockingRecvCompletion>();
+    let mut worker_threads = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let worker_listener_fd = Arc::clone(&listener_fd);
         let worker_rx = work_rx.clone();
@@ -897,7 +941,7 @@ fn blocking_recv_reactor(
         let worker_wake_fd = Arc::clone(&wake_fd);
         let worker_relays = Arc::clone(&relays);
         let worker_failure = Arc::clone(&failure);
-        thread::spawn(move || {
+        worker_threads.push(thread::spawn(move || {
             blocking_recv_worker(
                 worker_listener_fd,
                 worker_rx,
@@ -906,7 +950,7 @@ fn blocking_recv_reactor(
                 worker_relays,
                 worker_failure,
             )
-        });
+        }));
     }
     drop(completion_tx);
 
@@ -918,7 +962,7 @@ fn blocking_recv_reactor(
     let mut channels_may_have_more = false;
     let mut pollfds = Vec::<libc::pollfd>::new();
 
-    loop {
+    'reactor: loop {
         pollfds.clear();
         pollfds.reserve(pending.len() + 1);
         pollfds.push(libc::pollfd {
@@ -949,13 +993,13 @@ fn blocking_recv_reactor(
                 continue;
             }
             failure.report("poll blocking UDP receives", err);
-            return;
+            break 'reactor;
         }
 
         if pollfds[0].revents & libc::POLLIN != 0 {
             if let Err(err) = drain_eventfd(wake_fd.as_raw_fd()) {
                 failure.report("drain blocking receive wake fd", err);
-                return;
+                break 'reactor;
             }
         }
 
@@ -976,7 +1020,7 @@ fn blocking_recv_reactor(
                     }
                     Err(err) => {
                         failure.report("validate blocking UDP receive", err);
-                        return;
+                        break 'reactor;
                     }
                 }
             }
@@ -996,7 +1040,7 @@ fn blocking_recv_reactor(
                             "blocking receive completion queue disconnected",
                         ),
                     );
-                    return;
+                    break 'reactor;
                 }
             };
             completed += 1;
@@ -1023,7 +1067,7 @@ fn blocking_recv_reactor(
                 }
             }
             if report_thread_notification_error(&failure, "respond to blocking UDP receive") {
-                return;
+                break 'reactor;
             }
         }
 
@@ -1036,7 +1080,7 @@ fn blocking_recv_reactor(
                     terminal_revents: 0,
                 }),
                 Err(channel::TryRecvError::Empty) => break,
-                Err(channel::TryRecvError::Disconnected) => return,
+                Err(channel::TryRecvError::Disconnected) => break 'reactor,
             }
             received += 1;
         }
@@ -1060,13 +1104,22 @@ fn blocking_recv_reactor(
                             "blocking receive work queue disconnected",
                         ),
                     );
-                    return;
+                    break 'reactor;
                 }
             }
         }
 
         channels_may_have_more =
             completed == BLOCKING_RECV_CHANNEL_BUDGET || received == BLOCKING_RECV_CHANNEL_BUDGET;
+    }
+    drop(work_tx);
+    for worker in worker_threads {
+        if worker.join().is_err() {
+            failure.report(
+                "blocking receive worker panicked",
+                io::Error::other("blocking receive worker panicked"),
+            );
+        }
     }
 }
 
