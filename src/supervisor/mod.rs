@@ -39,6 +39,8 @@ const TGID_CACHE_MAX_ENTRIES: usize = 256;
 const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
 const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
 const LOCAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const TARGET_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
+const TARGET_TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 struct NotificationFailure {
     reported: AtomicBool,
@@ -295,12 +297,18 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
 
     let monitor_result = monitor_target_tree(target.child_mut(), &failure_rx, &failure);
     failure.shutting_down.store(true, Ordering::Release);
-    if monitor_result.is_err() {
+    if let Err(monitor_err) = &monitor_result {
         // The notification loop only drains once every seccomp filter user is
         // gone; kill the tree before the joins below so a monitor failure with
-        // a live target cannot hang them, with the armed guard as backstop.
+        // a live target cannot hang them. If bounded cleanup fails, do not enter
+        // an unbounded join while a target may still hold the filter.
         let mut target_status = None;
-        let _ = terminate_target_tree(target.child_mut(), &mut target_status);
+        if let Err(cleanup_err) = terminate_target_tree(target.child_mut(), &mut target_status) {
+            eprintln!(
+                "yatht: {monitor_err:#}; also failed to terminate target tree: {cleanup_err}"
+            );
+            std::process::exit(1);
+        }
     }
     let notification_join_result = notification_thread
         .join()
@@ -371,21 +379,42 @@ fn terminate_target_tree(
     child: &mut Child,
     target_status: &mut Option<ExitStatus>,
 ) -> io::Result<()> {
+    terminate_target_tree_until(
+        child,
+        target_status,
+        Instant::now() + TARGET_TERMINATION_TIMEOUT,
+    )
+}
+
+fn terminate_target_tree_until(
+    child: &mut Child,
+    target_status: &mut Option<ExitStatus>,
+    deadline: Instant,
+) -> io::Result<()> {
     if target_status.is_none() {
         if let Some(status) = child.try_wait()? {
             *target_status = Some(status);
         } else {
             let _ = child.kill();
-            *target_status = Some(child.wait()?);
+            *target_status = Some(wait_for_target_exit(child, deadline)?);
         }
     }
-    terminate_adopted_descendants()
+    terminate_adopted_descendants_until(deadline)
 }
 
+#[cfg(test)]
 fn terminate_adopted_descendants() -> io::Result<()> {
+    terminate_adopted_descendants_until(Instant::now() + TARGET_TERMINATION_TIMEOUT)
+}
+
+fn terminate_adopted_descendants_until(deadline: Instant) -> io::Result<()> {
     loop {
         if !reap_descendants_nonblocking()? {
             return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(termination_timeout("adopted descendants"));
         }
 
         for pid in direct_child_pids(std::process::id())? {
@@ -393,8 +422,43 @@ fn terminate_adopted_descendants() -> io::Result<()> {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
         }
-        thread::sleep(Duration::from_millis(1));
+        sleep_until_next_termination_poll(deadline);
     }
+}
+
+fn wait_for_target_exit(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
+    poll_until_termination(deadline, || child.try_wait(), "target process")
+}
+
+fn poll_until_termination<T>(
+    deadline: Instant,
+    mut poll: impl FnMut() -> io::Result<Option<T>>,
+    subject: &str,
+) -> io::Result<T> {
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(termination_timeout(subject));
+        }
+        sleep_until_next_termination_poll(deadline);
+    }
+}
+
+fn sleep_until_next_termination_poll(deadline: Instant) {
+    let now = Instant::now();
+    if now >= deadline {
+        return;
+    }
+    thread::sleep(TARGET_TERMINATION_POLL_INTERVAL.min(deadline.duration_since(now)));
+}
+
+fn termination_timeout(subject: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("timed out terminating {subject}"),
+    )
 }
 
 fn reap_descendants_nonblocking() -> io::Result<bool> {
@@ -3815,6 +3879,7 @@ fn decode_os_list(raw: &str) -> Result<Vec<OsString>> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
@@ -3859,6 +3924,40 @@ mod tests {
 
         assert_eq!(key.tgid, std::process::id());
         assert_eq!(key.fd, 9);
+    }
+
+    #[test]
+    fn termination_poll_returns_before_deadline() {
+        let attempts = Cell::new(0);
+        let value = poll_until_termination(
+            Instant::now() + Duration::from_secs(1),
+            || {
+                let next = attempts.get() + 1;
+                attempts.set(next);
+                Ok((next == 2).then_some(7_u8))
+            },
+            "test process",
+        )
+        .unwrap();
+
+        assert_eq!(value, 7);
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn termination_poll_reports_expired_deadline() {
+        let attempts = Cell::new(0);
+        let result = poll_until_termination::<()>(
+            Instant::now(),
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(None)
+            },
+            "test process",
+        );
+
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

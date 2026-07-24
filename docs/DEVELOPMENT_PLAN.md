@@ -58,6 +58,11 @@ is `socks5://127.0.0.1:1080`.
   stage.
 - The parent acts as a child subreaper. It preserves the initial target's exit
   status while keeping the listener alive until adopted descendants exit.
+- Failure cleanup sends `SIGKILL` to the target tree and polls the direct child
+  and adopted descendants against one shared one-second deadline. If the tree
+  cannot be reaped or `/proc` enumeration fails, the supervisor reports both
+  the monitoring and cleanup errors and exits before entering notification
+  joins that require every seccomp filter user to be gone.
 - The child stage sets `PR_SET_NO_NEW_PRIVS`, installs a seccomp classic-BPF
   filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`, writes the listener fd number
   to the parent, then `execve`s the requested target after the parent
@@ -146,8 +151,8 @@ direct CIDRs and the configured proxy endpoint.
 ## Test Plan
 
 - Unit tests cover BPF shape, proxy URL parsing, CIDR routing, HTTP CONNECT
-  request generation, SOCKS5 UDP framing, sockaddr parsing, and internal argv
-  encoding.
+  request generation, SOCKS5 UDP framing, sockaddr parsing, internal argv
+  encoding, and bounded target-termination polling.
 - Integration tests cover TCP CONNECT redirection, UDP/53 DNS-over-TCP
   redirection, and generic UDP over SOCKS5 UDP ASSOCIATE using local fake
   proxies. TCP integration also verifies stable socket identity, pre-connect
