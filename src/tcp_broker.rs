@@ -948,24 +948,33 @@ fn flush_socket(
     pending: &mut PendingBuffer,
     resources: &BrokerResources,
 ) -> io::Result<WriteOutcome> {
-    if pending.is_empty() {
-        return Ok(WriteOutcome::Idle);
-    }
-    loop {
+    let mut outcome = WriteOutcome::Idle;
+    while !pending.is_empty() {
+        // `pending()` exposes only the front chunk; the send length must match
+        // that slice, never the multi-chunk total `pending.len()`.
+        let chunk = pending.pending();
+        let chunk_len = chunk.len();
         let rc = unsafe {
             libc::send(
                 stream.as_raw_fd(),
-                pending.pending().as_ptr().cast(),
-                pending.len(),
+                chunk.as_ptr().cast(),
+                chunk_len,
                 libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
             )
         };
         resources.observability.tcp_send();
         if rc > 0 {
-            pending.consume(rc as usize, resources);
-            resources.release_pending(rc as usize);
-            resources.observability.tcp_pending_removed(rc as usize);
-            return Ok(WriteOutcome::Progress);
+            let sent = rc as usize;
+            pending.consume(sent, resources);
+            resources.release_pending(sent);
+            resources.observability.tcp_pending_removed(sent);
+            outcome = WriteOutcome::Progress;
+            if sent < chunk_len {
+                // A partial write means the socket buffer is full; the next
+                // send would only report EAGAIN.
+                break;
+            }
+            continue;
         }
         if rc == 0 {
             return Err(io::Error::new(
@@ -978,10 +987,11 @@ fn flush_socket(
             continue;
         }
         if err.kind() == io::ErrorKind::WouldBlock {
-            return Ok(WriteOutcome::Idle);
+            break;
         }
         return Err(err);
     }
+    Ok(outcome)
 }
 
 fn socket_error(fd: RawFd) -> io::Error {
@@ -1198,6 +1208,55 @@ mod tests {
         let pollfd = relay.target_pollfd(&broker.resources);
         assert_eq!(pollfd.fd, -1);
         assert_eq!(pollfd.events, 0);
+    }
+
+    #[test]
+    fn flushes_multi_chunk_backlog_without_corruption() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (broker_target, _target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+
+        let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            relay.permit.resources.reserve_pending(payload.len()),
+            payload.len()
+        );
+        relay.target_to_upstream.append(&payload, &broker.resources);
+        assert!(relay.target_to_upstream.chunks.len() > 1);
+
+        let length = payload.len();
+        let reader = thread::spawn(move || {
+            let mut received = vec![0_u8; length];
+            remote.read_exact(&mut received).unwrap();
+            received
+        });
+        while !relay.target_to_upstream.is_empty() {
+            let outcome = flush_socket(
+                &relay.upstream,
+                &mut relay.target_to_upstream,
+                &broker.resources,
+            )
+            .unwrap();
+            if outcome == WriteOutcome::Idle {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(reader.join().unwrap(), payload);
+        assert_eq!(broker.resources.pending_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(
+            broker
+                .resources
+                .buffer_capacity_bytes
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
