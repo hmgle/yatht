@@ -35,7 +35,9 @@ from typing import Any, Coroutine
 ROOT = Path(__file__).resolve().parent.parent
 WORKLOAD_SOURCE = ROOT / "benchmarks" / "tcp_broker" / "workload.c"
 DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
-DEFAULT_OUTPUT_ROOT = ROOT / "target" / "tcp-broker-benchmarks"
+# Raw measurement archives must survive `cargo clean`; only the rebuildable
+# workload binary stays under target/.
+DEFAULT_OUTPUT_ROOT = ROOT / "bench-results" / "tcp-broker"
 VARIANT_ORDER = ("direct", "addfd", "stable")
 METRICS_SCHEMA_VERSION = 3
 SAMPLE_INTERVAL_SECONDS = 0.005
