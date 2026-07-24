@@ -600,7 +600,10 @@ def stream_result_is_clean(
 
 
 def require_stream_server_quiescence(run: dict[str, Any]) -> None:
-    if run["mode"] != "stream" or run.get("stream_server_quiescent") is True:
+    if (
+        run["mode"] not in ("stream", "fairness")
+        or run.get("stream_server_quiescent") is True
+    ):
         return
     raise RuntimeError(
         f"stream server did not quiesce after {run['scenario']}/{run['variant']}; "
@@ -674,6 +677,8 @@ def ensure_fd_limit(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         selected_flow_counts.append(args.stream_flows)
     if args.slow_flows > 0:
         selected_flow_counts.append(args.slow_flows)
+    if args.fairness_quiet_flows > 0:
+        selected_flow_counts.append(args.fairness_quiet_flows + 1)
     if args.stalled_flows > 0:
         selected_flow_counts.append(args.stalled_flows)
     max_flows = max(selected_flow_counts)
@@ -834,13 +839,16 @@ def max_field(runs: list[dict[str, Any]], field: str) -> int | None:
     return max(values) if values else None
 
 
-def parse_workload_output(stdout: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def parse_workload_output(
+    stdout: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     records = [json.loads(line) for line in stdout.splitlines() if line.strip()]
     flows = [record for record in records if record.get("event") == "flow"]
+    samples = [record for record in records if record.get("event") == "sample"]
     summaries = [record for record in records if record.get("event") == "workload_summary"]
     if len(summaries) != 1:
         raise ValueError(f"expected one workload summary, got {len(summaries)}")
-    return flows, summaries[0]
+    return flows, samples, summaries[0]
 
 
 def workload_flows_are_valid(flows: list[dict[str, Any]], expected: int) -> bool:
@@ -905,28 +913,41 @@ def variant_command(
     metrics_path: Path | None = None,
     stalled_ready_path: Path | None = None,
 ) -> list[str]:
-    if scenario["mode"] == "stalled":
-        destination_port = servers.stalled_port
-    elif scenario["mode"] == "stream":
-        destination_port = servers.stream_port
+    if scenario["mode"] == "fairness":
+        workload = [
+            str(args.workload),
+            "fairness",
+            "127.0.0.1",
+            str(servers.destination_port),
+            str(servers.stream_port),
+            str(scenario["quiet_flows"]),
+            str(scenario["quiet_iterations"]),
+            str(scenario["value"]),
+            str(scenario["hot_bytes"]),
+        ]
     else:
-        destination_port = servers.destination_port
-    workload = [
-        str(args.workload),
-        scenario["mode"],
-        "127.0.0.1",
-        str(destination_port),
-        str(scenario["flows"]),
-        str(scenario["value"]),
-    ]
-    if scenario["mode"] == "stalled":
-        workload.append(str(scenario["hold_ms"]))
-        if stalled_ready_path is None:
-            raise ValueError("stalled workload requires a ready path")
-        workload.append(str(stalled_ready_path))
-    if scenario["mode"] == "stream":
-        workload.append(scenario["direction"])
-        workload.append(str(scenario["rate"]))
+        if scenario["mode"] == "stalled":
+            destination_port = servers.stalled_port
+        elif scenario["mode"] == "stream":
+            destination_port = servers.stream_port
+        else:
+            destination_port = servers.destination_port
+        workload = [
+            str(args.workload),
+            scenario["mode"],
+            "127.0.0.1",
+            str(destination_port),
+            str(scenario["flows"]),
+            str(scenario["value"]),
+        ]
+        if scenario["mode"] == "stalled":
+            workload.append(str(scenario["hold_ms"]))
+            if stalled_ready_path is None:
+                raise ValueError("stalled workload requires a ready path")
+            workload.append(str(stalled_ready_path))
+        if scenario["mode"] == "stream":
+            workload.append(scenario["direction"])
+            workload.append(str(scenario["rate"]))
     if variant == "direct":
         return workload
     yatht = args.yatht if variant == "stable" else args.addfd_yatht
@@ -956,7 +977,7 @@ def run_one(
         stalled_ready_path = Path(control_dir) / "stalled-ready"
         if scenario["mode"] == "stalled":
             servers.prepare_stalled_run()
-        if scenario["mode"] == "stream":
+        if scenario["mode"] in ("stream", "fairness"):
             servers.prepare_stream_run()
         command = variant_command(
             variant,
@@ -1072,16 +1093,21 @@ def run_one(
     )
     stream_server_results: list[dict[str, Any]] | None = None
     stream_results_complete: bool | None = None
-    if scenario["mode"] == "stream":
+    if scenario["mode"] in ("stream", "fairness"):
+        expected_stream_connections = (
+            scenario["flows"] if scenario["mode"] == "stream" else 1
+        )
         stream_server_results, stream_results_complete = servers.stream_run_results(
-            scenario["flows"]
+            expected_stream_connections
         )
 
     parse_error = None
     try:
-        flows, workload_summary = parse_workload_output(completed.stdout)
+        flows, workload_samples, workload_summary = parse_workload_output(
+            completed.stdout
+        )
     except (json.JSONDecodeError, ValueError) as error:
-        flows, workload_summary = [], {}
+        flows, workload_samples, workload_summary = [], [], {}
         parse_error = str(error)
 
     metric_summary: dict[str, Any] | None = None
@@ -1140,6 +1166,7 @@ def run_one(
     stream_server_connections: int | None = None
     stream_server_violations: int | None = None
     stream_server_quiescent: bool | None = None
+    fairness_quiet_samples: int | None = None
     if scenario["mode"] == "stream":
         assert stream_server_results is not None
         stream_server_connections = len(stream_server_results)
@@ -1163,6 +1190,31 @@ def run_one(
             ok
             and stream_server_connections == scenario["flows"]
             and stream_server_violations == 0
+            and workload_summary.get("bytes") == expected_payload_total
+        )
+    if scenario["mode"] == "fairness":
+        assert stream_server_results is not None
+        stream_server_connections = len(stream_server_results)
+        stream_server_violations = sum(
+            1
+            for result in stream_server_results
+            if not stream_result_is_clean(result, "up", scenario["hot_bytes"])
+        )
+        stream_server_quiescent = (
+            stream_results_complete is True and stream_server_connections == 1
+        )
+        quiet_expected = scenario["quiet_flows"] * scenario["quiet_iterations"]
+        fairness_quiet_samples = sum(
+            1 for sample in workload_samples if sample.get("kind") == "quiet_echo"
+        )
+        expected_payload_total = (
+            scenario["hot_bytes"] + 2 * scenario["value"] * quiet_expected
+        )
+        ok = (
+            ok
+            and stream_server_connections == 1
+            and stream_server_violations == 0
+            and fairness_quiet_samples == quiet_expected
             and workload_summary.get("bytes") == expected_payload_total
         )
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
@@ -1212,6 +1264,7 @@ def run_one(
         "stream_server_connections": stream_server_connections,
         "stream_server_violations": stream_server_violations,
         "stream_server_quiescent": stream_server_quiescent,
+        "fairness_quiet_samples": fairness_quiet_samples,
         "broker_pending_peak_bytes": (
             metric_summary.get("tcp_peak_pending_bytes")
             if scenario["mode"] == "stalled" and metric_summary is not None
@@ -1243,13 +1296,13 @@ def run_one(
     }
     enriched = [
         {
-            **flow,
+            **record,
             "scenario": scenario["name"],
             "variant": variant,
             "measurement_kind": measurement_kind,
             "repetition": repetition,
         }
-        for flow in flows
+        for record in [*flows, *workload_samples]
     ]
     return run, enriched
 
@@ -1294,6 +1347,18 @@ def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "value": args.slow_bytes,
                 "direction": "up",
                 "rate": args.slow_rate,
+            }
+        )
+    if args.fairness_quiet_flows > 0:
+        result.append(
+            {
+                "name": f"fairness-{args.fairness_quiet_flows}-quiet-flows",
+                "mode": "fairness",
+                "flows": args.fairness_quiet_flows + 1,
+                "value": args.fairness_quiet_payload,
+                "quiet_flows": args.fairness_quiet_flows,
+                "quiet_iterations": args.fairness_quiet_iterations,
+                "hot_bytes": args.fairness_hot_bytes,
             }
         )
     if args.stalled_flows > 0:
@@ -1370,6 +1435,33 @@ def summarize(
             for run in valid_runs
             if run.get("bytes") and run.get("child_cpu_ns") is not None
         ]
+        selected_samples = [
+            sample
+            for sample in flow_samples
+            if sample.get("event") == "sample"
+            and sample["scenario"] == scenario
+            and sample["variant"] == variant
+            and sample["measurement_kind"] == "measurement"
+            and (
+                sample["scenario"],
+                sample["variant"],
+                sample["repetition"],
+                sample["measurement_kind"],
+            )
+            in valid_run_keys
+        ]
+        quiet_echo = [
+            sample["latency_ns"]
+            for sample in selected_samples
+            if sample.get("kind") == "quiet_echo"
+        ]
+        hot_goodput = [
+            flow["sent_bytes"] / (flow["total_ns"] / 1_000_000_000)
+            for flow in selected_flows
+            if flow.get("kind") == "hot"
+            and flow.get("sent_bytes")
+            and flow.get("total_ns")
+        ]
         rows.append(
             {
                 "scenario": scenario,
@@ -1394,6 +1486,13 @@ def summarize(
                 ),
                 "child_cpu_ns_per_byte_median": (
                     statistics.median(cpu_per_byte) if cpu_per_byte else None
+                ),
+                "quiet_echo_samples": len(quiet_echo),
+                "quiet_echo_p50_ns": percentile(quiet_echo, 0.50) if quiet_echo else None,
+                "quiet_echo_p95_ns": percentile(quiet_echo, 0.95) if quiet_echo else None,
+                "quiet_echo_p99_ns": percentile(quiet_echo, 0.99) if quiet_echo else None,
+                "hot_goodput_bytes_per_second_median": (
+                    statistics.median(hot_goodput) if hot_goodput else None
                 ),
                 "child_cpu_median_ns": median_field(valid_runs, "child_cpu_ns"),
                 "benchmark_server_cpu_median_ns": median_field(
@@ -1497,6 +1596,10 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "slow_flows": args.slow_flows,
         "slow_bytes": args.slow_bytes,
         "slow_rate_bytes_per_second": args.slow_rate,
+        "fairness_quiet_flows": args.fairness_quiet_flows,
+        "fairness_quiet_iterations": args.fairness_quiet_iterations,
+        "fairness_quiet_payload": args.fairness_quiet_payload,
+        "fairness_hot_bytes": args.fairness_hot_bytes,
         "stalled_flows": args.stalled_flows,
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
@@ -1545,6 +1648,10 @@ def parse_args() -> argparse.Namespace:
     # Per-flow server-side read rate; keeps each slow run within a few seconds
     # while the relay stays under visible backpressure the whole time.
     parser.add_argument("--slow-rate", type=int, default=128 * 1024)
+    parser.add_argument("--fairness-quiet-flows", type=int, default=32)
+    parser.add_argument("--fairness-quiet-iterations", type=int, default=40)
+    parser.add_argument("--fairness-quiet-payload", type=int, default=1024)
+    parser.add_argument("--fairness-hot-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--stalled-flows", type=int, default=128)
     # The proxied chain (kernel socket autotuning on both yatht hops, the 64 KiB
     # relay buffer, and the SOCKS proxy's stream buffers) can absorb several MiB
@@ -1604,6 +1711,18 @@ def parse_args() -> argparse.Namespace:
         args.slow_flows > 0 and (args.slow_bytes <= 0 or args.slow_rate <= 0)
     ):
         parser.error("slow flows must be nonnegative with positive bytes and rate")
+    if args.fairness_quiet_flows < 0 or (
+        args.fairness_quiet_flows > 0
+        and (
+            args.fairness_quiet_iterations <= 0
+            or args.fairness_quiet_payload <= 0
+            or args.fairness_hot_bytes <= 0
+        )
+    ):
+        parser.error(
+            "fairness quiet flows must be nonnegative with positive "
+            "iterations, payload, and hot bytes"
+        )
     if args.stalled_flows < 0 or (args.stalled_flows > 0 and args.stalled_bytes <= 0):
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
@@ -1613,6 +1732,7 @@ def parse_args() -> argparse.Namespace:
         and not args.idle_flows
         and args.stream_flows == 0
         and args.slow_flows == 0
+        and args.fairness_quiet_flows == 0
         and args.stalled_flows == 0
     ):
         parser.error("at least one scenario must be enabled")

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <poll.h>
 #include <stdint.h>
@@ -745,6 +746,269 @@ static int run_stream(const struct endpoint *endpoint, size_t flows,
     return successful == flows ? 0 : 1;
 }
 
+/*
+ * Fairness workload: one hot flow uploads hot_bytes through the stream server
+ * while quiet_flows connections run small echo round trips against the echo
+ * destination, each iteration timed individually. The quiet latency samples
+ * are the measurement; the hot flow exists to contend for the relay.
+ */
+struct fairness_config {
+    const struct endpoint *echo_endpoint;
+    const struct endpoint *stream_endpoint;
+    size_t quiet_payload;
+    size_t hot_bytes;
+    size_t iterations;
+};
+
+struct fairness_flow {
+    pthread_t thread;
+    const struct fairness_config *config;
+    size_t flow;
+    int created;
+    int error;
+    uint64_t connect_ns;
+    uint64_t total_ns;
+    uint64_t sent_bytes;
+    uint64_t *latencies;
+    size_t completed_iterations;
+};
+
+static void *fairness_hot_main(void *raw) {
+    struct fairness_flow *state = raw;
+    const struct fairness_config *config = state->config;
+    uint64_t started = monotonic_ns();
+    int fd = connect_endpoint(config->stream_endpoint, &state->connect_ns);
+    if (fd < 0) {
+        state->error = errno;
+        state->total_ns = monotonic_ns() - started;
+        return NULL;
+    }
+    uint8_t header[STREAM_HEADER_SIZE];
+    memset(header, 0, sizeof(header));
+    memcpy(header, "YBW1", 4);
+    header[4] = 'U';
+    encode_u64le(header + 8, (uint64_t)config->hot_bytes);
+    uint8_t chunk[STREAM_CHUNK_SIZE];
+    memset(chunk, 0x5a, sizeof(chunk));
+    if (write_all(fd, header, sizeof(header)) != 0) {
+        state->error = errno;
+    }
+    size_t remaining = config->hot_bytes;
+    while (state->error == 0 && remaining > 0) {
+        size_t step = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+        if (write_all(fd, chunk, step) != 0) {
+            state->error = errno;
+            break;
+        }
+        state->sent_bytes += step;
+        remaining -= step;
+    }
+    if (state->error == 0 && shutdown(fd, SHUT_WR) != 0) {
+        state->error = errno;
+    }
+    size_t acked = 0;
+    while (state->error == 0) {
+        uint8_t ack = 0;
+        ssize_t count = recv(fd, &ack, 1, 0);
+        if (count > 0) {
+            if (ack != 0xa5 || acked != 0) {
+                state->error = EPROTO;
+                break;
+            }
+            acked = 1;
+            continue;
+        }
+        if (count == 0) {
+            if (acked != 1) {
+                state->error = EIO;
+            }
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        state->error = errno;
+        break;
+    }
+    close(fd);
+    state->total_ns = monotonic_ns() - started;
+    return NULL;
+}
+
+static void *fairness_quiet_main(void *raw) {
+    struct fairness_flow *state = raw;
+    const struct fairness_config *config = state->config;
+    uint64_t started = monotonic_ns();
+    uint8_t *payload = malloc(config->quiet_payload);
+    uint8_t *scratch = malloc(config->quiet_payload);
+    int fd = -1;
+    if (payload == NULL || scratch == NULL) {
+        state->error = ENOMEM;
+        goto out;
+    }
+    memset(payload, 0x5a, config->quiet_payload);
+    fd = connect_endpoint(config->echo_endpoint, &state->connect_ns);
+    if (fd < 0) {
+        state->error = errno;
+        goto out;
+    }
+    for (size_t iteration = 0; iteration < config->iterations; ++iteration) {
+        uint64_t iteration_started = monotonic_ns();
+        if (write_all(fd, payload, config->quiet_payload) != 0) {
+            state->error = errno;
+            goto out;
+        }
+        size_t received = 0;
+        while (received < config->quiet_payload) {
+            ssize_t count = recv(fd, scratch, config->quiet_payload - received, 0);
+            if (count > 0) {
+                for (ssize_t index = 0; index < count; ++index) {
+                    if (scratch[index] != 0x5a) {
+                        state->error = EPROTO;
+                        goto out;
+                    }
+                }
+                received += (size_t)count;
+                continue;
+            }
+            if (count == 0) {
+                state->error = EIO;
+                goto out;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            state->error = errno;
+            goto out;
+        }
+        state->latencies[iteration] = monotonic_ns() - iteration_started;
+        ++state->completed_iterations;
+    }
+    if (shutdown(fd, SHUT_WR) != 0) {
+        state->error = errno;
+        goto out;
+    }
+    for (;;) {
+        ssize_t count = recv(fd, scratch, config->quiet_payload, 0);
+        if (count > 0) {
+            state->error = EPROTO;
+            break;
+        }
+        if (count == 0) {
+            break;
+        }
+        if (errno != EINTR) {
+            state->error = errno;
+            break;
+        }
+    }
+out:
+    free(payload);
+    free(scratch);
+    if (fd >= 0) {
+        close(fd);
+    }
+    state->total_ns = monotonic_ns() - started;
+    return NULL;
+}
+
+static int run_fairness(const struct endpoint *echo_endpoint,
+                        const struct endpoint *stream_endpoint,
+                        size_t quiet_flows, size_t iterations,
+                        size_t quiet_payload, size_t hot_bytes) {
+    struct fairness_config config = {
+        .echo_endpoint = echo_endpoint,
+        .stream_endpoint = stream_endpoint,
+        .quiet_payload = quiet_payload,
+        .hot_bytes = hot_bytes,
+        .iterations = iterations,
+    };
+    size_t total_flows = quiet_flows + 1;
+    struct fairness_flow *states = calloc(total_flows, sizeof(*states));
+    uint64_t *latency_storage = calloc(quiet_flows * iterations, sizeof(uint64_t));
+    if (states == NULL || latency_storage == NULL) {
+        perror("calloc");
+        free(states);
+        free(latency_storage);
+        return 2;
+    }
+    for (size_t flow = 0; flow < total_flows; ++flow) {
+        struct fairness_flow *state = &states[flow];
+        state->config = &config;
+        state->flow = flow;
+        if (flow > 0) {
+            state->latencies = latency_storage + (flow - 1) * iterations;
+        }
+        void *(*entry)(void *) = flow == 0 ? fairness_hot_main : fairness_quiet_main;
+        int rc = pthread_create(&state->thread, NULL, entry, state);
+        if (rc != 0) {
+            state->error = rc;
+        } else {
+            state->created = 1;
+        }
+    }
+    for (size_t flow = 0; flow < total_flows; ++flow) {
+        if (states[flow].created) {
+            pthread_join(states[flow].thread, NULL);
+        }
+    }
+
+    size_t successful = 0;
+    uint64_t total_bytes = 0;
+    for (size_t flow = 0; flow < total_flows; ++flow) {
+        struct fairness_flow *state = &states[flow];
+        int ok = state->error == 0 &&
+                 (flow == 0 ? state->sent_bytes == hot_bytes
+                            : state->completed_iterations == iterations);
+        if (ok) {
+            ++successful;
+            if (flow == 0) {
+                total_bytes += state->sent_bytes;
+            } else {
+                total_bytes += (uint64_t)quiet_payload * iterations * 2;
+            }
+        }
+        if (flow == 0) {
+            printf("{\"event\":\"flow\",\"flow\":0,\"kind\":\"hot\",\"ok\":%s,"
+                   "\"errno\":%d,\"connect_ns\":%" PRIu64 ",\"total_ns\":%" PRIu64
+                   ",\"sent_bytes\":%" PRIu64 "}\n",
+                   ok ? "true" : "false", state->error, state->connect_ns,
+                   state->total_ns, state->sent_bytes);
+        } else {
+            printf("{\"event\":\"flow\",\"flow\":%zu,\"kind\":\"quiet\",\"ok\":%s,"
+                   "\"errno\":%d,\"connect_ns\":%" PRIu64 ",\"total_ns\":%" PRIu64
+                   ",\"iterations\":%zu}\n",
+                   flow, ok ? "true" : "false", state->error, state->connect_ns,
+                   state->total_ns, state->completed_iterations);
+            if (ok) {
+                for (size_t iteration = 0; iteration < iterations; ++iteration) {
+                    printf("{\"event\":\"sample\",\"kind\":\"quiet_echo\","
+                           "\"flow\":%zu,\"iteration\":%zu,\"latency_ns\":%" PRIu64
+                           "}\n",
+                           flow, iteration, state->latencies[iteration]);
+                }
+            }
+        }
+    }
+    free(states);
+    free(latency_storage);
+
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        perror("getrusage");
+        return 2;
+    }
+    printf("{\"event\":\"workload_summary\",\"mode\":\"fairness\","
+           "\"flows\":%zu,\"successful\":%zu,\"bytes\":%" PRIu64
+           ",\"quiet_flows\":%zu,\"quiet_iterations\":%zu"
+           ",\"quiet_payload_bytes\":%zu,\"hot_bytes\":%zu"
+           ",\"user_cpu_ns\":%" PRIu64 ",\"system_cpu_ns\":%" PRIu64 "}\n",
+           total_flows, successful, total_bytes, quiet_flows, iterations,
+           quiet_payload, hot_bytes, timeval_ns(usage.ru_utime),
+           timeval_ns(usage.ru_stime));
+    return successful == total_flows ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc < 6) {
@@ -752,9 +1016,29 @@ int main(int argc, char **argv) {
                 "usage: %s request HOST PORT FLOWS PAYLOAD_BYTES\n"
                 "       %s idle HOST PORT FLOWS HOLD_MS\n"
                 "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS READY_PATH\n"
-                "       %s stream HOST PORT FLOWS BYTES_PER_FLOW DIRECTION RATE_BYTES_PER_SECOND\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                "       %s stream HOST PORT FLOWS BYTES_PER_FLOW DIRECTION RATE_BYTES_PER_SECOND\n"
+                "       %s fairness HOST ECHO_PORT STREAM_PORT QUIET_FLOWS QUIET_ITERATIONS QUIET_PAYLOAD_BYTES HOT_BYTES\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
+    }
+    if (strcmp(argv[1], "fairness") == 0) {
+        if (argc != 9) {
+            fprintf(stderr,
+                    "fairness requires HOST ECHO_PORT STREAM_PORT QUIET_FLOWS "
+                    "QUIET_ITERATIONS QUIET_PAYLOAD_BYTES HOT_BYTES\n");
+            return 2;
+        }
+        struct endpoint echo_endpoint = resolve_endpoint(argv[2], argv[3]);
+        struct endpoint stream_endpoint = resolve_endpoint(argv[2], argv[4]);
+        size_t quiet_payload = parse_size(argv[7], "quiet payload bytes");
+        if (quiet_payload == 0) {
+            fprintf(stderr, "quiet payload must be positive\n");
+            return 2;
+        }
+        return run_fairness(&echo_endpoint, &stream_endpoint,
+                            parse_size(argv[5], "quiet flows"),
+                            parse_size(argv[6], "quiet iterations"),
+                            quiet_payload, parse_size(argv[8], "hot bytes"));
     }
     struct endpoint endpoint = resolve_endpoint(argv[2], argv[3]);
     size_t flows = parse_size(argv[4], "flows");

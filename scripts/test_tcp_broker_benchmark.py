@@ -603,9 +603,10 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertEqual(
                         completed.returncode, 0, msg=completed.stderr[-500:]
                     )
-                    flow_records, summary = benchmark.parse_workload_output(
+                    flow_records, samples, summary = benchmark.parse_workload_output(
                         completed.stdout
                     )
+                    self.assertEqual(samples, [])
                     self.assertTrue(
                         benchmark.workload_flows_are_valid(flow_records, flows)
                     )
@@ -622,6 +623,63 @@ class BenchmarkTests(unittest.TestCase):
                                 result, direction, payload
                             )
                         )
+        finally:
+            servers.stop()
+
+    @unittest.skipIf(shutil.which("cc") is None, "cc not available")
+    def test_workload_fairness_roundtrip(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=10)
+        servers.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workload = Path(directory) / "workload"
+                benchmark.build_workload("cc", workload)
+                quiet_flows, iterations, payload, hot_bytes = 3, 5, 512, 100000
+                servers.prepare_stream_run()
+                completed = subprocess.run(
+                    [
+                        str(workload),
+                        "fairness",
+                        "127.0.0.1",
+                        str(servers.destination_port),
+                        str(servers.stream_port),
+                        str(quiet_flows),
+                        str(iterations),
+                        str(payload),
+                        str(hot_bytes),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(completed.returncode, 0, msg=completed.stderr[-500:])
+                flow_records, samples, summary = benchmark.parse_workload_output(
+                    completed.stdout
+                )
+                self.assertTrue(
+                    benchmark.workload_flows_are_valid(flow_records, quiet_flows + 1)
+                )
+                kinds = {record["flow"]: record["kind"] for record in flow_records}
+                self.assertEqual(kinds[0], "hot")
+                self.assertEqual(
+                    [kinds[flow] for flow in range(1, quiet_flows + 1)],
+                    ["quiet"] * quiet_flows,
+                )
+                self.assertEqual(len(samples), quiet_flows * iterations)
+                self.assertTrue(
+                    all(sample["kind"] == "quiet_echo" for sample in samples)
+                )
+                self.assertTrue(all(sample["latency_ns"] > 0 for sample in samples))
+                self.assertEqual(
+                    summary["bytes"],
+                    hot_bytes + 2 * payload * quiet_flows * iterations,
+                )
+                results, complete = servers.stream_run_results(1)
+                self.assertTrue(complete)
+                self.assertEqual(len(results), 1)
+                self.assertTrue(
+                    benchmark.stream_result_is_clean(results[0], "up", hot_bytes)
+                )
         finally:
             servers.stop()
 
