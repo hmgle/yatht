@@ -409,7 +409,7 @@ static int run_stalled(const struct endpoint *endpoint, size_t flows,
     }
     printf("{\"event\":\"workload_summary\",\"mode\":\"stalled\","
            "\"flows\":%zu,\"successful\":%zu,\"bytes\":%" PRIu64
-           ",\"blocked_flows\":%zu,\"hold_ms\":%zu,\"released\":true"
+           ",\"blocked_flows\":%zu,\"hold_ms\":%zu"
            ",\"user_cpu_ns\":%" PRIu64 ",\"system_cpu_ns\":%" PRIu64 "}\n",
            flows, successful, total_bytes, blocked_flows, hold_ms,
            timeval_ns(usage.ru_utime), timeval_ns(usage.ru_stime));

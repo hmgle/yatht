@@ -743,7 +743,6 @@ def run_one(
             and stalled_ready_flows == scenario["flows"]
             and stalled_released
             and workload_summary.get("blocked_flows") == scenario["flows"]
-            and workload_summary.get("released") is True
         )
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
@@ -1060,7 +1059,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-flows", type=comma_sizes, default=comma_sizes("1000"))
     parser.add_argument("--idle-hold-ms", type=int, default=100)
     parser.add_argument("--stalled-flows", type=int, default=128)
-    parser.add_argument("--stalled-bytes", type=int, default=1024 * 1024)
+    # The proxied chain (kernel socket autotuning on both yatht hops, the 64 KiB
+    # relay buffer, and the SOCKS proxy's stream buffers) can absorb several MiB
+    # per flow on distributions with large tcp_rmem/tcp_wmem defaults; the
+    # per-flow budget must exceed that or flows never observe EAGAIN.
+    parser.add_argument("--stalled-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--stalled-hold-ms", type=int, default=250)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
