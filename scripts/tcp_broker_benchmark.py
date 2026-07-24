@@ -37,6 +37,11 @@ DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
 DEFAULT_OUTPUT_ROOT = ROOT / "target" / "tcp-broker-benchmarks"
 VARIANT_ORDER = ("direct", "addfd", "stable")
 METRICS_SCHEMA_VERSION = 3
+SAMPLE_INTERVAL_SECONDS = 0.005
+# Walking /proc for the whole process tree at 5 ms is a measurable observer
+# effect with thousands of flows; per-role samples stay at 5 ms while the tree
+# aggregate is refreshed every TREE_SAMPLE_STRIDE iterations.
+TREE_SAMPLE_STRIDE = 20
 
 
 class BenchmarkServers:
@@ -438,6 +443,9 @@ def host_cpu_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, i
     }
 
 
+_SAMPLE_DENIED_WARNED: set[int] = set()
+
+
 def process_resources(pid: int) -> dict[str, int] | None:
     try:
         status = Path(f"/proc/{pid}/status").read_text().splitlines()
@@ -449,7 +457,18 @@ def process_resources(pid: int) -> dict[str, int] | None:
             "rss_hwm_kib": int(hwm_line.split()[1]),
             "fds": fd_count,
         }
-    except (OSError, StopIteration):
+    except PermissionError:
+        # Unlike an exit race this hides the process for the whole run (for
+        # example hidepid or a setuid target); say so once instead of silently
+        # reporting null peaks.
+        if pid not in _SAMPLE_DENIED_WARNED:
+            _SAMPLE_DENIED_WARNED.add(pid)
+            print(
+                f"warning: cannot sample /proc/{pid}: permission denied",
+                file=sys.stderr,
+            )
+        return None
+    except (OSError, StopIteration, ValueError):
         return None
 
 
@@ -668,6 +687,7 @@ def run_one(
                 else:
                     supervisor_pid = process.pid
                 deadline = time.monotonic() + args.timeout
+                iteration = 0
                 while process.poll() is None:
                     if supervisor_pid is not None:
                         update_process_peak(supervisor_peaks, process_resources(supervisor_pid))
@@ -678,20 +698,22 @@ def run_one(
                     if target_pid is not None:
                         update_process_peak(target_peaks, process_resources(target_pid))
                     update_process_peak(server_peaks, process_resources(os.getpid()))
-                    tree_samples = [
-                        sample
-                        for pid in process_tree_pids(process.pid)
-                        if (sample := process_resources(pid)) is not None
-                    ]
-                    if tree_samples:
-                        tree_rss = sum(sample["rss_kib"] for sample in tree_samples)
-                        tree_fds = sum(sample["fds"] for sample in tree_samples)
-                        process_tree_rss_sampled_peak_kib = max(
-                            process_tree_rss_sampled_peak_kib or 0, tree_rss
-                        )
-                        process_tree_fd_sampled_peak = max(
-                            process_tree_fd_sampled_peak or 0, tree_fds
-                        )
+                    if iteration % TREE_SAMPLE_STRIDE == 0:
+                        tree_samples = [
+                            sample
+                            for pid in process_tree_pids(process.pid)
+                            if (sample := process_resources(pid)) is not None
+                        ]
+                        if tree_samples:
+                            tree_rss = sum(sample["rss_kib"] for sample in tree_samples)
+                            tree_fds = sum(sample["fds"] for sample in tree_samples)
+                            process_tree_rss_sampled_peak_kib = max(
+                                process_tree_rss_sampled_peak_kib or 0, tree_rss
+                            )
+                            process_tree_fd_sampled_peak = max(
+                                process_tree_fd_sampled_peak or 0, tree_fds
+                            )
+                    iteration += 1
                     now = time.monotonic()
                     if scenario["mode"] == "stalled" and not stalled_ready:
                         if stalled_ready_path.exists():
@@ -711,7 +733,7 @@ def run_one(
                         timed_out = True
                         terminate_process_group(process)
                         break
-                    time.sleep(0.005)
+                    time.sleep(SAMPLE_INTERVAL_SECONDS)
             finally:
                 if scenario["mode"] == "stalled" and not stalled_released:
                     servers.release_stalled_run()
@@ -1056,7 +1078,10 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "random_seed": args.seed,
         "estimated_fd_limit": args.estimated_fd_limit,
         "resource_sampling": {
-            "interval_ms": 5,
+            "interval_ms": int(SAMPLE_INTERVAL_SECONDS * 1000),
+            "process_tree_interval_ms": int(
+                SAMPLE_INTERVAL_SECONDS * 1000 * TREE_SAMPLE_STRIDE
+            ),
             "direct_target_role": "root process",
             "proxied_supervisor_role": "root process",
             "proxied_target_role": "first direct child",

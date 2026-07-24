@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import socket
@@ -103,6 +105,25 @@ class BenchmarkTests(unittest.TestCase):
         with mock.patch.object(benchmark.Path, "read_text", side_effect=error):
             self.assertIsNone(benchmark.process_resources(123))
             self.assertEqual(benchmark.direct_child_pids(123), [])
+
+    def test_malformed_status_lines_are_treated_as_missing_samples(self) -> None:
+        status = "VmRSS:\tgarbage\nVmHWM:\t1 kB\n"
+        with (
+            mock.patch.object(benchmark.Path, "read_text", return_value=status),
+            mock.patch.object(benchmark.Path, "iterdir", return_value=iter([])),
+        ):
+            self.assertIsNone(benchmark.process_resources(123))
+
+    def test_permission_denied_samples_return_null_and_warn_once(self) -> None:
+        error = PermissionError(13, "Permission denied")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(benchmark.Path, "read_text", side_effect=error),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertIsNone(benchmark.process_resources(424242))
+            self.assertIsNone(benchmark.process_resources(424242))
+        self.assertEqual(stderr.getvalue().count("cannot sample /proc/424242"), 1)
 
     def test_flow_ids_must_cover_expected_range(self) -> None:
         valid = [{"flow": 0, "ok": True}, {"flow": 1, "ok": True}]
