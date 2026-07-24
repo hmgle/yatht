@@ -301,9 +301,12 @@ def executable(value: str) -> str:
 
 
 def git_commit(value: str) -> str:
-    resolved = command_output(["git", "rev-parse", "--verify", f"{value}^{{commit}}"])
+    resolved = command_output(
+        ["git", "rev-parse", "--verify", f"{value}^{{commit}}"],
+        cwd=ROOT,
+    )
     if resolved is None:
-        raise argparse.ArgumentTypeError(f"git commit not found: {value}")
+        raise argparse.ArgumentTypeError(f"git commit not found in {ROOT}: {value}")
     return resolved
 
 
@@ -964,7 +967,7 @@ def summarize(
     return rows
 
 
-def command_output(command: list[str]) -> str | None:
+def command_output(command: list[str], cwd: Path | None = None) -> str | None:
     try:
         return subprocess.run(
             command,
@@ -972,6 +975,7 @@ def command_output(command: list[str]) -> str | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=True,
+            cwd=cwd,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -993,8 +997,9 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
     return {
         "schema_version": 2,
         "created_unix_ns": time.time_ns(),
-        "git_commit": command_output(["git", "rev-parse", "HEAD"]),
-        "git_status": command_output(["git", "status", "--short"]),
+        "git_commit": command_output(["git", "rev-parse", "HEAD"], cwd=ROOT),
+        "git_status": command_output(["git", "status", "--short"], cwd=ROOT),
+        "git_root": str(ROOT),
         "uname": command_output(["uname", "-a"]),
         "rustc": command_output(["rustc", "--version"]),
         "cc": command_output([args.cc, "--version"]),
@@ -1073,7 +1078,11 @@ def parse_args() -> argparse.Namespace:
             args.yatht = executable(args.yatht)
         except argparse.ArgumentTypeError as error:
             parser.error(str(error))
-        args.yatht_commit = args.yatht_commit or git_commit("HEAD")
+        if args.yatht_commit is None:
+            try:
+                args.yatht_commit = git_commit("HEAD")
+            except argparse.ArgumentTypeError as error:
+                parser.error(f"cannot resolve default --yatht-commit: {error}")
     else:
         args.yatht = None
         args.yatht_commit = None
@@ -1116,7 +1125,7 @@ def main() -> None:
     metrics_dir = output_dir / "metrics"
     metrics_dir.mkdir()
     dirty_diff_path = output_dir / "workspace.diff"
-    dirty_diff = command_output(["git", "diff", "--binary", "HEAD"])
+    dirty_diff = command_output(["git", "diff", "--binary", "HEAD"], cwd=ROOT)
     dirty_diff_path.write_text((dirty_diff or "") + "\n")
     (output_dir / "environment.json").write_text(
         json.dumps(environment_metadata(args, dirty_diff_path), indent=2, sort_keys=True) + "\n"

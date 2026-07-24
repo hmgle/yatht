@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -83,6 +84,16 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(len(benchmark.git_commit("HEAD")), 40)
         with self.assertRaises(benchmark.argparse.ArgumentTypeError):
             benchmark.git_commit("definitely-not-a-commit")
+
+    def test_git_commit_resolves_from_repo_root_regardless_of_cwd(self) -> None:
+        expected = benchmark.git_commit("HEAD")
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                self.assertEqual(benchmark.git_commit("HEAD"), expected)
+            finally:
+                os.chdir(previous)
 
     def test_missing_process_resources_are_null(self) -> None:
         self.assertIsNone(benchmark.process_resources(2**31 - 1))
