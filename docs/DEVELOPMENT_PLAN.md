@@ -172,9 +172,11 @@ cargo test
   `VmHWM`/sampled fd peaks, and stable-broker diagnostics under `target/`.
   Stalled runs set the same small application send buffer for every variant,
   pause destination transport reads, require every flow to report `EAGAIN`,
-  hold for the requested interval, then release and drain all bytes. A failed
-  warmup, measurement, diagnostic, malformed metric line, or incomplete flow
-  set remains in the artifacts and fails the run gate.
+  hold for the requested interval, then release and drain all bytes while the
+  destination verifies the drained payload pattern, per-flow byte totals, and
+  clean end of stream. A failed warmup, measurement, diagnostic, malformed
+  metric line, incomplete flow set, or corrupted or short drain remains in
+  the artifacts and fails the run gate.
 
 ```sh
 cargo build --release --locked

@@ -44,6 +44,10 @@ SAMPLE_INTERVAL_SECONDS = 0.005
 # aggregate is refreshed every TREE_SAMPLE_STRIDE iterations.
 TREE_SAMPLE_STRIDE = 20
 SERVER_CALL_TIMEOUT_SECONDS = 5
+# workload.c fills every payload byte with 0x5a; the stalled destination
+# verifies the drained stream against it so relay corruption that conserves
+# byte counts still fails the run gate.
+STALLED_PAYLOAD_BYTE = 0x5A
 
 
 class BenchmarkServers:
@@ -61,6 +65,7 @@ class BenchmarkServers:
         )
         self.error: BaseException | None = None
         self.stalled_release: asyncio.Event | None = None
+        self.stalled_results: list[dict[str, int | bool]] | None = None
         self.connection_tasks: set[asyncio.Task[None]] = set()
         self.connection_writers: set[asyncio.StreamWriter] = set()
         self.safety_timeout = safety_timeout
@@ -125,6 +130,17 @@ class BenchmarkServers:
 
     async def _prepare_stalled_run(self) -> None:
         self.stalled_release = asyncio.Event()
+        self.stalled_results = []
+
+    def stalled_run_results(self) -> list[dict[str, int | bool]]:
+        if self.loop is None:
+            raise RuntimeError("benchmark servers are not running")
+        return list(self._run_on_loop(self._stalled_run_results(), self.loop))
+
+    async def _stalled_run_results(self) -> list[dict[str, int | bool]]:
+        if self.stalled_results is None:
+            raise RuntimeError("stalled run was not prepared")
+        return list(self.stalled_results)
 
     def release_stalled_run(self) -> None:
         if self.loop is not None and self.stalled_release is not None:
@@ -299,17 +315,30 @@ class BenchmarkServers:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        # Bind the connection to the run that prepared it: a straggler from a
+        # timed-out run must not pollute the next run's verification results.
+        results = self.stalled_results
+        received = 0
+        content_ok = True
+        saw_eof = False
         try:
             release = self.stalled_release
-            if release is None:
+            if release is None or results is None:
                 raise RuntimeError("stalled run was not prepared")
             await asyncio.wait_for(release.wait(), timeout=self.safety_timeout)
             writer.transport.resume_reading()
-            while await reader.read(65536):
-                pass
+            while data := await reader.read(65536):
+                received += len(data)
+                if data.count(STALLED_PAYLOAD_BYTE) != len(data):
+                    content_ok = False
+            saw_eof = True
         except (ConnectionError, asyncio.TimeoutError, asyncio.CancelledError):
             pass
         finally:
+            if results is not None:
+                results.append(
+                    {"bytes": received, "content_ok": content_ok, "eof": saw_eof}
+                )
             writer.close()
             with suppress(ConnectionError, OSError):
                 await writer.wait_closed()
@@ -763,6 +792,9 @@ def run_one(
     host_cpu_after = host_cpu_ticks()
     benchmark_server_cpu_ns = servers.cpu_ns() - benchmark_server_before
     child_delta_ns = child_cpu_ns() - child_before
+    stalled_server_results = (
+        servers.stalled_run_results() if scenario["mode"] == "stalled" else None
+    )
 
     parse_error = None
     try:
@@ -793,13 +825,32 @@ def run_one(
         and parse_error is None
         and workload_flows_are_valid(flows, scenario["flows"])
     )
+    stalled_server_connections: int | None = None
+    stalled_server_corrupt_connections: int | None = None
+    stalled_server_byte_mismatch_connections: int | None = None
+    stalled_server_incomplete_connections: int | None = None
     if scenario["mode"] == "stalled":
+        assert stalled_server_results is not None
+        stalled_server_connections = len(stalled_server_results)
+        stalled_server_corrupt_connections = sum(
+            1 for result in stalled_server_results if not result["content_ok"]
+        )
+        stalled_server_byte_mismatch_connections = sum(
+            1 for result in stalled_server_results if result["bytes"] != scenario["value"]
+        )
+        stalled_server_incomplete_connections = sum(
+            1 for result in stalled_server_results if not result["eof"]
+        )
         ok = (
             ok
             and stalled_ready
             and stalled_ready_flows == scenario["flows"]
             and stalled_released
             and workload_summary.get("blocked_flows") == scenario["flows"]
+            and stalled_server_connections == scenario["flows"]
+            and stalled_server_corrupt_connections == 0
+            and stalled_server_byte_mismatch_connections == 0
+            and stalled_server_incomplete_connections == 0
         )
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
@@ -840,6 +891,10 @@ def run_one(
             if scenario["mode"] == "stalled"
             else None
         ),
+        "stalled_server_connections": stalled_server_connections,
+        "stalled_server_corrupt_connections": stalled_server_corrupt_connections,
+        "stalled_server_byte_mismatch_connections": stalled_server_byte_mismatch_connections,
+        "stalled_server_incomplete_connections": stalled_server_incomplete_connections,
         "broker_pending_peak_bytes": (
             metric_summary.get("tcp_peak_pending_bytes")
             if scenario["mode"] == "stalled" and metric_summary is not None
@@ -1243,6 +1298,10 @@ def main() -> None:
                                     "stalled_ready_flows",
                                     "stalled_released",
                                     "application_backpressure_confirmed",
+                                    "stalled_server_connections",
+                                    "stalled_server_corrupt_connections",
+                                    "stalled_server_byte_mismatch_connections",
+                                    "stalled_server_incomplete_connections",
                                     "successful_flows",
                                     "parse_error",
                                     "stderr",

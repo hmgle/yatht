@@ -239,6 +239,49 @@ class BenchmarkTests(unittest.TestCase):
             connection.close()
             servers.stop()
 
+    def test_stalled_server_verifies_drained_content_and_totals(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stalled_run()
+            payload = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 70000
+            with socket.create_connection(
+                ("127.0.0.1", servers.stalled_port), timeout=5
+            ) as connection:
+                servers.release_stalled_run()
+                connection.sendall(payload)
+                connection.shutdown(socket.SHUT_WR)
+                self.assertEqual(connection.recv(1), b"")
+            self.assertEqual(
+                servers.stalled_run_results(),
+                [{"bytes": len(payload), "content_ok": True, "eof": True}],
+            )
+
+            servers.prepare_stalled_run()
+            self.assertEqual(servers.stalled_run_results(), [])
+        finally:
+            servers.stop()
+
+    def test_stalled_server_flags_corrupted_drain(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stalled_run()
+            filler = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 1000
+            with socket.create_connection(
+                ("127.0.0.1", servers.stalled_port), timeout=5
+            ) as connection:
+                servers.release_stalled_run()
+                connection.sendall(filler + b"\x00" + filler)
+                connection.shutdown(socket.SHUT_WR)
+                self.assertEqual(connection.recv(1), b"")
+            self.assertEqual(
+                servers.stalled_run_results(),
+                [{"bytes": 2001, "content_ok": False, "eof": True}],
+            )
+        finally:
+            servers.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
