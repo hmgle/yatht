@@ -11,7 +11,7 @@ use crossbeam_channel as channel;
 use serde::Serialize;
 
 const METRIC_QUEUE_CAPACITY: usize = 4096;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Default)]
 pub struct Observability {
@@ -198,10 +198,10 @@ struct RunSummary {
     tcp_recv_syscalls: u64,
     tcp_send_syscalls: u64,
     tcp_command_wakeups: u64,
-    poll_calls: u64,
-    poll_ready_returns: u64,
-    poll_ready_fds: u64,
-    no_progress_iterations: u64,
+    tcp_poll_calls: u64,
+    tcp_poll_ready_returns: u64,
+    tcp_poll_ready_fds: u64,
+    tcp_no_progress_iterations: u64,
     tcp_half_closes: u64,
     tcp_resets: u64,
     tcp_flow_failures: u64,
@@ -324,10 +324,10 @@ impl ObservabilityRuntime {
             tcp_recv_syscalls: inner.tcp_recv_syscalls.load(Ordering::Relaxed),
             tcp_send_syscalls: inner.tcp_send_syscalls.load(Ordering::Relaxed),
             tcp_command_wakeups: inner.tcp_command_wakeups.load(Ordering::Relaxed),
-            poll_calls: inner.tcp_poll_calls.load(Ordering::Relaxed),
-            poll_ready_returns: inner.tcp_poll_ready_returns.load(Ordering::Relaxed),
-            poll_ready_fds: inner.tcp_poll_ready_fds.load(Ordering::Relaxed),
-            no_progress_iterations: inner.tcp_no_progress_iterations.load(Ordering::Relaxed),
+            tcp_poll_calls: inner.tcp_poll_calls.load(Ordering::Relaxed),
+            tcp_poll_ready_returns: inner.tcp_poll_ready_returns.load(Ordering::Relaxed),
+            tcp_poll_ready_fds: inner.tcp_poll_ready_fds.load(Ordering::Relaxed),
+            tcp_no_progress_iterations: inner.tcp_no_progress_iterations.load(Ordering::Relaxed),
             tcp_half_closes: inner.tcp_half_closes.load(Ordering::Relaxed),
             tcp_resets: inner.tcp_resets.load(Ordering::Relaxed),
             tcp_flow_failures: inner.tcp_flow_failures.load(Ordering::Relaxed),

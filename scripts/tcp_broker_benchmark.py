@@ -36,6 +36,7 @@ WORKLOAD_SOURCE = ROOT / "benchmarks" / "tcp_broker" / "workload.c"
 DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
 DEFAULT_OUTPUT_ROOT = ROOT / "target" / "tcp-broker-benchmarks"
 VARIANT_ORDER = ("direct", "addfd", "stable")
+METRICS_SCHEMA_VERSION = 3
 
 
 class BenchmarkServers:
@@ -746,6 +747,7 @@ def run_one(
     if metrics_path is not None:
         ok = ok and metric_summary is not None and not metric_parse_errors
         if metric_summary is not None:
+            ok = ok and metric_summary.get("schema_version") == METRICS_SCHEMA_VERSION
             ok = ok and metric_summary.get("tcp_setup_completed") == scenario["flows"]
             ok = ok and metric_summary.get("tcp_active_flows") == 0
             ok = ok and metric_summary.get("tcp_pending_bytes") == 0

@@ -1177,10 +1177,10 @@ mod tests {
         assert_eq!(summary["tcp_flow_failures"], 0);
         assert_eq!(summary["tcp_flows_cancelled"], 0);
         assert!(summary["tcp_command_wakeups"].as_u64().unwrap() > 0);
-        assert!(summary["poll_calls"].as_u64().unwrap() > 0);
-        assert!(summary["poll_ready_returns"].as_u64().unwrap() > 0);
-        assert!(summary["poll_ready_fds"].as_u64().unwrap() > 0);
-        assert_eq!(summary["no_progress_iterations"], 0);
+        assert!(summary["tcp_poll_calls"].as_u64().unwrap() > 0);
+        assert!(summary["tcp_poll_ready_returns"].as_u64().unwrap() > 0);
+        assert!(summary["tcp_poll_ready_fds"].as_u64().unwrap() > 0);
+        assert_eq!(summary["tcp_no_progress_iterations"], 0);
     }
 
     #[test]
