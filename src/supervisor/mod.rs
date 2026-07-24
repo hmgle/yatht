@@ -295,6 +295,13 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
 
     let monitor_result = monitor_target_tree(target.child_mut(), &failure_rx, &failure);
     failure.shutting_down.store(true, Ordering::Release);
+    if monitor_result.is_err() {
+        // The notification loop only drains once every seccomp filter user is
+        // gone; kill the tree before the joins below so a monitor failure with
+        // a live target cannot hang them, with the armed guard as backstop.
+        let mut target_status = None;
+        let _ = terminate_target_tree(target.child_mut(), &mut target_status);
+    }
     let notification_join_result = notification_thread
         .join()
         .map_err(|_| anyhow!("seccomp notification thread panicked"));
