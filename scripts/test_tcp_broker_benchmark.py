@@ -7,7 +7,9 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shutil
 import socket
+import subprocess
 import tempfile
 import time
 import unittest
@@ -366,6 +368,260 @@ class BenchmarkTests(unittest.TestCase):
                 servers.stalled_run_results(),
                 [{"bytes": 2001, "content_ok": False, "eof": True}],
             )
+        finally:
+            servers.stop()
+
+    @staticmethod
+    def stream_header(direction: str, payload: int, rate: int = 0) -> bytes:
+        return benchmark.STREAM_HEADER.pack(
+            benchmark.STREAM_MAGIC, ord(direction), payload, rate, 0
+        )
+
+    def test_stream_server_upload_verifies_bytes_and_acks(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            payload = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 200000
+            with socket.create_connection(
+                ("127.0.0.1", servers.stream_port), timeout=5
+            ) as connection:
+                connection.sendall(self.stream_header("U", len(payload)) + payload)
+                connection.shutdown(socket.SHUT_WR)
+                self.assertEqual(
+                    connection.recv(1), bytes([benchmark.STREAM_ACK_BYTE])
+                )
+                self.assertEqual(connection.recv(1), b"")
+            results, complete = servers.stream_run_results(1)
+            self.assertTrue(complete)
+            self.assertTrue(
+                benchmark.stream_result_is_clean(results[0], "up", len(payload))
+            )
+        finally:
+            servers.stop()
+
+    def test_stream_server_download_sends_exact_payload(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            expected = 150000
+            with socket.create_connection(
+                ("127.0.0.1", servers.stream_port), timeout=5
+            ) as connection:
+                connection.sendall(self.stream_header("D", expected))
+                connection.shutdown(socket.SHUT_WR)
+                received = bytearray()
+                while chunk := connection.recv(65536):
+                    received.extend(chunk)
+            self.assertEqual(len(received), expected)
+            self.assertEqual(
+                received.count(benchmark.STALLED_PAYLOAD_BYTE), expected
+            )
+            results, complete = servers.stream_run_results(1)
+            self.assertTrue(complete)
+            self.assertTrue(
+                benchmark.stream_result_is_clean(results[0], "down", expected)
+            )
+        finally:
+            servers.stop()
+
+    def test_stream_server_bidi_moves_both_directions(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            expected = 60000
+            payload = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * expected
+            with socket.create_connection(
+                ("127.0.0.1", servers.stream_port), timeout=5
+            ) as connection:
+                connection.sendall(self.stream_header("B", expected) + payload)
+                connection.shutdown(socket.SHUT_WR)
+                received = bytearray()
+                while chunk := connection.recv(65536):
+                    received.extend(chunk)
+            self.assertEqual(bytes(received), payload)
+            results, complete = servers.stream_run_results(1)
+            self.assertTrue(complete)
+            self.assertTrue(
+                benchmark.stream_result_is_clean(results[0], "bidi", expected)
+            )
+        finally:
+            servers.stop()
+
+    def test_stream_server_aborts_short_or_corrupt_upload(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            payload = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 999 + b"\x00"
+            with socket.create_connection(
+                ("127.0.0.1", servers.stream_port), timeout=5
+            ) as connection:
+                connection.sendall(self.stream_header("U", len(payload)) + payload)
+                connection.shutdown(socket.SHUT_WR)
+                try:
+                    tail = connection.recv(1)
+                except ConnectionError:
+                    tail = b""
+                self.assertNotEqual(tail, bytes([benchmark.STREAM_ACK_BYTE]))
+            results, complete = servers.stream_run_results(1)
+            self.assertTrue(complete)
+            self.assertFalse(results[0]["content_ok"])
+            self.assertFalse(results[0]["acked"])
+            self.assertFalse(
+                benchmark.stream_result_is_clean(results[0], "up", len(payload))
+            )
+        finally:
+            servers.stop()
+
+    def test_stream_server_rate_limit_paces_reads(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            payload = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 16384
+            started = time.monotonic()
+            with socket.create_connection(
+                ("127.0.0.1", servers.stream_port), timeout=5
+            ) as connection:
+                connection.sendall(
+                    self.stream_header("U", len(payload), rate=65536) + payload
+                )
+                connection.shutdown(socket.SHUT_WR)
+                self.assertEqual(
+                    connection.recv(1), bytes([benchmark.STREAM_ACK_BYTE])
+                )
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 0.2)
+            results, complete = servers.stream_run_results(1)
+            self.assertTrue(complete)
+            self.assertTrue(
+                benchmark.stream_result_is_clean(results[0], "up", len(payload))
+            )
+        finally:
+            servers.stop()
+
+    def test_stream_result_cleanliness_matrix(self) -> None:
+        clean_up = {
+            "header_ok": True,
+            "direction": "U",
+            "received": 10,
+            "sent": 0,
+            "content_ok": True,
+            "eof": True,
+            "acked": True,
+        }
+        self.assertTrue(benchmark.stream_result_is_clean(clean_up, "up", 10))
+        self.assertFalse(
+            benchmark.stream_result_is_clean({**clean_up, "received": 9}, "up", 10)
+        )
+        self.assertFalse(
+            benchmark.stream_result_is_clean({**clean_up, "acked": False}, "up", 10)
+        )
+        self.assertFalse(
+            benchmark.stream_result_is_clean({**clean_up, "direction": "D"}, "up", 10)
+        )
+        clean_down = {
+            "header_ok": True,
+            "direction": "D",
+            "received": 0,
+            "sent": 10,
+            "content_ok": True,
+            "eof": True,
+            "acked": False,
+        }
+        self.assertTrue(benchmark.stream_result_is_clean(clean_down, "down", 10))
+        self.assertFalse(
+            benchmark.stream_result_is_clean({**clean_down, "received": 1}, "down", 10)
+        )
+        clean_bidi = {
+            "header_ok": True,
+            "direction": "B",
+            "received": 10,
+            "sent": 10,
+            "content_ok": True,
+            "eof": True,
+            "acked": False,
+        }
+        self.assertTrue(benchmark.stream_result_is_clean(clean_bidi, "bidi", 10))
+        self.assertFalse(
+            benchmark.stream_result_is_clean({**clean_bidi, "sent": 9}, "bidi", 10)
+        )
+
+    def test_stream_server_quiescence_gate(self) -> None:
+        benchmark.require_stream_server_quiescence(
+            {"mode": "request", "scenario": "request", "variant": "stable"}
+        )
+        benchmark.require_stream_server_quiescence(
+            {
+                "mode": "stream",
+                "scenario": "stream-up-1-flows",
+                "variant": "stable",
+                "stream_server_quiescent": True,
+            }
+        )
+        for value in (False, None):
+            with self.assertRaisesRegex(RuntimeError, "stream server"):
+                benchmark.require_stream_server_quiescence(
+                    {
+                        "mode": "stream",
+                        "scenario": "stream-up-1-flows",
+                        "variant": "stable",
+                        "stream_server_quiescent": value,
+                    }
+                )
+
+    @unittest.skipIf(shutil.which("cc") is None, "cc not available")
+    def test_workload_stream_roundtrip_all_directions(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=10)
+        servers.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workload = Path(directory) / "workload"
+                benchmark.build_workload("cc", workload)
+                flows = 4
+                payload = 200000
+                for direction in ("up", "down", "bidi"):
+                    servers.prepare_stream_run()
+                    completed = subprocess.run(
+                        [
+                            str(workload),
+                            "stream",
+                            "127.0.0.1",
+                            str(servers.stream_port),
+                            str(flows),
+                            str(payload),
+                            direction,
+                            "0",
+                        ],
+                        text=True,
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        completed.returncode, 0, msg=completed.stderr[-500:]
+                    )
+                    flow_records, summary = benchmark.parse_workload_output(
+                        completed.stdout
+                    )
+                    self.assertTrue(
+                        benchmark.workload_flows_are_valid(flow_records, flows)
+                    )
+                    expected_total = flows * payload * (
+                        2 if direction == "bidi" else 1
+                    )
+                    self.assertEqual(summary["bytes"], expected_total)
+                    results, complete = servers.stream_run_results(flows)
+                    self.assertTrue(complete)
+                    self.assertEqual(len(results), flows)
+                    for result in results:
+                        self.assertTrue(
+                            benchmark.stream_result_is_clean(
+                                result, direction, payload
+                            )
+                        )
         finally:
             servers.stop()
 

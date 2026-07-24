@@ -24,6 +24,7 @@ import shlex
 import shutil
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,15 @@ SERVER_CALL_TIMEOUT_SECONDS = 5
 # verifies the drained stream against it so relay corruption that conserves
 # byte counts still fails the run gate.
 STALLED_PAYLOAD_BYTE = 0x5A
+# The stream server speaks the 32-byte header documented in workload.c: magic,
+# direction, payload bytes, and an optional server-side read rate limit for
+# slow-consumer scenarios. Uploads are acknowledged with a single 0xa5 byte
+# only after byte count and content verify, so truncation cannot pass.
+STREAM_MAGIC = b"YBW1"
+STREAM_HEADER = struct.Struct("<4sB3xQQQ")
+STREAM_ACK_BYTE = 0xA5
+STREAM_DIRECTION_CODES = {"up": "U", "down": "D", "bidi": "B"}
+STREAM_RESULT_WAIT_SECONDS = 2.0
 
 
 class BenchmarkServers:
@@ -59,6 +69,7 @@ class BenchmarkServers:
         self.destination_port = 0
         self.proxy_port = 0
         self.stalled_port = 0
+        self.stream_port = 0
         self.ready = threading.Event()
         self.thread = threading.Thread(
             target=self._thread_main,
@@ -68,6 +79,7 @@ class BenchmarkServers:
         self.error: BaseException | None = None
         self.stalled_release: asyncio.Event | None = None
         self.stalled_results: list[dict[str, int | bool]] | None = None
+        self.stream_results: list[dict[str, Any]] | None = None
         self.connection_tasks: set[asyncio.Task[None]] = set()
         self.connection_writers: set[asyncio.StreamWriter] = set()
         self.safety_timeout = safety_timeout
@@ -151,6 +163,41 @@ class BenchmarkServers:
             with suppress(RuntimeError):
                 self.loop.call_soon_threadsafe(self.stalled_release.set)
 
+    def prepare_stream_run(self) -> None:
+        if self.loop is None:
+            raise RuntimeError("benchmark servers are not running")
+        self._run_on_loop(self._prepare_stream_run(), self.loop)
+
+    async def _prepare_stream_run(self) -> None:
+        self.stream_results = []
+
+    def stream_run_results(
+        self, expected_connections: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if self.loop is None:
+            raise RuntimeError("benchmark servers are not running")
+        results, complete = self._run_on_loop(
+            self._stream_wait_results(expected_connections), self.loop
+        )
+        return results, complete
+
+    async def _stream_wait_results(
+        self, expected_connections: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if self.stream_results is None:
+            raise RuntimeError("stream run was not prepared")
+        assert self.loop is not None
+        deadline = self.loop.time() + STREAM_RESULT_WAIT_SECONDS
+        while (
+            len(self.stream_results) < expected_connections
+            and self.loop.time() < deadline
+        ):
+            await asyncio.sleep(0.005)
+        return (
+            list(self.stream_results),
+            len(self.stream_results) >= expected_connections,
+        )
+
     async def _thread_cpu_ns(self) -> int:
         return time.thread_time_ns()
 
@@ -188,14 +235,22 @@ class BenchmarkServers:
         )
         for stalled_socket in stalled.sockets:
             stalled_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        stream = await asyncio.start_server(
+            self._spawn_stream_connection,
+            "127.0.0.1",
+            0,
+            backlog=65535,
+        )
         self.destination_port = destination.sockets[0].getsockname()[1]
         self.proxy_port = proxy.sockets[0].getsockname()[1]
         self.stalled_port = stalled.sockets[0].getsockname()[1]
+        self.stream_port = stream.sockets[0].getsockname()[1]
         self.ready.set()
         await self.stop_event.wait()
         destination.close()
         proxy.close()
         stalled.close()
+        stream.close()
         writers = list(self.connection_writers)
         for writer in writers:
             writer.transport.abort()
@@ -212,6 +267,7 @@ class BenchmarkServers:
         await destination.wait_closed()
         await proxy.wait_closed()
         await stalled.wait_closed()
+        await stream.wait_closed()
 
     def _spawn_connection(
         self,
@@ -237,6 +293,16 @@ class BenchmarkServers:
         self._spawn_connection(
             self._handle_stalled_destination(reader, writer, release, results), writer
         )
+
+    def _spawn_stream_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        # Same capture rule as the stalled listener: a late connection from a
+        # finished run must not append into the next run's result list.
+        results = self.stream_results
+        self._spawn_connection(self._handle_stream(reader, writer, results), writer)
 
     def _connection_done(
         self,
@@ -351,6 +417,118 @@ class BenchmarkServers:
             with suppress(ConnectionError, OSError):
                 await writer.wait_closed()
 
+    async def _handle_stream(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        results: list[dict[str, Any]] | None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "header_ok": False,
+            "direction": None,
+            "received": 0,
+            "sent": 0,
+            "content_ok": True,
+            "eof": False,
+            "acked": False,
+        }
+        try:
+            if results is None:
+                raise RuntimeError("stream run was not prepared")
+            try:
+                header = await reader.readexactly(STREAM_HEADER.size)
+            except asyncio.IncompleteReadError:
+                return
+            magic, direction_code, payload_bytes, rate, _reserved = (
+                STREAM_HEADER.unpack(header)
+            )
+            if magic != STREAM_MAGIC:
+                return
+            direction = chr(direction_code)
+            record["direction"] = direction
+            if direction not in STREAM_DIRECTION_CODES.values():
+                return
+            record["header_ok"] = True
+            if direction == "U":
+                await self._stream_sink(reader, record, rate)
+                if (
+                    record["eof"]
+                    and record["content_ok"]
+                    and record["received"] == payload_bytes
+                ):
+                    writer.write(bytes([STREAM_ACK_BYTE]))
+                    await writer.drain()
+                    if writer.can_write_eof():
+                        writer.write_eof()
+                        await writer.drain()
+                    record["acked"] = True
+                else:
+                    # Fail fast: a short or corrupted upload must surface as a
+                    # client-visible error, not a hung ack wait.
+                    writer.transport.abort()
+            elif direction == "D":
+                await self._stream_source(writer, record, payload_bytes)
+                if writer.can_write_eof():
+                    writer.write_eof()
+                    await writer.drain()
+                await self._stream_sink(reader, record, 0)
+            else:
+                await asyncio.gather(
+                    self._stream_sink(reader, record, rate),
+                    self._stream_source(writer, record, payload_bytes),
+                )
+                if (
+                    record["eof"]
+                    and record["content_ok"]
+                    and record["received"] == payload_bytes
+                ):
+                    if writer.can_write_eof():
+                        writer.write_eof()
+                        await writer.drain()
+                else:
+                    writer.transport.abort()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            if results is not None:
+                results.append(record)
+            writer.close()
+            with suppress(ConnectionError, OSError):
+                await writer.wait_closed()
+
+    async def _stream_sink(
+        self,
+        reader: asyncio.StreamReader,
+        record: dict[str, Any],
+        rate_bytes_per_second: int,
+    ) -> None:
+        chunk_limit = 16384 if rate_bytes_per_second else 65536
+        while True:
+            chunk = await reader.read(chunk_limit)
+            if not chunk:
+                record["eof"] = True
+                return
+            record["received"] += len(chunk)
+            if chunk.count(STALLED_PAYLOAD_BYTE) != len(chunk):
+                record["content_ok"] = False
+            if rate_bytes_per_second:
+                await asyncio.sleep(len(chunk) / rate_bytes_per_second)
+
+    async def _stream_source(
+        self,
+        writer: asyncio.StreamWriter,
+        record: dict[str, Any],
+        total_bytes: int,
+    ) -> None:
+        payload = bytes([STALLED_PAYLOAD_BYTE]) * 65536
+        remaining = total_bytes
+        while remaining > 0:
+            chunk = payload if remaining >= len(payload) else payload[:remaining]
+            writer.write(chunk)
+            await writer.drain()
+            record["sent"] += len(chunk)
+            remaining -= len(chunk)
+
     async def _copy_stream(
         self,
         reader: asyncio.StreamReader,
@@ -385,6 +563,47 @@ def require_stalled_server_quiescence(run: dict[str, Any]) -> None:
         return
     raise RuntimeError(
         f"stalled server did not quiesce after {run['scenario']}/{run['variant']}; "
+        "aborting before the shared listener can contaminate another run"
+    )
+
+
+def stream_result_is_clean(
+    result: dict[str, Any],
+    direction: str,
+    expected_bytes: int,
+) -> bool:
+    """Return whether one stream-server connection matched the scenario."""
+    code = STREAM_DIRECTION_CODES[direction]
+    if (
+        not result.get("header_ok")
+        or result.get("direction") != code
+        or not result.get("content_ok")
+    ):
+        return False
+    if direction == "up":
+        return (
+            result["received"] == expected_bytes
+            and result["eof"]
+            and result["acked"]
+        )
+    if direction == "down":
+        return (
+            result["sent"] == expected_bytes
+            and result["eof"]
+            and result["received"] == 0
+        )
+    return (
+        result["received"] == expected_bytes
+        and result["sent"] == expected_bytes
+        and result["eof"]
+    )
+
+
+def require_stream_server_quiescence(run: dict[str, Any]) -> None:
+    if run["mode"] != "stream" or run.get("stream_server_quiescent") is True:
+        return
+    raise RuntimeError(
+        f"stream server did not quiesce after {run['scenario']}/{run['variant']}; "
         "aborting before the shared listener can contaminate another run"
     )
 
@@ -433,10 +652,28 @@ def comma_variants(raw: str) -> list[str]:
     return values
 
 
+def comma_directions(raw: str) -> list[str]:
+    if not raw:
+        return []
+    values = raw.split(",")
+    if any(not value for value in values):
+        raise argparse.ArgumentTypeError("directions must not be empty")
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("directions must not contain duplicates")
+    unknown = sorted(set(values) - set(STREAM_DIRECTION_CODES))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown directions: {', '.join(unknown)}")
+    return values
+
+
 def ensure_fd_limit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     selected_flow_counts = list(args.idle_flows)
     if args.payload_sizes:
         selected_flow_counts.append(args.connections)
+    if args.stream_flows > 0:
+        selected_flow_counts.append(args.stream_flows)
+    if args.slow_flows > 0:
+        selected_flow_counts.append(args.slow_flows)
     if args.stalled_flows > 0:
         selected_flow_counts.append(args.stalled_flows)
     max_flows = max(selected_flow_counts)
@@ -668,9 +905,12 @@ def variant_command(
     metrics_path: Path | None = None,
     stalled_ready_path: Path | None = None,
 ) -> list[str]:
-    destination_port = (
-        servers.stalled_port if scenario["mode"] == "stalled" else servers.destination_port
-    )
+    if scenario["mode"] == "stalled":
+        destination_port = servers.stalled_port
+    elif scenario["mode"] == "stream":
+        destination_port = servers.stream_port
+    else:
+        destination_port = servers.destination_port
     workload = [
         str(args.workload),
         scenario["mode"],
@@ -684,6 +924,9 @@ def variant_command(
         if stalled_ready_path is None:
             raise ValueError("stalled workload requires a ready path")
         workload.append(str(stalled_ready_path))
+    if scenario["mode"] == "stream":
+        workload.append(scenario["direction"])
+        workload.append(str(scenario["rate"]))
     if variant == "direct":
         return workload
     yatht = args.yatht if variant == "stable" else args.addfd_yatht
@@ -713,6 +956,8 @@ def run_one(
         stalled_ready_path = Path(control_dir) / "stalled-ready"
         if scenario["mode"] == "stalled":
             servers.prepare_stalled_run()
+        if scenario["mode"] == "stream":
+            servers.prepare_stream_run()
         command = variant_command(
             variant,
             args,
@@ -825,6 +1070,12 @@ def run_one(
     stalled_server_results = (
         servers.stalled_run_results() if scenario["mode"] == "stalled" else None
     )
+    stream_server_results: list[dict[str, Any]] | None = None
+    stream_results_complete: bool | None = None
+    if scenario["mode"] == "stream":
+        stream_server_results, stream_results_complete = servers.stream_run_results(
+            scenario["flows"]
+        )
 
     parse_error = None
     try:
@@ -886,6 +1137,34 @@ def run_one(
             and stalled_server_byte_mismatch_connections == 0
             and stalled_server_incomplete_connections == 0
         )
+    stream_server_connections: int | None = None
+    stream_server_violations: int | None = None
+    stream_server_quiescent: bool | None = None
+    if scenario["mode"] == "stream":
+        assert stream_server_results is not None
+        stream_server_connections = len(stream_server_results)
+        stream_server_violations = sum(
+            1
+            for result in stream_server_results
+            if not stream_result_is_clean(
+                result, scenario["direction"], scenario["value"]
+            )
+        )
+        stream_server_quiescent = (
+            stream_results_complete is True
+            and stream_server_connections == scenario["flows"]
+        )
+        expected_payload_total = (
+            scenario["flows"]
+            * scenario["value"]
+            * (2 if scenario["direction"] == "bidi" else 1)
+        )
+        ok = (
+            ok
+            and stream_server_connections == scenario["flows"]
+            and stream_server_violations == 0
+            and workload_summary.get("bytes") == expected_payload_total
+        )
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
     if metrics_path is not None:
@@ -930,6 +1209,9 @@ def run_one(
         "stalled_server_byte_mismatch_connections": stalled_server_byte_mismatch_connections,
         "stalled_server_incomplete_connections": stalled_server_incomplete_connections,
         "stalled_server_quiescent": stalled_server_quiescent,
+        "stream_server_connections": stream_server_connections,
+        "stream_server_violations": stream_server_violations,
+        "stream_server_quiescent": stream_server_quiescent,
         "broker_pending_peak_bytes": (
             metric_summary.get("tcp_peak_pending_bytes")
             if scenario["mode"] == "stalled" and metric_summary is not None
@@ -991,6 +1273,29 @@ def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
         }
         for flows in args.idle_flows
     ]
+    if args.stream_flows > 0:
+        result += [
+            {
+                "name": f"stream-{direction}-{args.stream_flows}-flows",
+                "mode": "stream",
+                "flows": args.stream_flows,
+                "value": args.stream_bytes,
+                "direction": direction,
+                "rate": 0,
+            }
+            for direction in args.stream_directions
+        ]
+    if args.slow_flows > 0:
+        result.append(
+            {
+                "name": f"slow-{args.slow_flows}-flows",
+                "mode": "stream",
+                "flows": args.slow_flows,
+                "value": args.slow_bytes,
+                "direction": "up",
+                "rate": args.slow_rate,
+            }
+        )
     if args.stalled_flows > 0:
         result.append(
             {
@@ -1059,6 +1364,12 @@ def summarize(
         valid_runs = [run for run in selected_runs if run["ok"]]
         successful = sum(run["successful_flows"] for run in valid_runs)
         wall_total = sum(wall)
+        bytes_moved = sum(run.get("bytes") or 0 for run in valid_runs)
+        cpu_per_byte = [
+            run["child_cpu_ns"] / run["bytes"]
+            for run in valid_runs
+            if run.get("bytes") and run.get("child_cpu_ns") is not None
+        ]
         rows.append(
             {
                 "scenario": scenario,
@@ -1075,6 +1386,14 @@ def summarize(
                 "wall_median_ns": statistics.median(wall) if wall else None,
                 "connections_per_second": (
                     successful / (wall_total / 1_000_000_000) if wall_total else None
+                ),
+                "goodput_bytes_per_second": (
+                    bytes_moved / (wall_total / 1_000_000_000)
+                    if wall_total and bytes_moved
+                    else None
+                ),
+                "child_cpu_ns_per_byte_median": (
+                    statistics.median(cpu_per_byte) if cpu_per_byte else None
                 ),
                 "child_cpu_median_ns": median_field(valid_runs, "child_cpu_ns"),
                 "benchmark_server_cpu_median_ns": median_field(
@@ -1141,7 +1460,7 @@ def binary_metadata(path: str | None, commit: str | None, build_command: str | N
 
 def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_unix_ns": time.time_ns(),
         "git_commit": command_output(["git", "rev-parse", "HEAD"], cwd=ROOT),
         "git_status": command_output(["git", "status", "--short"], cwd=ROOT),
@@ -1172,6 +1491,12 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "connections": args.connections,
         "payload_sizes": args.payload_sizes,
         "idle_flows": args.idle_flows,
+        "stream_flows": args.stream_flows,
+        "stream_bytes": args.stream_bytes,
+        "stream_directions": args.stream_directions,
+        "slow_flows": args.slow_flows,
+        "slow_bytes": args.slow_bytes,
+        "slow_rate_bytes_per_second": args.slow_rate,
         "stalled_flows": args.stalled_flows,
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
@@ -1208,6 +1533,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--idle-flows", type=comma_sizes, default=comma_sizes("1000"))
     parser.add_argument("--idle-hold-ms", type=int, default=100)
+    parser.add_argument("--stream-flows", type=int, default=32)
+    parser.add_argument("--stream-bytes", type=int, default=4 * 1024 * 1024)
+    parser.add_argument(
+        "--stream-directions",
+        type=comma_directions,
+        default=comma_directions("up,down,bidi"),
+    )
+    parser.add_argument("--slow-flows", type=int, default=16)
+    parser.add_argument("--slow-bytes", type=int, default=256 * 1024)
+    # Per-flow server-side read rate; keeps each slow run within a few seconds
+    # while the relay stays under visible backpressure the whole time.
+    parser.add_argument("--slow-rate", type=int, default=128 * 1024)
     parser.add_argument("--stalled-flows", type=int, default=128)
     # The proxied chain (kernel socket autotuning on both yatht hops, the 64 KiB
     # relay buffer, and the SOCKS proxy's stream buffers) can absorb several MiB
@@ -1259,11 +1596,25 @@ def parse_args() -> argparse.Namespace:
         parser.error("idle flow counts must be positive")
     if args.idle_hold_ms < 0 or args.stalled_hold_ms < 0:
         parser.error("hold times must be nonnegative")
+    if args.stream_flows < 0 or (args.stream_flows > 0 and args.stream_bytes <= 0):
+        parser.error("stream flows must be nonnegative and stream bytes positive")
+    if args.stream_flows > 0 and not args.stream_directions:
+        parser.error("stream flows require at least one direction")
+    if args.slow_flows < 0 or (
+        args.slow_flows > 0 and (args.slow_bytes <= 0 or args.slow_rate <= 0)
+    ):
+        parser.error("slow flows must be nonnegative with positive bytes and rate")
     if args.stalled_flows < 0 or (args.stalled_flows > 0 and args.stalled_bytes <= 0):
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
-    if not args.payload_sizes and not args.idle_flows and args.stalled_flows == 0:
+    if (
+        not args.payload_sizes
+        and not args.idle_flows
+        and args.stream_flows == 0
+        and args.slow_flows == 0
+        and args.stalled_flows == 0
+    ):
         parser.error("at least one scenario must be enabled")
     ensure_fd_limit(args, parser)
     return args
@@ -1338,6 +1689,9 @@ def main() -> None:
                                     "stalled_server_byte_mismatch_connections",
                                     "stalled_server_incomplete_connections",
                                     "stalled_server_quiescent",
+                                    "stream_server_connections",
+                                    "stream_server_violations",
+                                    "stream_server_quiescent",
                                     "successful_flows",
                                     "parse_error",
                                     "stderr",
@@ -1373,6 +1727,7 @@ def main() -> None:
                             flush=True,
                         )
                         require_stalled_server_quiescence(run)
+                        require_stream_server_quiescence(run)
                 if "stable" in args.variants and not args.skip_diagnostics:
                     metrics_path = metrics_dir / f"{scenario['name']}.jsonl"
                     run, flows = run_one(
@@ -1392,6 +1747,7 @@ def main() -> None:
                     run_file.flush()
                     flow_file.flush()
                     require_stalled_server_quiescence(run)
+                    require_stream_server_quiescence(run)
     except BaseException as error:
         execution_error = error
     finally:
