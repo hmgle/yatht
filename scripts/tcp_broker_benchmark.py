@@ -226,8 +226,15 @@ class BenchmarkServers:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        # Capture the run state before scheduling the coroutine. The event
+        # loop may accept a connection and queue its task while the caller is
+        # preparing the next run from another thread.
+        release = self.stalled_release
+        results = self.stalled_results
         writer.transport.pause_reading()
-        self._spawn_connection(self._handle_stalled_destination(reader, writer), writer)
+        self._spawn_connection(
+            self._handle_stalled_destination(reader, writer, release, results), writer
+        )
 
     def _connection_done(
         self,
@@ -314,15 +321,14 @@ class BenchmarkServers:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        release: asyncio.Event | None,
+        results: list[dict[str, int | bool]] | None,
     ) -> None:
-        # Bind the connection to the run that prepared it: a straggler from a
-        # timed-out run must not pollute the next run's verification results.
-        results = self.stalled_results
+        # The caller captures release/results before this task is scheduled.
         received = 0
         content_ok = True
         saw_eof = False
         try:
-            release = self.stalled_release
             if release is None or results is None:
                 raise RuntimeError("stalled run was not prepared")
             await asyncio.wait_for(release.wait(), timeout=self.safety_timeout)
@@ -357,6 +363,28 @@ class BenchmarkServers:
                 await writer.drain()
         except (ConnectionError, asyncio.CancelledError):
             pass
+
+
+def stalled_server_is_quiescent(
+    timed_out: bool,
+    expected_flows: int,
+    results: list[dict[str, int | bool]],
+) -> bool:
+    """Return whether the shared stalled listener is safe to reuse."""
+    return (
+        not timed_out
+        and len(results) == expected_flows
+        and all(result["eof"] for result in results)
+    )
+
+
+def require_stalled_server_quiescence(run: dict[str, Any]) -> None:
+    if run["mode"] != "stalled" or run.get("stalled_server_quiescent") is True:
+        return
+    raise RuntimeError(
+        f"stalled server did not quiesce after {run['scenario']}/{run['variant']}; "
+        "aborting before the shared listener can contaminate another run"
+    )
 
 
 def executable(value: str) -> str:
@@ -829,6 +857,7 @@ def run_one(
     stalled_server_corrupt_connections: int | None = None
     stalled_server_byte_mismatch_connections: int | None = None
     stalled_server_incomplete_connections: int | None = None
+    stalled_server_quiescent: bool | None = None
     if scenario["mode"] == "stalled":
         assert stalled_server_results is not None
         stalled_server_connections = len(stalled_server_results)
@@ -840,6 +869,9 @@ def run_one(
         )
         stalled_server_incomplete_connections = sum(
             1 for result in stalled_server_results if not result["eof"]
+        )
+        stalled_server_quiescent = stalled_server_is_quiescent(
+            timed_out, scenario["flows"], stalled_server_results
         )
         ok = (
             ok
@@ -895,6 +927,7 @@ def run_one(
         "stalled_server_corrupt_connections": stalled_server_corrupt_connections,
         "stalled_server_byte_mismatch_connections": stalled_server_byte_mismatch_connections,
         "stalled_server_incomplete_connections": stalled_server_incomplete_connections,
+        "stalled_server_quiescent": stalled_server_quiescent,
         "broker_pending_peak_bytes": (
             metric_summary.get("tcp_peak_pending_bytes")
             if scenario["mode"] == "stalled" and metric_summary is not None
@@ -1302,6 +1335,7 @@ def main() -> None:
                                     "stalled_server_corrupt_connections",
                                     "stalled_server_byte_mismatch_connections",
                                     "stalled_server_incomplete_connections",
+                                    "stalled_server_quiescent",
                                     "successful_flows",
                                     "parse_error",
                                     "stderr",
@@ -1336,6 +1370,7 @@ def main() -> None:
                             f"{'ok' if run['ok'] else 'FAILED'}",
                             flush=True,
                         )
+                        require_stalled_server_quiescence(run)
                 if "stable" in args.variants and not args.skip_diagnostics:
                     metrics_path = metrics_dir / f"{scenario['name']}.jsonl"
                     run, flows = run_one(
@@ -1354,6 +1389,7 @@ def main() -> None:
                         flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
                     run_file.flush()
                     flow_file.flush()
+                    require_stalled_server_quiescence(run)
     except BaseException as error:
         execution_error = error
     finally:

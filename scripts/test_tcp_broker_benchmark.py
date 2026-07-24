@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import contextlib
 import importlib.util
@@ -238,6 +239,92 @@ class BenchmarkTests(unittest.TestCase):
             servers.release_stalled_run()
             connection.close()
             servers.stop()
+
+    def test_stalled_handler_captures_run_before_task_starts(self) -> None:
+        async def exercise() -> tuple[list[dict[str, int | bool]], list[object]]:
+            class FakeTransport:
+                def __init__(self) -> None:
+                    self.paused = False
+                    self.resumed = False
+
+                def pause_reading(self) -> None:
+                    self.paused = True
+
+                def resume_reading(self) -> None:
+                    self.resumed = True
+
+            class FakeWriter:
+                def __init__(self) -> None:
+                    self.transport = FakeTransport()
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+                async def wait_closed(self) -> None:
+                    pass
+
+            servers = benchmark.BenchmarkServers(safety_timeout=1)
+            old_release = asyncio.Event()
+            old_results: list[dict[str, int | bool]] = []
+            servers.stalled_release = old_release
+            servers.stalled_results = old_results
+            reader = asyncio.StreamReader()
+            reader.feed_data(bytes([benchmark.STALLED_PAYLOAD_BYTE]))
+            reader.feed_eof()
+            writer = FakeWriter()
+            spawned = []
+            servers._spawn_connection = lambda coroutine, _writer: spawned.append(
+                coroutine
+            )
+
+            servers._spawn_stalled_connection(reader, writer)
+            new_results: list[object] = []
+            servers.stalled_release = asyncio.Event()
+            servers.stalled_results = new_results
+            old_release.set()
+            await spawned.pop()
+
+            self.assertTrue(writer.transport.paused)
+            self.assertTrue(writer.transport.resumed)
+            self.assertTrue(writer.closed)
+            return old_results, new_results
+
+        old_results, new_results = asyncio.run(exercise())
+
+        self.assertEqual(
+            old_results,
+            [{"bytes": 1, "content_ok": True, "eof": True}],
+        )
+        self.assertEqual(new_results, [])
+
+    def test_stalled_server_quiescence_rejects_unsafe_reuse(self) -> None:
+        complete = [{"bytes": 1, "content_ok": True, "eof": True}]
+        incomplete = [{"bytes": 1, "content_ok": True, "eof": False}]
+
+        self.assertTrue(benchmark.stalled_server_is_quiescent(False, 1, complete))
+        self.assertFalse(benchmark.stalled_server_is_quiescent(True, 1, complete))
+        self.assertFalse(benchmark.stalled_server_is_quiescent(False, 1, []))
+        self.assertFalse(benchmark.stalled_server_is_quiescent(False, 1, incomplete))
+
+        with self.assertRaisesRegex(RuntimeError, "shared listener"):
+            benchmark.require_stalled_server_quiescence(
+                {
+                    "mode": "stalled",
+                    "scenario": "stalled-1-flow",
+                    "variant": "stable",
+                    "stalled_server_quiescent": False,
+                }
+            )
+        with self.assertRaisesRegex(RuntimeError, "shared listener"):
+            benchmark.require_stalled_server_quiescence(
+                {
+                    "mode": "stalled",
+                    "scenario": "stalled-1-flow",
+                    "variant": "stable",
+                    "stalled_server_quiescent": None,
+                }
+            )
 
     def test_stalled_server_verifies_drained_content_and_totals(self) -> None:
         servers = benchmark.BenchmarkServers(safety_timeout=5)

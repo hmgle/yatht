@@ -179,9 +179,14 @@ cargo test
   pause destination transport reads, require every flow to report `EAGAIN`,
   hold for the requested interval, then release and drain all bytes while the
   destination verifies the drained payload pattern, per-flow byte totals, and
-  clean end of stream. A failed warmup, measurement, diagnostic, malformed
-  metric line, incomplete flow set, or corrupted or short drain remains in
-  the artifacts and fails the run gate.
+  clean end of stream. Accepted connections capture their release event and
+  result list before the handler task is scheduled. Because a connection can
+  still remain in the shared listener backlog before acceptance, each run also
+  records whether the stalled server reached quiescence; a timeout, missing
+  handler, or incomplete EOF aborts the batch before another run can reuse the
+  listener. A failed warmup, measurement, diagnostic, malformed metric line,
+  incomplete flow set, or corrupted or short drain remains in the artifacts
+  and fails the run gate.
 
 ```sh
 cargo build --release --locked
