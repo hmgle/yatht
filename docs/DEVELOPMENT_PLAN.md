@@ -167,14 +167,23 @@ cargo test
   pre-stable `b5554b9` ADDFD binary, and the current stable broker. It covers
   short request/response flows, mostly-idle concurrency, and stalled readers;
   randomizes variant order after three warmups; repeats each measurement ten
-  times; and archives raw samples, summaries, commands, environment metadata,
-  peak RSS/fd samples, and stable-broker diagnostics under `target/`.
+  times; and archives raw samples, partial failure results, commands, binary
+  hashes/commits/build commands, dirty-worktree artifacts, role-specific
+  `VmHWM`/sampled fd peaks, and stable-broker diagnostics under `target/`.
+  Stalled runs set the same small application send buffer for every variant,
+  pause destination transport reads, require every flow to report `EAGAIN`,
+  hold for the requested interval, then release and drain all bytes. A failed
+  warmup, measurement, diagnostic, malformed metric line, or incomplete flow
+  set remains in the artifacts and fails the run gate.
 
 ```sh
 cargo build --release --locked
 uv run scripts/tcp_broker_benchmark.py \
   --yatht target/release/yatht \
-  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht
+  --yatht-build-command 'cargo build --release --locked' \
+  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht \
+  --addfd-commit b5554b9 \
+  --addfd-build-command 'cargo build --release --locked'
 ```
 
 - Manual integration check on Linux x86_64/kernel >= 5.9:
