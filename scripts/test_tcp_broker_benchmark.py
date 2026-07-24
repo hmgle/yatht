@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import importlib.util
 import io
@@ -169,6 +170,49 @@ class BenchmarkTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_cancelled_cross_thread_call_chains_stored_failure(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=1)
+        root_cause = RuntimeError("handler failed")
+        servers.error = root_cause
+        cancelled: concurrent.futures.Future[int] = concurrent.futures.Future()
+        cancelled.cancel()
+        coroutine = servers._thread_cpu_ns()
+        try:
+            with (
+                mock.patch.object(
+                    benchmark.asyncio,
+                    "run_coroutine_threadsafe",
+                    return_value=cancelled,
+                ),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                servers._run_on_loop(coroutine, mock.Mock())
+        finally:
+            coroutine.close()
+        self.assertIs(caught.exception.__cause__, root_cause)
+
+    def test_timed_out_cross_thread_call_cancels_future_and_chains_failure(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=1)
+        root_cause = RuntimeError("handler failed")
+        servers.error = root_cause
+        pending: concurrent.futures.Future[int] = concurrent.futures.Future()
+        coroutine = servers._thread_cpu_ns()
+        try:
+            with (
+                mock.patch.object(benchmark, "SERVER_CALL_TIMEOUT_SECONDS", 0.01),
+                mock.patch.object(
+                    benchmark.asyncio,
+                    "run_coroutine_threadsafe",
+                    return_value=pending,
+                ),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                servers._run_on_loop(coroutine, mock.Mock())
+        finally:
+            coroutine.close()
+        self.assertIs(caught.exception.__cause__, root_cause)
+        self.assertTrue(pending.cancelled())
 
     def test_stalled_server_applies_backpressure_before_release(self) -> None:
         servers = benchmark.BenchmarkServers(safety_timeout=1)

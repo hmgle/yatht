@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 from contextlib import suppress
 import csv
 import hashlib
@@ -42,6 +43,7 @@ SAMPLE_INTERVAL_SECONDS = 0.005
 # effect with thousands of flows; per-role samples stay at 5 ms while the tree
 # aggregate is refreshed every TREE_SAMPLE_STRIDE iterations.
 TREE_SAMPLE_STRIDE = 20
+SERVER_CALL_TIMEOUT_SECONDS = 5
 
 
 class BenchmarkServers:
@@ -99,8 +101,16 @@ class BenchmarkServers:
             self._raise_stored_failure()
             raise
         try:
-            return future.result(timeout=5)
-        except (RuntimeError, TimeoutError):
+            return future.result(timeout=SERVER_CALL_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # Cancel so an abandoned call cannot linger on the loop.
+            future.cancel()
+            self._raise_stored_failure()
+            raise
+        except (RuntimeError, concurrent.futures.CancelledError, asyncio.CancelledError):
+            # Shutting down after a handler failure cancels still-pending
+            # calls; which CancelledError class arrives varies across Python
+            # versions, and the stored error is the root cause either way.
             self._raise_stored_failure()
             raise
 
