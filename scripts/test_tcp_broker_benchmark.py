@@ -127,6 +127,28 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(servers.thread.is_alive())
         self.assertEqual(servers.connection_tasks, set())
 
+    def test_server_root_cause_survives_closed_event_loop(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=1)
+        servers.start()
+        connection = socket.create_connection(("127.0.0.1", servers.stalled_port))
+        try:
+            deadline = time.monotonic() + 5
+            while servers.thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(servers.thread.is_alive())
+            with self.assertRaises(RuntimeError) as cpu_error:
+                servers.cpu_ns()
+            self.assertIn(
+                "stalled run was not prepared", str(cpu_error.exception.__cause__)
+            )
+            with self.assertRaises(RuntimeError) as stop_error:
+                servers.stop()
+            self.assertIn(
+                "stalled run was not prepared", str(stop_error.exception.__cause__)
+            )
+        finally:
+            connection.close()
+
     def test_stalled_server_applies_backpressure_before_release(self) -> None:
         servers = benchmark.BenchmarkServers(safety_timeout=1)
         servers.start()

@@ -67,7 +67,10 @@ class BenchmarkServers:
 
     def stop(self) -> None:
         if self.loop is not None and self.stop_event is not None:
-            self.loop.call_soon_threadsafe(self.stop_event.set)
+            # A handler failure already stopped and closed the loop; the stored
+            # error re-raised below is the root cause worth reporting.
+            with suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(self.stop_event.set)
         self.thread.join(timeout=10)
         if self.thread.is_alive():
             raise RuntimeError("benchmark servers did not stop")
@@ -77,21 +80,43 @@ class BenchmarkServers:
     def cpu_ns(self) -> int:
         if self.loop is None:
             return 0
-        future = asyncio.run_coroutine_threadsafe(self._thread_cpu_ns(), self.loop)
-        return int(future.result(timeout=5))
+        return int(self._run_on_loop(self._thread_cpu_ns(), self.loop))
+
+    def _run_on_loop(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+        loop: asyncio.AbstractEventLoop,
+    ) -> Any:
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except RuntimeError:
+            coroutine.close()
+            self._raise_stored_failure()
+            raise
+        try:
+            return future.result(timeout=5)
+        except (RuntimeError, TimeoutError):
+            self._raise_stored_failure()
+            raise
+
+    def _raise_stored_failure(self) -> None:
+        if self.error is not None:
+            raise RuntimeError("benchmark servers failed") from self.error
 
     def prepare_stalled_run(self) -> None:
         if self.loop is None:
             raise RuntimeError("benchmark servers are not running")
-        future = asyncio.run_coroutine_threadsafe(self._prepare_stalled_run(), self.loop)
-        future.result(timeout=5)
+        self._run_on_loop(self._prepare_stalled_run(), self.loop)
 
     async def _prepare_stalled_run(self) -> None:
         self.stalled_release = asyncio.Event()
 
     def release_stalled_run(self) -> None:
         if self.loop is not None and self.stalled_release is not None:
-            self.loop.call_soon_threadsafe(self.stalled_release.set)
+            # Called from run_one's finally block: never let a dead loop mask
+            # the in-flight exception; stop() re-raises the stored root cause.
+            with suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(self.stalled_release.set)
 
     async def _thread_cpu_ns(self) -> int:
         return time.thread_time_ns()
