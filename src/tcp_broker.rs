@@ -31,6 +31,9 @@ pub struct TcpBrokerReactor {
     relays: Vec<TcpRelay>,
     resources: Arc<BrokerResources>,
     teardown_recorded: bool,
+    // Reused across iterations; registration-heavy phases would otherwise
+    // allocate and free a 2N+1 entry array on every wakeup.
+    pollfds: Vec<libc::pollfd>,
 }
 
 struct BrokerResources {
@@ -143,6 +146,7 @@ impl TcpBroker {
                 relays: Vec::new(),
                 resources,
                 teardown_recorded: false,
+                pollfds: Vec::new(),
             },
         ))
     }
@@ -435,19 +439,20 @@ impl TcpBrokerReactor {
                 return Ok(());
             }
 
-            let mut pollfds = Vec::with_capacity(1 + self.relays.len() * 2);
-            pollfds.push(libc::pollfd {
+            self.pollfds.clear();
+            self.pollfds.reserve(1 + self.relays.len() * 2);
+            self.pollfds.push(libc::pollfd {
                 fd: self.wake_fd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             });
             for relay in &self.relays {
-                pollfds.push(relay.target_pollfd(&self.resources));
-                pollfds.push(relay.upstream_pollfd(&self.resources));
+                self.pollfds.push(relay.target_pollfd(&self.resources));
+                self.pollfds.push(relay.upstream_pollfd(&self.resources));
             }
 
             self.resources.observability.tcp_poll();
-            let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) };
+            let rc = unsafe { libc::poll(self.pollfds.as_mut_ptr(), self.pollfds.len() as _, -1) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -458,7 +463,7 @@ impl TcpBrokerReactor {
             self.resources.observability.tcp_poll_ready(rc as usize);
 
             let mut made_progress = false;
-            if pollfds[0].revents & libc::POLLIN != 0 {
+            if self.pollfds[0].revents & libc::POLLIN != 0 {
                 if let Err(err) = drain_eventfd(self.wake_fd.as_raw_fd()) {
                     return self.fail(err);
                 }
@@ -469,10 +474,10 @@ impl TcpBrokerReactor {
                 }
             }
 
-            let polled_relays = (pollfds.len() - 1) / 2;
+            let polled_relays = (self.pollfds.len() - 1) / 2;
             for index in (0..polled_relays).rev() {
-                let target_events = pollfds[1 + index * 2].revents;
-                let upstream_events = pollfds[2 + index * 2].revents;
+                let target_events = self.pollfds[1 + index * 2].revents;
+                let upstream_events = self.pollfds[2 + index * 2].revents;
                 let relay = &mut self.relays[index];
                 let result = relay.process(target_events, upstream_events);
                 made_progress |= result.as_ref().copied().unwrap_or(true);
