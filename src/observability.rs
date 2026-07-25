@@ -11,7 +11,7 @@ use crossbeam_channel as channel;
 use serde::Serialize;
 
 const METRIC_QUEUE_CAPACITY: usize = 4096;
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Default)]
 pub struct Observability {
@@ -51,6 +51,7 @@ struct ObservabilityInner {
     tcp_splice_in_syscalls: AtomicU64,
     tcp_splice_out_syscalls: AtomicU64,
     tcp_splice_fallbacks: AtomicU64,
+    tcp_splice_quickacks: AtomicU64,
     tcp_pipe_bytes: AtomicU64,
     tcp_peak_pipe_bytes: AtomicU64,
     tcp_command_wakeups: AtomicU64,
@@ -105,6 +106,7 @@ impl ObservabilityInner {
             tcp_splice_in_syscalls: AtomicU64::new(0),
             tcp_splice_out_syscalls: AtomicU64::new(0),
             tcp_splice_fallbacks: AtomicU64::new(0),
+            tcp_splice_quickacks: AtomicU64::new(0),
             tcp_pipe_bytes: AtomicU64::new(0),
             tcp_peak_pipe_bytes: AtomicU64::new(0),
             tcp_command_wakeups: AtomicU64::new(0),
@@ -213,6 +215,7 @@ struct RunSummary {
     tcp_splice_in_syscalls: u64,
     tcp_splice_out_syscalls: u64,
     tcp_splice_fallbacks: u64,
+    tcp_splice_quickacks: u64,
     tcp_pipe_bytes: u64,
     tcp_peak_pipe_bytes: u64,
     tcp_command_wakeups: u64,
@@ -345,6 +348,7 @@ impl ObservabilityRuntime {
             tcp_splice_in_syscalls: inner.tcp_splice_in_syscalls.load(Ordering::Relaxed),
             tcp_splice_out_syscalls: inner.tcp_splice_out_syscalls.load(Ordering::Relaxed),
             tcp_splice_fallbacks: inner.tcp_splice_fallbacks.load(Ordering::Relaxed),
+            tcp_splice_quickacks: inner.tcp_splice_quickacks.load(Ordering::Relaxed),
             tcp_pipe_bytes: inner.tcp_pipe_bytes.load(Ordering::Relaxed),
             tcp_peak_pipe_bytes: inner.tcp_peak_pipe_bytes.load(Ordering::Relaxed),
             tcp_command_wakeups: inner.tcp_command_wakeups.load(Ordering::Relaxed),
@@ -628,6 +632,12 @@ impl Observability {
     pub fn tcp_splice_fallback(&self) {
         if let Some(inner) = &self.inner {
             inner.tcp_splice_fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_splice_quickack(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_splice_quickacks.fetch_add(1, Ordering::Relaxed);
         }
     }
 

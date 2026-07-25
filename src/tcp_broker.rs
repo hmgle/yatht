@@ -88,6 +88,53 @@ fn data_mover_kind_from_env() -> io::Result<DataMoverKind> {
         )),
     }
 }
+
+// Conditional quickack for the splice mover (TCP_BROKER_ROADMAP.md M3.1).
+// Splice consumption of a lone full-MSS segment leaves the peer's delayed
+// ACK armed while Nagle holds the peer's sub-MSS tail for that ACK, a timer
+// interlock worth a full delayed-ACK period per chunk; buffered escapes it
+// through the kernel's backlog deferred-ACK path because its copy loop holds
+// the socket lock for most of each round (see
+// docs/TCP_BROKER_M3_SPLICE_STARVATION_ATTRIBUTION.md). After a draining
+// splice round at dribble scale, TCP_QUICKACK(1) flushes the pending ACK.
+const SPLICE_QUICKACK_ENV: &str = "SUP_TCP_SPLICE_QUICKACK";
+// Dribble signature: at most one full loopback MSS plus its Nagle tail per
+// round. Bulk rounds run up to SPLICE_BATCH_BUDGET_BYTES and must keep the
+// kernel's ACK coalescing, so the threshold stays well below the budget.
+const SPLICE_QUICKACK_DRIBBLE_MAX_BYTES: usize = 128 * 1024;
+
+fn splice_quickack_from_env() -> io::Result<bool> {
+    match std::env::var(SPLICE_QUICKACK_ENV) {
+        Ok(value) if value == "on" => Ok(true),
+        Ok(value) if value == "off" => Ok(false),
+        Ok(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {SPLICE_QUICKACK_ENV} value: {value}"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {SPLICE_QUICKACK_ENV} value: {err}"),
+        )),
+    }
+}
+
+// A round wants the forced ACK only when it made progress, believes it
+// drained the socket (short splice or EAGAIN; "pipe full" ambiguity costs
+// one harmless syscall), saw no EOF, and moved at most a dribble's worth.
+fn splice_round_wants_quickack(
+    enabled: bool,
+    drained: bool,
+    outcome: BatchedRead,
+    moved: usize,
+) -> bool {
+    enabled
+        && drained
+        && outcome.progressed
+        && !outcome.eof
+        && moved <= SPLICE_QUICKACK_DRIBBLE_MAX_BYTES
+}
+
 const DEFAULT_MAX_ACTIVE_FLOWS: usize = 16_384;
 const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFER_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
@@ -130,6 +177,7 @@ struct BrokerResources {
     pending_bytes: AtomicUsize,
     buffer_capacity_bytes: AtomicUsize,
     registration_queue_depth: AtomicUsize,
+    splice_quickack: bool,
     observability: Observability,
 }
 
@@ -225,8 +273,16 @@ impl TcpBroker {
     ) -> io::Result<(Self, TcpBrokerReactor)> {
         let kind = reactor_kind_from_env()?;
         let mover = data_mover_kind_from_env()?;
+        let splice_quickack = splice_quickack_from_env()?;
         let (limits, flow_limit_reason) = TcpBrokerLimits::detect(setup_concurrency, mover)?;
-        Self::new_with_limits(observability, limits, flow_limit_reason, kind, mover)
+        Self::new_with_limits(
+            observability,
+            limits,
+            flow_limit_reason,
+            kind,
+            mover,
+            splice_quickack,
+        )
     }
 
     fn new_with_limits(
@@ -235,6 +291,7 @@ impl TcpBroker {
         flow_limit_reason: FlowLimitReason,
         kind: ReactorKind,
         mover: DataMoverKind,
+        splice_quickack: bool,
     ) -> io::Result<(Self, TcpBrokerReactor)> {
         let wake_fd = Arc::new(create_eventfd()?);
         let (tx, rx) = channel::bounded(REGISTRATION_QUEUE_CAPACITY);
@@ -245,6 +302,7 @@ impl TcpBroker {
             pending_bytes: AtomicUsize::new(0),
             buffer_capacity_bytes: AtomicUsize::new(0),
             registration_queue_depth: AtomicUsize::new(0),
+            splice_quickack,
             observability,
         });
         resources.observability.record_tcp_broker_limits(
@@ -1725,6 +1783,7 @@ impl SplicePipe {
         let mut outcome = BatchedRead::IDLE;
         let mut budget = SPLICE_BATCH_BUDGET_BYTES;
         let mut syscalls = 0;
+        let mut drained = false;
         while budget > 0 && syscalls < SPLICE_MAX_SYSCALLS_PER_ROUND {
             let room = self.capacity.saturating_sub(self.len);
             if room == 0 {
@@ -1752,6 +1811,7 @@ impl SplicePipe {
                 if moved < reserved {
                     // A short splice drained the socket or filled the pipe;
                     // level-triggered readiness re-reports whatever remains.
+                    drained = true;
                     break;
                 }
                 continue;
@@ -1769,6 +1829,7 @@ impl SplicePipe {
                     // side until the pipe drains cannot lose a wakeup.
                     self.full = true;
                 }
+                drained = true;
                 break;
             }
             if outcome.progressed {
@@ -1778,6 +1839,11 @@ impl SplicePipe {
                 break;
             }
             return Err(err);
+        }
+        let moved_total = SPLICE_BATCH_BUDGET_BYTES - budget;
+        if splice_round_wants_quickack(resources.splice_quickack, drained, outcome, moved_total) {
+            force_tcp_quickack(stream.as_raw_fd());
+            resources.observability.tcp_splice_quickack();
         }
         Ok(outcome)
     }
@@ -1821,6 +1887,23 @@ impl SplicePipe {
         }
         Ok(outcome)
     }
+}
+
+// Flush the receive path's pending delayed ACK. Best effort: a failure only
+// costs the latency optimization, never correctness.
+// SAFETY: `fd` is borrowed from a live `TcpStream`, and setsockopt with an
+// `int` option value reads exactly `socklen_t` bytes from the given pointer.
+fn force_tcp_quickack(fd: RawFd) {
+    let one: libc::c_int = 1;
+    let _ = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
 }
 
 fn splice_fds(from: RawFd, to: RawFd, len: usize) -> libc::ssize_t {
@@ -2123,6 +2206,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
             DataMoverKind::Buffered,
+            true,
         )
         .unwrap();
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -2338,6 +2422,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             kind,
             mover,
+            true,
         )
         .unwrap();
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -2388,6 +2473,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
             DataMoverKind::Buffered,
+            true,
         )
         .unwrap();
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2441,6 +2527,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             kind,
             mover,
+            true,
         )
         .unwrap();
         let reactor_thread =
@@ -2616,6 +2703,114 @@ mod tests {
     }
 
     #[test]
+    fn splice_quickack_predicate_gates_on_drained_dribble_progress() {
+        let progressed = BatchedRead {
+            progressed: true,
+            eof: false,
+        };
+        assert!(splice_round_wants_quickack(true, true, progressed, 53));
+        assert!(splice_round_wants_quickack(
+            true,
+            true,
+            progressed,
+            SPLICE_QUICKACK_DRIBBLE_MAX_BYTES
+        ));
+        assert!(!splice_round_wants_quickack(false, true, progressed, 53));
+        assert!(!splice_round_wants_quickack(true, false, progressed, 53));
+        assert!(!splice_round_wants_quickack(
+            true,
+            true,
+            BatchedRead::IDLE,
+            53
+        ));
+        assert!(!splice_round_wants_quickack(
+            true,
+            true,
+            BatchedRead {
+                progressed: true,
+                eof: true,
+            },
+            53
+        ));
+        assert!(!splice_round_wants_quickack(
+            true,
+            true,
+            progressed,
+            SPLICE_QUICKACK_DRIBBLE_MAX_BYTES + 1
+        ));
+    }
+
+    fn spliced_echo_run_summary(quickack: bool) -> serde_json::Value {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
+        let limits = TcpBrokerLimits {
+            max_active_flows: 1,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_buffer_capacity_bytes: DEFAULT_MAX_BUFFER_CAPACITY_BYTES,
+            rlimit_nofile: 4096,
+            baseline_fds: 0,
+            reserved_fds: 256,
+        };
+        let (broker, reactor) = TcpBroker::new_with_limits(
+            runtime.observability(),
+            limits,
+            FlowLimitReason::ActiveFlow,
+            ReactorKind::Poll,
+            DataMoverKind::Splice,
+            quickack,
+        )
+        .unwrap();
+        let reactor_thread = thread::spawn(move || reactor.run().unwrap());
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&target);
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+
+        target.write_all(b"request").unwrap();
+        target.shutdown(Shutdown::Write).unwrap();
+        let mut request = Vec::new();
+        remote.read_to_end(&mut request).unwrap();
+        assert_eq!(request, b"request");
+        remote.write_all(b"response").unwrap();
+        remote.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        target.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+
+        broker.shutdown().unwrap();
+        reactor_thread.join().unwrap();
+        runtime.finish().unwrap();
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "run_summary")
+            .unwrap()
+    }
+
+    #[test]
+    fn spliced_dribble_flow_records_quickacks_in_run_summary() {
+        let summary = spliced_echo_run_summary(true);
+        assert_eq!(summary["schema_version"], 5);
+        assert!(summary["tcp_splice_in_syscalls"].as_u64().unwrap() > 0);
+        // Each sub-dribble consuming round drains its socket, so the forced
+        // ACK fires at least once per direction.
+        assert!(summary["tcp_splice_quickacks"].as_u64().unwrap() >= 2);
+    }
+
+    #[test]
+    fn splice_quickack_off_keeps_counter_zero() {
+        let summary = spliced_echo_run_summary(false);
+        assert!(summary["tcp_splice_in_syscalls"].as_u64().unwrap() > 0);
+        assert_eq!(summary["tcp_splice_quickacks"], 0);
+    }
+
+    #[test]
     fn spliced_backpressure_parks_reads_and_half_closes_after_drain() {
         let (broker, mut reactor) = test_broker_backends(
             ReactorKind::Poll,
@@ -2775,6 +2970,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
             DataMoverKind::Splice,
+            true,
         )
         .unwrap();
         let (mut target, broker_target) = tcp_pair();
@@ -2971,6 +3167,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
             DataMoverKind::Buffered,
+            true,
         )
         .unwrap();
         let mut first = PendingBuffer::default();
@@ -3202,6 +3399,7 @@ mod tests {
             FlowLimitReason::ActiveFlow,
             kind,
             mover,
+            true,
         )
         .unwrap()
     }
