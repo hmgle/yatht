@@ -683,6 +683,148 @@ class BenchmarkTests(unittest.TestCase):
         finally:
             servers.stop()
 
+    def test_reset_result_cleanliness_matrix(self) -> None:
+        clean = {
+            "header_ok": True,
+            "direction": "R",
+            "received": 100,
+            "sent": 16,
+            "content_ok": True,
+            "eof": False,
+            "acked": False,
+            "aborted": True,
+        }
+        self.assertTrue(benchmark.reset_result_is_clean(clean, 100, 16, 0))
+        self.assertTrue(
+            benchmark.reset_result_is_clean({**clean, "received": 50}, 100, 16, 50)
+        )
+        self.assertFalse(
+            benchmark.reset_result_is_clean({**clean, "aborted": False}, 100, 16, 0)
+        )
+        self.assertFalse(
+            benchmark.reset_result_is_clean({**clean, "received": 99}, 100, 16, 0)
+        )
+        self.assertFalse(
+            benchmark.reset_result_is_clean({**clean, "sent": 0}, 100, 16, 0)
+        )
+
+    def test_stream_server_reset_direction_aborts_after_prefix(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            request = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 5000
+            with socket.create_connection(
+                ("127.0.0.1", servers.stream_port), timeout=5
+            ) as connection:
+                connection.sendall(
+                    benchmark.STREAM_HEADER.pack(
+                        benchmark.STREAM_MAGIC, ord("R"), len(request), 64, 0
+                    )
+                    + request
+                )
+                observed = bytearray()
+                with contextlib.suppress(ConnectionError):
+                    while chunk := connection.recv(65536):
+                        observed.extend(chunk)
+            self.assertLessEqual(len(observed), 64)
+            results, complete = servers.stream_run_results(1)
+            self.assertTrue(complete)
+            self.assertTrue(
+                benchmark.reset_result_is_clean(results[0], len(request), 64, 0)
+            )
+        finally:
+            servers.stop()
+
+    def test_proxy_propagates_upstream_reset(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            servers.prepare_stream_run()
+            request = bytes([benchmark.STALLED_PAYLOAD_BYTE]) * 2000
+            with socket.create_connection(
+                ("127.0.0.1", servers.proxy_port), timeout=5
+            ) as connection:
+                connection.sendall(b"\x05\x01\x00")
+                self.assertEqual(connection.recv(2), b"\x05\x00")
+                connection.sendall(
+                    b"\x05\x01\x00\x01\x7f\x00\x00\x01"
+                    + servers.stream_port.to_bytes(2, "big")
+                )
+                self.assertEqual(len(connection.recv(10)), 10)
+                connection.sendall(
+                    benchmark.STREAM_HEADER.pack(
+                        benchmark.STREAM_MAGIC, ord("R"), len(request), 0, 0
+                    )
+                    + request
+                )
+                saw_reset = False
+                try:
+                    while connection.recv(65536):
+                        pass
+                except ConnectionError:
+                    saw_reset = True
+            self.assertTrue(saw_reset)
+        finally:
+            servers.stop()
+
+    @unittest.skipIf(shutil.which("cc") is None, "cc not available")
+    def test_workload_reset_roundtrip_classifies_outcomes(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=10)
+        servers.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workload = Path(directory) / "workload"
+                benchmark.build_workload("cc", workload)
+                flows, request = 4, 50000
+                for prefix, consume in ((512, 0), (0, 25000)):
+                    servers.prepare_stream_run()
+                    completed = subprocess.run(
+                        [
+                            str(workload),
+                            "reset",
+                            "127.0.0.1",
+                            str(servers.stream_port),
+                            str(flows),
+                            str(request),
+                            str(prefix),
+                            str(consume),
+                        ],
+                        text=True,
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        completed.returncode, 0, msg=completed.stderr[-500:]
+                    )
+                    flow_records, samples, summary = benchmark.parse_workload_output(
+                        completed.stdout
+                    )
+                    self.assertEqual(samples, [])
+                    self.assertTrue(
+                        benchmark.workload_flows_are_valid(flow_records, flows)
+                    )
+                    self.assertTrue(
+                        all(
+                            record["outcome"] in ("reset", "eof")
+                            for record in flow_records
+                        )
+                    )
+                    self.assertEqual(
+                        summary["reset_outcomes"] + summary["eof_outcomes"], flows
+                    )
+                    results, complete = servers.stream_run_results(flows)
+                    self.assertTrue(complete)
+                    self.assertEqual(len(results), flows)
+                    for result in results:
+                        self.assertTrue(
+                            benchmark.reset_result_is_clean(
+                                result, request, prefix, consume
+                            )
+                        )
+        finally:
+            servers.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -321,6 +321,18 @@ class BenchmarkServers:
             if self.stop_event is not None:
                 self.stop_event.set()
 
+    @staticmethod
+    def _abort_with_reset(writer: asyncio.StreamWriter) -> None:
+        # transport.abort() alone sends a FIN when nothing is queued; a hard
+        # RST needs SO_LINGER zero on the underlying socket first.
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            with suppress(OSError):
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+        writer.transport.abort()
+
     async def _handle_destination(
         self,
         reader: asyncio.StreamReader,
@@ -370,10 +382,27 @@ class BenchmarkServers:
             upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
             writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
             await writer.drain()
-            await asyncio.gather(
-                self._copy_stream(reader, upstream_writer),
-                self._copy_stream(upstream_reader, writer),
+            copy_tasks = [
+                asyncio.create_task(self._copy_stream(reader, upstream_writer)),
+                asyncio.create_task(self._copy_stream(upstream_reader, writer)),
+            ]
+            done, pending = await asyncio.wait(
+                copy_tasks, return_when=asyncio.FIRST_COMPLETED
             )
+            reset_seen = any(task.result() for task in done)
+            if not reset_seen and pending:
+                done, pending = await asyncio.wait(pending)
+                reset_seen = any(task.result() for task in done)
+            if reset_seen:
+                # Propagate hard resets instead of translating them into a
+                # clean FIN, so reset scenarios observe comparable failure
+                # signals with and without the proxy in the chain.
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending)
+                self._abort_with_reset(writer)
+                self._abort_with_reset(upstream_writer)
         except (ConnectionError, asyncio.IncompleteReadError, OSError, asyncio.CancelledError):
             pass
         finally:
@@ -431,6 +460,7 @@ class BenchmarkServers:
             "content_ok": True,
             "eof": False,
             "acked": False,
+            "aborted": False,
         }
         try:
             if results is None:
@@ -439,18 +469,18 @@ class BenchmarkServers:
                 header = await reader.readexactly(STREAM_HEADER.size)
             except asyncio.IncompleteReadError:
                 return
-            magic, direction_code, payload_bytes, rate, _reserved = (
+            magic, direction_code, payload_bytes, aux, aux2 = (
                 STREAM_HEADER.unpack(header)
             )
             if magic != STREAM_MAGIC:
                 return
             direction = chr(direction_code)
             record["direction"] = direction
-            if direction not in STREAM_DIRECTION_CODES.values():
+            if direction not in (*STREAM_DIRECTION_CODES.values(), "R"):
                 return
             record["header_ok"] = True
             if direction == "U":
-                await self._stream_sink(reader, record, rate)
+                await self._stream_sink(reader, record, aux)
                 if (
                     record["eof"]
                     and record["content_ok"]
@@ -465,16 +495,16 @@ class BenchmarkServers:
                 else:
                     # Fail fast: a short or corrupted upload must surface as a
                     # client-visible error, not a hung ack wait.
-                    writer.transport.abort()
+                    self._abort_with_reset(writer)
             elif direction == "D":
                 await self._stream_source(writer, record, payload_bytes)
                 if writer.can_write_eof():
                     writer.write_eof()
                     await writer.drain()
                 await self._stream_sink(reader, record, 0)
-            else:
+            elif direction == "B":
                 await asyncio.gather(
-                    self._stream_sink(reader, record, rate),
+                    self._stream_sink(reader, record, aux),
                     self._stream_source(writer, record, payload_bytes),
                 )
                 if (
@@ -486,7 +516,25 @@ class BenchmarkServers:
                         writer.write_eof()
                         await writer.drain()
                 else:
-                    writer.transport.abort()
+                    self._abort_with_reset(writer)
+            else:
+                # 'R': consume aux2 bytes (0 = the whole request), optionally
+                # answer with aux prefix bytes, then abort so the client and
+                # any relay in between observe a hard reset.
+                consume = aux2 if aux2 else payload_bytes
+                remaining = consume
+                while remaining > 0:
+                    chunk = await reader.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    record["received"] += len(chunk)
+                    if chunk.count(STALLED_PAYLOAD_BYTE) != len(chunk):
+                        record["content_ok"] = False
+                    remaining -= len(chunk)
+                if aux:
+                    await self._stream_source(writer, record, aux)
+                self._abort_with_reset(writer)
+                record["aborted"] = True
         except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
@@ -533,7 +581,8 @@ class BenchmarkServers:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-    ) -> None:
+    ) -> bool:
+        """Copy until EOF; return whether a hard reset ended the copy."""
         try:
             while data := await reader.read(65536):
                 writer.write(data)
@@ -541,8 +590,11 @@ class BenchmarkServers:
             if writer.can_write_eof():
                 writer.write_eof()
                 await writer.drain()
+        except ConnectionResetError:
+            return True
         except (ConnectionError, asyncio.CancelledError):
             pass
+        return False
 
 
 def stalled_server_is_quiescent(
@@ -601,13 +653,31 @@ def stream_result_is_clean(
 
 def require_stream_server_quiescence(run: dict[str, Any]) -> None:
     if (
-        run["mode"] not in ("stream", "fairness")
+        run["mode"] not in ("stream", "fairness", "reset")
         or run.get("stream_server_quiescent") is True
     ):
         return
     raise RuntimeError(
         f"stream server did not quiesce after {run['scenario']}/{run['variant']}; "
         "aborting before the shared listener can contaminate another run"
+    )
+
+
+def reset_result_is_clean(
+    result: dict[str, Any],
+    request_bytes: int,
+    prefix_bytes: int,
+    consume_bytes: int,
+) -> bool:
+    """Return whether one reset-server connection matched the scenario."""
+    expected_consume = consume_bytes if consume_bytes else request_bytes
+    return bool(
+        result.get("header_ok")
+        and result.get("direction") == "R"
+        and result.get("content_ok")
+        and result.get("aborted")
+        and result["received"] == expected_consume
+        and result["sent"] == prefix_bytes
     )
 
 
@@ -679,6 +749,8 @@ def ensure_fd_limit(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         selected_flow_counts.append(args.slow_flows)
     if args.fairness_quiet_flows > 0:
         selected_flow_counts.append(args.fairness_quiet_flows + 1)
+    if args.reset_flows > 0:
+        selected_flow_counts.append(args.reset_flows)
     if args.stalled_flows > 0:
         selected_flow_counts.append(args.stalled_flows)
     max_flows = max(selected_flow_counts)
@@ -928,7 +1000,7 @@ def variant_command(
     else:
         if scenario["mode"] == "stalled":
             destination_port = servers.stalled_port
-        elif scenario["mode"] == "stream":
+        elif scenario["mode"] in ("stream", "reset"):
             destination_port = servers.stream_port
         else:
             destination_port = servers.destination_port
@@ -948,6 +1020,9 @@ def variant_command(
         if scenario["mode"] == "stream":
             workload.append(scenario["direction"])
             workload.append(str(scenario["rate"]))
+        if scenario["mode"] == "reset":
+            workload.append(str(scenario["prefix"]))
+            workload.append(str(scenario["consume"]))
     if variant == "direct":
         return workload
     yatht = args.yatht if variant == "stable" else args.addfd_yatht
@@ -977,7 +1052,7 @@ def run_one(
         stalled_ready_path = Path(control_dir) / "stalled-ready"
         if scenario["mode"] == "stalled":
             servers.prepare_stalled_run()
-        if scenario["mode"] in ("stream", "fairness"):
+        if scenario["mode"] in ("stream", "fairness", "reset"):
             servers.prepare_stream_run()
         command = variant_command(
             variant,
@@ -1093,9 +1168,9 @@ def run_one(
     )
     stream_server_results: list[dict[str, Any]] | None = None
     stream_results_complete: bool | None = None
-    if scenario["mode"] in ("stream", "fairness"):
+    if scenario["mode"] in ("stream", "fairness", "reset"):
         expected_stream_connections = (
-            scenario["flows"] if scenario["mode"] == "stream" else 1
+            1 if scenario["mode"] == "fairness" else scenario["flows"]
         )
         stream_server_results, stream_results_complete = servers.stream_run_results(
             expected_stream_connections
@@ -1167,6 +1242,7 @@ def run_one(
     stream_server_violations: int | None = None
     stream_server_quiescent: bool | None = None
     fairness_quiet_samples: int | None = None
+    reset_outcome_counts: dict[str, int] | None = None
     if scenario["mode"] == "stream":
         assert stream_server_results is not None
         stream_server_connections = len(stream_server_results)
@@ -1217,6 +1293,29 @@ def run_one(
             and fairness_quiet_samples == quiet_expected
             and workload_summary.get("bytes") == expected_payload_total
         )
+    if scenario["mode"] == "reset":
+        assert stream_server_results is not None
+        stream_server_connections = len(stream_server_results)
+        stream_server_violations = sum(
+            1
+            for result in stream_server_results
+            if not reset_result_is_clean(
+                result, scenario["value"], scenario["prefix"], scenario["consume"]
+            )
+        )
+        stream_server_quiescent = (
+            stream_results_complete is True
+            and stream_server_connections == scenario["flows"]
+        )
+        reset_outcome_counts = {
+            "reset": sum(1 for flow in flows if flow.get("outcome") == "reset"),
+            "eof": sum(1 for flow in flows if flow.get("outcome") == "eof"),
+        }
+        ok = (
+            ok
+            and stream_server_connections == scenario["flows"]
+            and stream_server_violations == 0
+        )
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
     if metrics_path is not None:
@@ -1265,6 +1364,7 @@ def run_one(
         "stream_server_violations": stream_server_violations,
         "stream_server_quiescent": stream_server_quiescent,
         "fairness_quiet_samples": fairness_quiet_samples,
+        "reset_outcome_counts": reset_outcome_counts,
         "broker_pending_peak_bytes": (
             metric_summary.get("tcp_peak_pending_bytes")
             if scenario["mode"] == "stalled" and metric_summary is not None
@@ -1361,6 +1461,25 @@ def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hot_bytes": args.fairness_hot_bytes,
             }
         )
+    if args.reset_flows > 0:
+        result += [
+            {
+                "name": f"reset-response-{args.reset_flows}-flows",
+                "mode": "reset",
+                "flows": args.reset_flows,
+                "value": args.reset_request_bytes,
+                "prefix": args.reset_prefix_bytes,
+                "consume": 0,
+            },
+            {
+                "name": f"reset-early-{args.reset_flows}-flows",
+                "mode": "reset",
+                "flows": args.reset_flows,
+                "value": args.reset_request_bytes,
+                "prefix": 0,
+                "consume": args.reset_request_bytes // 2,
+            },
+        ]
     if args.stalled_flows > 0:
         result.append(
             {
@@ -1494,6 +1613,12 @@ def summarize(
                 "hot_goodput_bytes_per_second_median": (
                     statistics.median(hot_goodput) if hot_goodput else None
                 ),
+                "reset_outcome_reset_flows": sum(
+                    1 for flow in selected_flows if flow.get("outcome") == "reset"
+                ),
+                "reset_outcome_eof_flows": sum(
+                    1 for flow in selected_flows if flow.get("outcome") == "eof"
+                ),
                 "child_cpu_median_ns": median_field(valid_runs, "child_cpu_ns"),
                 "benchmark_server_cpu_median_ns": median_field(
                     valid_runs, "benchmark_server_cpu_ns"
@@ -1600,6 +1725,9 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "fairness_quiet_iterations": args.fairness_quiet_iterations,
         "fairness_quiet_payload": args.fairness_quiet_payload,
         "fairness_hot_bytes": args.fairness_hot_bytes,
+        "reset_flows": args.reset_flows,
+        "reset_request_bytes": args.reset_request_bytes,
+        "reset_prefix_bytes": args.reset_prefix_bytes,
         "stalled_flows": args.stalled_flows,
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
@@ -1652,6 +1780,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fairness-quiet-iterations", type=int, default=40)
     parser.add_argument("--fairness-quiet-payload", type=int, default=1024)
     parser.add_argument("--fairness-hot-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--reset-flows", type=int, default=128)
+    parser.add_argument("--reset-request-bytes", type=int, default=65536)
+    parser.add_argument("--reset-prefix-bytes", type=int, default=1024)
     parser.add_argument("--stalled-flows", type=int, default=128)
     # The proxied chain (kernel socket autotuning on both yatht hops, the 64 KiB
     # relay buffer, and the SOCKS proxy's stream buffers) can absorb several MiB
@@ -1723,6 +1854,14 @@ def parse_args() -> argparse.Namespace:
             "fairness quiet flows must be nonnegative with positive "
             "iterations, payload, and hot bytes"
         )
+    if args.reset_flows < 0 or (
+        args.reset_flows > 0
+        and (args.reset_request_bytes <= 1 or args.reset_prefix_bytes < 0)
+    ):
+        parser.error(
+            "reset flows must be nonnegative with request bytes above one "
+            "and nonnegative prefix bytes"
+        )
     if args.stalled_flows < 0 or (args.stalled_flows > 0 and args.stalled_bytes <= 0):
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
@@ -1733,6 +1872,7 @@ def parse_args() -> argparse.Namespace:
         and args.stream_flows == 0
         and args.slow_flows == 0
         and args.fairness_quiet_flows == 0
+        and args.reset_flows == 0
         and args.stalled_flows == 0
     ):
         parser.error("at least one scenario must be enabled")

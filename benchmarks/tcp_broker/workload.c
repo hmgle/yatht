@@ -1009,6 +1009,290 @@ static int run_fairness(const struct endpoint *echo_endpoint,
     return successful == total_flows ? 0 : 1;
 }
 
+/*
+ * Reset workload: FLOWS concurrent connections send request bytes to the
+ * stream server with direction 'R'. The server consumes CONSUME bytes
+ * (0 = the whole request), optionally answers with PREFIX payload bytes, and
+ * then aborts the connection so a hard RST propagates back. Clients classify
+ * the observable terminal state instead of asserting one: Linux and the relay
+ * chain may legitimately surface either ECONNRESET or a clean EOF, and the
+ * per-variant distribution is part of the dataset.
+ */
+struct reset_flow {
+    int fd;
+    int error;
+    int send_errno;
+    int recv_errno;
+    int connected;
+    int done;
+    size_t header_sent;
+    size_t to_send;
+    uint64_t received;
+    uint64_t sent_bytes;
+    int saw_eof;
+    uint64_t started_ns;
+    uint64_t connect_ns;
+};
+
+static void reset_flow_fail(struct reset_flow *flow, int error) {
+    if (flow->error == 0) {
+        flow->error = error;
+    }
+}
+
+static int reset_flow_finished(const struct reset_flow *flow) {
+    return flow->error != 0 || flow->saw_eof || flow->recv_errno != 0;
+}
+
+static void reset_flow_on_writable(struct reset_flow *flow, const uint8_t *header,
+                                   const uint8_t *payload) {
+    if (!flow->connected) {
+        int pending = 0;
+        socklen_t length = sizeof(pending);
+        if (getsockopt(flow->fd, SOL_SOCKET, SO_ERROR, &pending, &length) != 0) {
+            reset_flow_fail(flow, errno);
+            return;
+        }
+        if (pending != 0) {
+            reset_flow_fail(flow, pending);
+            return;
+        }
+        flow->connected = 1;
+        flow->connect_ns = monotonic_ns() - flow->started_ns;
+    }
+    while (flow->error == 0 && flow->header_sent < STREAM_HEADER_SIZE) {
+        ssize_t written = send(flow->fd, header + flow->header_sent,
+                               STREAM_HEADER_SIZE - flow->header_sent, MSG_NOSIGNAL);
+        if (written > 0) {
+            flow->header_sent += (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        reset_flow_fail(flow, written == 0 ? EIO : errno);
+        return;
+    }
+    while (flow->error == 0 && flow->to_send > 0) {
+        size_t chunk = flow->to_send > STREAM_CHUNK_SIZE ? STREAM_CHUNK_SIZE : flow->to_send;
+        ssize_t written = send(flow->fd, payload, chunk, MSG_NOSIGNAL);
+        if (written > 0) {
+            flow->to_send -= (size_t)written;
+            flow->sent_bytes += (uint64_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        if (written < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+            // Expected when the abort races the request: the reset arrived
+            // while data was still queued. Keep reading for the terminal
+            // state instead of treating this as a workload failure.
+            flow->send_errno = errno;
+            flow->to_send = 0;
+            return;
+        }
+        reset_flow_fail(flow, written == 0 ? EIO : errno);
+        return;
+    }
+}
+
+static void reset_flow_on_readable(struct reset_flow *flow, uint64_t prefix_limit) {
+    uint8_t buffer[STREAM_CHUNK_SIZE];
+    while (flow->error == 0 && !flow->saw_eof && flow->recv_errno == 0) {
+        ssize_t count = recv(flow->fd, buffer, sizeof(buffer), 0);
+        if (count > 0) {
+            for (ssize_t index = 0; index < count; ++index) {
+                if (buffer[index] != 0x5a) {
+                    reset_flow_fail(flow, EPROTO);
+                    break;
+                }
+            }
+            flow->received += (uint64_t)count;
+            if (flow->received > prefix_limit) {
+                reset_flow_fail(flow, EPROTO);
+            }
+            continue;
+        }
+        if (count == 0) {
+            flow->saw_eof = 1;
+            return;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+        if (errno == ECONNRESET) {
+            flow->recv_errno = errno;
+            return;
+        }
+        reset_flow_fail(flow, errno);
+        return;
+    }
+}
+
+static int run_reset(const struct endpoint *endpoint, size_t flows,
+                     size_t request_bytes, size_t prefix_bytes,
+                     size_t consume_bytes) {
+    uint8_t header[STREAM_HEADER_SIZE];
+    memset(header, 0, sizeof(header));
+    memcpy(header, "YBW1", 4);
+    header[4] = 'R';
+    encode_u64le(header + 8, (uint64_t)request_bytes);
+    encode_u64le(header + 16, (uint64_t)prefix_bytes);
+    encode_u64le(header + 24, (uint64_t)consume_bytes);
+
+    uint8_t *payload = malloc(STREAM_CHUNK_SIZE);
+    struct reset_flow *states = calloc(flows, sizeof(*states));
+    struct pollfd *poll_set = calloc(flows, sizeof(*poll_set));
+    size_t *poll_flows = calloc(flows, sizeof(*poll_flows));
+    if (payload == NULL || states == NULL || poll_set == NULL || poll_flows == NULL) {
+        perror("malloc");
+        free(payload);
+        free(states);
+        free(poll_set);
+        free(poll_flows);
+        return 2;
+    }
+    memset(payload, 0x5a, STREAM_CHUNK_SIZE);
+
+    for (size_t flow = 0; flow < flows; ++flow) {
+        struct reset_flow *state = &states[flow];
+        state->fd = -1;
+        state->started_ns = monotonic_ns();
+        state->to_send = request_bytes;
+        int fd = socket(endpoint->family,
+                        endpoint->socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                        endpoint->protocol);
+        if (fd < 0) {
+            state->error = errno;
+            continue;
+        }
+        state->fd = fd;
+        if (connect(fd, (const struct sockaddr *)&endpoint->address,
+                    endpoint->length) == 0) {
+            state->connected = 1;
+            state->connect_ns = monotonic_ns() - state->started_ns;
+        } else if (errno != EINPROGRESS) {
+            state->error = errno;
+        }
+    }
+
+    size_t successful = 0;
+    uint64_t total_bytes = 0;
+    size_t reset_outcomes = 0;
+    size_t eof_outcomes = 0;
+    for (;;) {
+        size_t active = 0;
+        for (size_t flow = 0; flow < flows; ++flow) {
+            struct reset_flow *state = &states[flow];
+            if (state->done) {
+                continue;
+            }
+            if (reset_flow_finished(state)) {
+                if (state->fd >= 0) {
+                    close(state->fd);
+                    state->fd = -1;
+                }
+                state->done = 1;
+                uint64_t total_ns = monotonic_ns() - state->started_ns;
+                const char *outcome = "error";
+                if (state->error == 0 && state->recv_errno == ECONNRESET) {
+                    outcome = "reset";
+                } else if (state->error == 0 && state->saw_eof) {
+                    outcome = "eof";
+                }
+                int ok = state->error == 0 && strcmp(outcome, "error") != 0;
+                if (ok) {
+                    ++successful;
+                    total_bytes += state->sent_bytes + state->received;
+                    if (strcmp(outcome, "reset") == 0) {
+                        ++reset_outcomes;
+                    } else {
+                        ++eof_outcomes;
+                    }
+                }
+                printf("{\"event\":\"flow\",\"flow\":%zu,\"ok\":%s,"
+                       "\"errno\":%d,\"outcome\":\"%s\",\"send_errno\":%d,"
+                       "\"recv_errno\":%d,\"connect_ns\":%" PRIu64
+                       ",\"total_ns\":%" PRIu64 ",\"sent_bytes\":%" PRIu64
+                       ",\"received_bytes\":%" PRIu64 "}\n",
+                       flow, ok ? "true" : "false", state->error, outcome,
+                       state->send_errno, state->recv_errno, state->connect_ns,
+                       total_ns, state->sent_bytes, state->received);
+                continue;
+            }
+            short events = POLLIN;
+            if (!state->connected || state->header_sent < STREAM_HEADER_SIZE ||
+                state->to_send > 0) {
+                events |= POLLOUT;
+            }
+            poll_set[active].fd = state->fd;
+            poll_set[active].events = events;
+            poll_set[active].revents = 0;
+            poll_flows[active] = flow;
+            ++active;
+        }
+        if (active == 0) {
+            break;
+        }
+        int ready = poll(poll_set, (nfds_t)active, -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            free(payload);
+            free(states);
+            free(poll_set);
+            free(poll_flows);
+            return 2;
+        }
+        for (size_t entry = 0; entry < active; ++entry) {
+            short revents = poll_set[entry].revents;
+            if (revents == 0) {
+                continue;
+            }
+            struct reset_flow *state = &states[poll_flows[entry]];
+            if (revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) {
+                reset_flow_on_writable(state, header, payload);
+            }
+            if (state->error == 0 && state->connected &&
+                state->header_sent == STREAM_HEADER_SIZE &&
+                (revents & (POLLIN | POLLERR | POLLHUP))) {
+                reset_flow_on_readable(state, (uint64_t)prefix_bytes);
+            }
+        }
+    }
+    free(payload);
+    free(states);
+    free(poll_set);
+    free(poll_flows);
+
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        perror("getrusage");
+        return 2;
+    }
+    printf("{\"event\":\"workload_summary\",\"mode\":\"reset\","
+           "\"flows\":%zu,\"successful\":%zu,\"bytes\":%" PRIu64
+           ",\"request_bytes\":%zu,\"prefix_bytes\":%zu,\"consume_bytes\":%zu"
+           ",\"reset_outcomes\":%zu,\"eof_outcomes\":%zu"
+           ",\"user_cpu_ns\":%" PRIu64 ",\"system_cpu_ns\":%" PRIu64 "}\n",
+           flows, successful, total_bytes, request_bytes, prefix_bytes,
+           consume_bytes, reset_outcomes, eof_outcomes,
+           timeval_ns(usage.ru_utime), timeval_ns(usage.ru_stime));
+    return successful == flows ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc < 6) {
@@ -1017,8 +1301,9 @@ int main(int argc, char **argv) {
                 "       %s idle HOST PORT FLOWS HOLD_MS\n"
                 "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS READY_PATH\n"
                 "       %s stream HOST PORT FLOWS BYTES_PER_FLOW DIRECTION RATE_BYTES_PER_SECOND\n"
+                "       %s reset HOST PORT FLOWS REQUEST_BYTES PREFIX_BYTES CONSUME_BYTES\n"
                 "       %s fairness HOST ECHO_PORT STREAM_PORT QUIET_FLOWS QUIET_ITERATIONS QUIET_PAYLOAD_BYTES HOT_BYTES\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "fairness") == 0) {
@@ -1056,6 +1341,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "stream") == 0 && argc == 8) {
         return run_stream(&endpoint, flows, value, argv[6],
                           parse_size(argv[7], "rate bytes per second"));
+    }
+    if (strcmp(argv[1], "reset") == 0 && argc == 8) {
+        return run_reset(&endpoint, flows, value,
+                         parse_size(argv[6], "prefix bytes"),
+                         parse_size(argv[7], "consume bytes"));
     }
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;
