@@ -375,6 +375,21 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(new_results, [])
 
+    def test_stalled_undersized_flow_count_classifies_calibration_misses(self) -> None:
+        blocked = {"blocked": True, "errno": 0, "accepted_bytes": 8}
+        undersized = {"blocked": False, "errno": 0, "accepted_bytes": 8}
+        errored = {"blocked": False, "errno": 104, "accepted_bytes": 8}
+        partial = {"blocked": False, "errno": 0, "accepted_bytes": 3}
+
+        self.assertEqual(
+            benchmark.stalled_undersized_flow_count(
+                [blocked, undersized, errored, partial], 8
+            ),
+            1,
+        )
+        self.assertEqual(benchmark.stalled_undersized_flow_count([], 8), 0)
+        self.assertEqual(benchmark.stalled_undersized_flow_count([blocked], 8), 0)
+
     def test_stalled_server_quiescence_rejects_unsafe_reuse(self) -> None:
         complete = [{"bytes": 1, "content_ok": True, "eof": True}]
         incomplete = [{"bytes": 1, "content_ok": True, "eof": False}]

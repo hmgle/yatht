@@ -971,6 +971,24 @@ def parse_workload_output(
     return flows, samples, summaries[0]
 
 
+def stalled_undersized_flow_count(
+    flows: list[dict[str, Any]], bytes_per_flow: int
+) -> int:
+    """Count stalled flows that absorbed the whole payload without blocking.
+
+    Such flows mean the relay chain's elasticity exceeded the configured
+    payload, so the run never exercised backpressure: a calibration failure
+    (raise --stalled-bytes), distinct from a backpressure violation.
+    """
+    return sum(
+        1
+        for flow in flows
+        if not flow.get("blocked")
+        and flow.get("errno") == 0
+        and flow.get("accepted_bytes") == bytes_per_flow
+    )
+
+
 def workload_flows_are_valid(flows: list[dict[str, Any]], expected: int) -> bool:
     return (
         len(flows) == expected
@@ -1403,8 +1421,12 @@ def run_one(
     stalled_server_byte_mismatch_connections: int | None = None
     stalled_server_incomplete_connections: int | None = None
     stalled_server_quiescent: bool | None = None
+    stalled_undersized_flows: int | None = None
     if scenario["mode"] == "stalled":
         assert stalled_server_results is not None
+        stalled_undersized_flows = stalled_undersized_flow_count(
+            flows, scenario["value"]
+        )
         stalled_server_connections = len(stalled_server_results)
         stalled_server_corrupt_connections = sum(
             1 for result in stalled_server_results if not result["content_ok"]
@@ -1553,6 +1575,7 @@ def run_one(
         "stalled_server_byte_mismatch_connections": stalled_server_byte_mismatch_connections,
         "stalled_server_incomplete_connections": stalled_server_incomplete_connections,
         "stalled_server_quiescent": stalled_server_quiescent,
+        "stalled_undersized_flows": stalled_undersized_flows,
         "stream_server_connections": stream_server_connections,
         "stream_server_violations": stream_server_violations,
         "stream_server_quiescent": stream_server_quiescent,
@@ -2176,6 +2199,7 @@ def main() -> None:
                                     "stalled_server_byte_mismatch_connections",
                                     "stalled_server_incomplete_connections",
                                     "stalled_server_quiescent",
+                                    "stalled_undersized_flows",
                                     "stream_server_connections",
                                     "stream_server_violations",
                                     "stream_server_quiescent",
@@ -2213,6 +2237,13 @@ def main() -> None:
                             f"{'ok' if run['ok'] else 'FAILED'}",
                             flush=True,
                         )
+                        if not run["ok"] and run.get("stalled_undersized_flows"):
+                            print(
+                                f"  calibration: {run['stalled_undersized_flows']} "
+                                "stalled flow(s) absorbed the full payload without "
+                                "blocking; raise --stalled-bytes",
+                                flush=True,
+                            )
                         require_stalled_server_quiescence(run)
                         require_stream_server_quiescence(run)
                 if "stable" in args.variants and not args.skip_diagnostics:
