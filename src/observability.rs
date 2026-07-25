@@ -11,7 +11,7 @@ use crossbeam_channel as channel;
 use serde::Serialize;
 
 const METRIC_QUEUE_CAPACITY: usize = 4096;
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Default)]
 pub struct Observability {
@@ -48,8 +48,14 @@ struct ObservabilityInner {
     tcp_upstream_to_target_bytes: AtomicU64,
     tcp_recv_syscalls: AtomicU64,
     tcp_send_syscalls: AtomicU64,
+    tcp_splice_in_syscalls: AtomicU64,
+    tcp_splice_out_syscalls: AtomicU64,
+    tcp_splice_fallbacks: AtomicU64,
+    tcp_pipe_bytes: AtomicU64,
+    tcp_peak_pipe_bytes: AtomicU64,
     tcp_command_wakeups: AtomicU64,
     tcp_poll_calls: AtomicU64,
+    tcp_epoll_ctl_calls: AtomicU64,
     tcp_poll_ready_returns: AtomicU64,
     tcp_poll_ready_fds: AtomicU64,
     tcp_no_progress_iterations: AtomicU64,
@@ -96,8 +102,14 @@ impl ObservabilityInner {
             tcp_upstream_to_target_bytes: AtomicU64::new(0),
             tcp_recv_syscalls: AtomicU64::new(0),
             tcp_send_syscalls: AtomicU64::new(0),
+            tcp_splice_in_syscalls: AtomicU64::new(0),
+            tcp_splice_out_syscalls: AtomicU64::new(0),
+            tcp_splice_fallbacks: AtomicU64::new(0),
+            tcp_pipe_bytes: AtomicU64::new(0),
+            tcp_peak_pipe_bytes: AtomicU64::new(0),
             tcp_command_wakeups: AtomicU64::new(0),
             tcp_poll_calls: AtomicU64::new(0),
+            tcp_epoll_ctl_calls: AtomicU64::new(0),
             tcp_poll_ready_returns: AtomicU64::new(0),
             tcp_poll_ready_fds: AtomicU64::new(0),
             tcp_no_progress_iterations: AtomicU64::new(0),
@@ -143,6 +155,7 @@ enum MetricEvent {
         rlimit_nofile: u64,
         baseline_fds: usize,
         reserved_fds: usize,
+        fds_per_flow: usize,
     },
     TcpSetup(Box<TcpSetupEvent>),
 }
@@ -197,8 +210,14 @@ struct RunSummary {
     tcp_upstream_to_target_bytes: u64,
     tcp_recv_syscalls: u64,
     tcp_send_syscalls: u64,
+    tcp_splice_in_syscalls: u64,
+    tcp_splice_out_syscalls: u64,
+    tcp_splice_fallbacks: u64,
+    tcp_pipe_bytes: u64,
+    tcp_peak_pipe_bytes: u64,
     tcp_command_wakeups: u64,
     tcp_poll_calls: u64,
+    tcp_epoll_ctl_calls: u64,
     tcp_poll_ready_returns: u64,
     tcp_poll_ready_fds: u64,
     tcp_no_progress_iterations: u64,
@@ -323,8 +342,14 @@ impl ObservabilityRuntime {
                 .load(Ordering::Relaxed),
             tcp_recv_syscalls: inner.tcp_recv_syscalls.load(Ordering::Relaxed),
             tcp_send_syscalls: inner.tcp_send_syscalls.load(Ordering::Relaxed),
+            tcp_splice_in_syscalls: inner.tcp_splice_in_syscalls.load(Ordering::Relaxed),
+            tcp_splice_out_syscalls: inner.tcp_splice_out_syscalls.load(Ordering::Relaxed),
+            tcp_splice_fallbacks: inner.tcp_splice_fallbacks.load(Ordering::Relaxed),
+            tcp_pipe_bytes: inner.tcp_pipe_bytes.load(Ordering::Relaxed),
+            tcp_peak_pipe_bytes: inner.tcp_peak_pipe_bytes.load(Ordering::Relaxed),
             tcp_command_wakeups: inner.tcp_command_wakeups.load(Ordering::Relaxed),
             tcp_poll_calls: inner.tcp_poll_calls.load(Ordering::Relaxed),
+            tcp_epoll_ctl_calls: inner.tcp_epoll_ctl_calls.load(Ordering::Relaxed),
             tcp_poll_ready_returns: inner.tcp_poll_ready_returns.load(Ordering::Relaxed),
             tcp_poll_ready_fds: inner.tcp_poll_ready_fds.load(Ordering::Relaxed),
             tcp_no_progress_iterations: inner.tcp_no_progress_iterations.load(Ordering::Relaxed),
@@ -401,6 +426,7 @@ impl Observability {
         rlimit_nofile: u64,
         baseline_fds: usize,
         reserved_fds: usize,
+        fds_per_flow: usize,
     ) {
         let event = MetricEvent::TcpBrokerLimits {
             schema_version: SCHEMA_VERSION,
@@ -411,6 +437,7 @@ impl Observability {
             rlimit_nofile,
             baseline_fds,
             reserved_fds,
+            fds_per_flow,
         };
         self.try_record(event);
     }
@@ -572,6 +599,61 @@ impl Observability {
     pub fn tcp_send(&self) {
         if let Some(inner) = &self.inner {
             inner.tcp_send_syscalls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_splice_in(&self, bytes: usize, target_to_upstream: bool) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.tcp_splice_in_syscalls.fetch_add(1, Ordering::Relaxed);
+        if bytes != 0 {
+            let counter = if target_to_upstream {
+                &inner.tcp_target_to_upstream_bytes
+            } else {
+                &inner.tcp_upstream_to_target_bytes
+            };
+            counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_splice_out(&self) {
+        if let Some(inner) = &self.inner {
+            inner
+                .tcp_splice_out_syscalls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_splice_fallback(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_splice_fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tcp_pipe_added(&self, added: usize) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let current = inner
+            .tcp_pipe_bytes
+            .fetch_add(added as u64, Ordering::Relaxed)
+            .saturating_add(added as u64);
+        update_peak(&inner.tcp_peak_pipe_bytes, current);
+    }
+
+    pub fn tcp_pipe_removed(&self, removed: usize) {
+        if let Some(inner) = &self.inner {
+            let previous = inner
+                .tcp_pipe_bytes
+                .fetch_sub(removed as u64, Ordering::Relaxed);
+            debug_assert!(previous >= removed as u64);
+        }
+    }
+
+    pub fn tcp_epoll_ctl(&self) {
+        if let Some(inner) = &self.inner {
+            inner.tcp_epoll_ctl_calls.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -46,6 +46,48 @@ fn reactor_kind_from_env() -> io::Result<ReactorKind> {
         )),
     }
 }
+
+// The data mover decides how relay bytes travel between the two sockets:
+// buffered user-space copies (default) or kernel pipes moved with splice.
+// Splice is opt-in experimental (TCP_BROKER_ROADMAP.md M3).
+const DATA_MOVER_ENV: &str = "SUP_TCP_DATA_MOVER";
+// Per-direction, per-round splice byte budget and syscall bound. Roadmap
+// pre-registered starting values; benchmarks may tune them.
+const SPLICE_BATCH_BUDGET_BYTES: usize = 256 * 1024;
+const SPLICE_MAX_SYSCALLS_PER_ROUND: usize = 8;
+// Two pipes per spliced flow, two fds per pipe, on top of the two sockets.
+const SPLICE_PIPE_FDS_PER_FLOW: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DataMoverKind {
+    Buffered,
+    Splice,
+}
+
+impl DataMoverKind {
+    fn fds_per_flow(self) -> usize {
+        match self {
+            Self::Buffered => BROKER_FDS_PER_FLOW,
+            Self::Splice => BROKER_FDS_PER_FLOW + SPLICE_PIPE_FDS_PER_FLOW,
+        }
+    }
+}
+
+fn data_mover_kind_from_env() -> io::Result<DataMoverKind> {
+    match std::env::var(DATA_MOVER_ENV) {
+        Ok(value) if value == "buffered" => Ok(DataMoverKind::Buffered),
+        Ok(value) if value == "splice" => Ok(DataMoverKind::Splice),
+        Ok(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {DATA_MOVER_ENV} value: {value}"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(DataMoverKind::Buffered),
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {DATA_MOVER_ENV} value: {err}"),
+        )),
+    }
+}
 const DEFAULT_MAX_ACTIVE_FLOWS: usize = 16_384;
 const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFER_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
@@ -57,6 +99,7 @@ pub struct TcpBroker {
     tx: channel::Sender<BrokerCommand>,
     wake_fd: Arc<OwnedFd>,
     resources: Arc<BrokerResources>,
+    mover: DataMoverKind,
 }
 
 pub struct TcpBrokerReactor {
@@ -135,8 +178,32 @@ struct TcpRelay {
 /// Per-direction relay storage. The flow state machine (EOF, half-close,
 /// error deferral, teardown) lives in `TcpRelay` and must never depend on
 /// how a direction stores bytes in flight.
-struct RelayChannel {
-    buffer: PendingBuffer,
+enum RelayChannel {
+    Buffered(PendingBuffer),
+    Spliced(SplicePipe),
+}
+
+/// Kernel pipe carrying one relay direction for the splice mover.
+///
+/// Safety/semantic invariants:
+/// - `splice` cannot request `MSG_NOSIGNAL`; writing into a peer-closed
+///   socket relies on the Rust runtime ignoring SIGPIPE in this process
+///   (std installs SIG_IGN before main, and `std::process::Command`
+///   restores SIG_DFL in spawned targets), so errors surface as EPIPE.
+/// - `capacity` is the size reported by `F_GETPIPE_SZ` at creation time;
+///   under `fs.pipe-user-pages-soft` pressure the kernel hands out 4 KiB
+///   pipes, so the real value must be read, reserved against the global
+///   buffer-capacity ledger, and released on drop.
+/// - `full` is a conservative flag: EAGAIN while the pipe holds bytes may
+///   mean slot fragmentation filled it below `capacity`. Parking the read
+///   side until the pipe drains cannot lose a wakeup under level-triggered
+///   readiness.
+struct SplicePipe {
+    read_end: OwnedFd,
+    write_end: OwnedFd,
+    len: usize,
+    capacity: usize,
+    full: bool,
 }
 
 #[derive(Default)]
@@ -157,8 +224,9 @@ impl TcpBroker {
         setup_concurrency: usize,
     ) -> io::Result<(Self, TcpBrokerReactor)> {
         let kind = reactor_kind_from_env()?;
-        let (limits, flow_limit_reason) = TcpBrokerLimits::detect(setup_concurrency)?;
-        Self::new_with_limits(observability, limits, flow_limit_reason, kind)
+        let mover = data_mover_kind_from_env()?;
+        let (limits, flow_limit_reason) = TcpBrokerLimits::detect(setup_concurrency, mover)?;
+        Self::new_with_limits(observability, limits, flow_limit_reason, kind, mover)
     }
 
     fn new_with_limits(
@@ -166,6 +234,7 @@ impl TcpBroker {
         limits: TcpBrokerLimits,
         flow_limit_reason: FlowLimitReason,
         kind: ReactorKind,
+        mover: DataMoverKind,
     ) -> io::Result<(Self, TcpBrokerReactor)> {
         let wake_fd = Arc::new(create_eventfd()?);
         let (tx, rx) = channel::bounded(REGISTRATION_QUEUE_CAPACITY);
@@ -186,12 +255,14 @@ impl TcpBroker {
             limits.rlimit_nofile,
             limits.baseline_fds,
             limits.reserved_fds,
+            mover.fds_per_flow(),
         );
         Ok((
             Self {
                 tx,
                 wake_fd: Arc::clone(&wake_fd),
                 resources: Arc::clone(&resources),
+                mover,
             },
             TcpBrokerReactor {
                 rx,
@@ -253,6 +324,7 @@ impl TcpBroker {
             upstream,
             permit,
             Arc::clone(&registration_cancelled),
+            self.mover,
         ) {
             Ok(relay) => relay,
             Err(err) => {
@@ -308,7 +380,10 @@ impl TcpBroker {
 }
 
 impl TcpBrokerLimits {
-    fn detect(setup_concurrency: usize) -> io::Result<(Self, FlowLimitReason)> {
+    fn detect(
+        setup_concurrency: usize,
+        mover: DataMoverKind,
+    ) -> io::Result<(Self, FlowLimitReason)> {
         let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
             return Err(io::Error::last_os_error());
@@ -326,7 +401,7 @@ impl TcpBrokerLimits {
         let fd_flow_limit = soft_limit
             .saturating_sub(baseline_fds)
             .saturating_sub(reserved_fds)
-            / BROKER_FDS_PER_FLOW;
+            / mover.fds_per_flow();
         let max_active_flows = DEFAULT_MAX_ACTIVE_FLOWS.min(fd_flow_limit);
         if max_active_flows == 0 {
             return Err(io::Error::new(
@@ -422,12 +497,16 @@ impl BrokerResources {
     }
 
     fn reserve_buffer_capacity(&self) -> bool {
+        self.reserve_buffer_capacity_bytes(READ_CHUNK_SIZE)
+    }
+
+    fn reserve_buffer_capacity_bytes(&self, requested: usize) -> bool {
         let reserved = self.buffer_capacity_bytes.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |current| {
                 current
-                    .checked_add(READ_CHUNK_SIZE)
+                    .checked_add(requested)
                     .filter(|next| *next <= self.limits.max_buffer_capacity_bytes)
             },
         );
@@ -435,8 +514,7 @@ impl BrokerResources {
             self.observability.tcp_resource_rejection("buffer_capacity");
             return false;
         }
-        self.observability
-            .tcp_buffer_capacity_reserved(READ_CHUNK_SIZE);
+        self.observability.tcp_buffer_capacity_reserved(requested);
         true
     }
 
@@ -636,7 +714,8 @@ impl TcpBrokerReactor {
     }
 
     fn run_epoll(mut self) -> io::Result<()> {
-        let mut ep = match EpollState::new(self.wake_fd.as_raw_fd()) {
+        let mut ep = match EpollState::new(self.wake_fd.as_raw_fd(), &self.resources.observability)
+        {
             Ok(ep) => ep,
             Err(err) => return self.fail(err),
         };
@@ -700,6 +779,7 @@ impl TcpBrokerReactor {
         // the caller drops the relay: closing the sole descriptor reference
         // detaches it from the epoll set.
         epoll_ctl(
+            &self.resources.observability,
             epfd,
             libc::EPOLL_CTL_ADD,
             relay.target.as_raw_fd(),
@@ -707,6 +787,7 @@ impl TcpBrokerReactor {
             encode_flow_token(slot, generation, false),
         )?;
         epoll_ctl(
+            &self.resources.observability,
             epfd,
             libc::EPOLL_CTL_ADD,
             relay.upstream.as_raw_fd(),
@@ -838,6 +919,7 @@ impl TcpBrokerReactor {
         let mut changed = false;
         if cached.target != target.events {
             epoll_ctl(
+                &self.resources.observability,
                 epfd,
                 libc::EPOLL_CTL_MOD,
                 target_fd,
@@ -848,6 +930,7 @@ impl TcpBrokerReactor {
         }
         if cached.upstream != upstream.events {
             epoll_ctl(
+                &self.resources.observability,
                 epfd,
                 libc::EPOLL_CTL_MOD,
                 upstream_fd,
@@ -970,13 +1053,14 @@ impl InterestSnapshot {
 }
 
 impl EpollState {
-    fn new(wake_fd: RawFd) -> io::Result<Self> {
+    fn new(wake_fd: RawFd, observability: &Observability) -> io::Result<Self> {
         let rc = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
         let epfd = unsafe { OwnedFd::from_raw_fd(rc) };
         epoll_ctl(
+            observability,
             epfd.as_raw_fd(),
             libc::EPOLL_CTL_ADD,
             wake_fd,
@@ -1070,7 +1154,15 @@ fn poll_to_epoll_interest(events: libc::c_short) -> u32 {
     bits
 }
 
-fn epoll_ctl(epfd: RawFd, op: libc::c_int, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
+fn epoll_ctl(
+    observability: &Observability,
+    epfd: RawFd,
+    op: libc::c_int,
+    fd: RawFd,
+    events: u32,
+    token: u64,
+) -> io::Result<()> {
+    observability.tcp_epoll_ctl();
     let mut event = libc::epoll_event { events, u64: token };
     let rc = unsafe { libc::epoll_ctl(epfd, op, fd, &mut event) };
     if rc < 0 {
@@ -1099,16 +1191,30 @@ impl TcpRelay {
         upstream: TcpStream,
         permit: TcpFlowPermit,
         registration_cancelled: Arc<AtomicBool>,
+        mover: DataMoverKind,
     ) -> io::Result<Self> {
         target.set_nonblocking(true)?;
         upstream.set_nonblocking(true)?;
         target.set_nodelay(true)?;
         upstream.set_nodelay(true)?;
+        let (target_to_upstream, upstream_to_target) = match mover {
+            DataMoverKind::Buffered => (RelayChannel::buffered(), RelayChannel::buffered()),
+            DataMoverKind::Splice => match RelayChannel::spliced_pair(&permit.resources) {
+                Some(pair) => pair,
+                None => {
+                    // No bytes have moved yet, so falling back to the
+                    // buffered mover is always safe (TCP_BROKER_ROADMAP.md
+                    // 6.2); the flow itself must not fail here.
+                    permit.resources.observability.tcp_splice_fallback();
+                    (RelayChannel::buffered(), RelayChannel::buffered())
+                }
+            },
+        };
         Ok(Self {
             target,
             upstream,
-            target_to_upstream: RelayChannel::buffered(),
-            upstream_to_target: RelayChannel::buffered(),
+            target_to_upstream,
+            upstream_to_target,
             target_read_eof: false,
             upstream_read_eof: false,
             target_write_shutdown: false,
@@ -1478,25 +1584,47 @@ impl PendingBuffer {
 
 impl RelayChannel {
     fn buffered() -> Self {
-        Self {
-            buffer: PendingBuffer::default(),
-        }
+        Self::Buffered(PendingBuffer::default())
+    }
+
+    /// Both direction pipes for one spliced flow, or `None` when pipe
+    /// creation or capacity admission fails and the flow must fall back to
+    /// the buffered mover before any byte has moved.
+    fn spliced_pair(resources: &BrokerResources) -> Option<(Self, Self)> {
+        let first = SplicePipe::try_new(resources)?;
+        let Some(second) = SplicePipe::try_new(resources) else {
+            first.release(resources);
+            return None;
+        };
+        Some((Self::Spliced(first), Self::Spliced(second)))
     }
 
     fn len(&self) -> usize {
-        self.buffer.len()
+        match self {
+            Self::Buffered(buffer) => buffer.len(),
+            Self::Spliced(pipe) => pipe.len,
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.len() == 0
     }
 
     fn is_full(&self) -> bool {
-        self.buffer.is_full()
+        match self {
+            Self::Buffered(buffer) => buffer.is_full(),
+            Self::Spliced(pipe) => pipe.full || pipe.len >= pipe.capacity,
+        }
     }
 
     fn has_writable_capacity(&self) -> bool {
-        self.buffer.has_writable_capacity()
+        match self {
+            Self::Buffered(buffer) => buffer.has_writable_capacity(),
+            // Pipe capacity is reserved up front, so a spliced direction
+            // never depends on the global buffer-capacity budget at read
+            // time; only its own occupancy can block it.
+            Self::Spliced(pipe) => !pipe.full && pipe.len < pipe.capacity,
+        }
     }
 
     fn read_from(
@@ -1505,7 +1633,10 @@ impl RelayChannel {
         resources: &BrokerResources,
         target_to_upstream: bool,
     ) -> io::Result<BatchedRead> {
-        read_socket(stream, &mut self.buffer, resources, target_to_upstream)
+        match self {
+            Self::Buffered(buffer) => read_socket(stream, buffer, resources, target_to_upstream),
+            Self::Spliced(pipe) => pipe.read_from_socket(stream, resources, target_to_upstream),
+        }
     }
 
     fn flush_to(
@@ -1513,21 +1644,201 @@ impl RelayChannel {
         stream: &TcpStream,
         resources: &BrokerResources,
     ) -> io::Result<WriteOutcome> {
-        flush_socket(stream, &mut self.buffer, resources)
+        match self {
+            Self::Buffered(buffer) => flush_socket(stream, buffer, resources),
+            Self::Spliced(pipe) => pipe.flush_to_socket(stream, resources),
+        }
     }
 
     fn release(&mut self, resources: &BrokerResources) {
-        self.buffer.release_capacity(resources);
+        match self {
+            Self::Buffered(buffer) => buffer.release_capacity(resources),
+            Self::Spliced(pipe) => {
+                if pipe.len > 0 {
+                    resources.observability.tcp_pipe_removed(pipe.len);
+                    pipe.len = 0;
+                }
+                resources.release_buffer_capacity(pipe.capacity);
+                pipe.capacity = 0;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_spliced(&self) -> bool {
+        matches!(self, Self::Spliced(_))
     }
 
     #[cfg(test)]
     fn append(&mut self, bytes: &[u8], resources: &BrokerResources) {
-        self.buffer.append(bytes, resources);
+        match self {
+            Self::Buffered(buffer) => buffer.append(bytes, resources),
+            Self::Spliced(_) => panic!("append is a buffered-only test helper"),
+        }
     }
 
     #[cfg(test)]
     fn chunk_count(&self) -> usize {
-        self.buffer.chunks.len()
+        match self {
+            Self::Buffered(buffer) => buffer.chunks.len(),
+            Self::Spliced(_) => 0,
+        }
+    }
+}
+
+impl SplicePipe {
+    fn try_new(resources: &BrokerResources) -> Option<Self> {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return None;
+        }
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let capacity = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        if capacity <= 0 {
+            return None;
+        }
+        let capacity = capacity as usize;
+        if !resources.reserve_buffer_capacity_bytes(capacity) {
+            return None;
+        }
+        Some(Self {
+            read_end,
+            write_end,
+            len: 0,
+            capacity,
+            full: false,
+        })
+    }
+
+    fn release(self, resources: &BrokerResources) {
+        debug_assert_eq!(self.len, 0);
+        resources.release_buffer_capacity(self.capacity);
+    }
+
+    fn read_from_socket(
+        &mut self,
+        stream: &TcpStream,
+        resources: &BrokerResources,
+        target_to_upstream: bool,
+    ) -> io::Result<BatchedRead> {
+        let mut outcome = BatchedRead::IDLE;
+        let mut budget = SPLICE_BATCH_BUDGET_BYTES;
+        let mut syscalls = 0;
+        while budget > 0 && syscalls < SPLICE_MAX_SYSCALLS_PER_ROUND {
+            let room = self.capacity.saturating_sub(self.len);
+            if room == 0 {
+                self.full = true;
+                break;
+            }
+            let want = room.min(budget);
+            let reserved = resources.reserve_pending(want);
+            if reserved == 0 {
+                break;
+            }
+            syscalls += 1;
+            let rc = splice_fds(stream.as_raw_fd(), self.write_end.as_raw_fd(), reserved);
+            resources
+                .observability
+                .tcp_splice_in(rc.max(0) as usize, target_to_upstream);
+            if rc > 0 {
+                let moved = rc as usize;
+                resources.release_pending(reserved - moved);
+                self.len += moved;
+                resources.observability.tcp_pending_added(moved);
+                resources.observability.tcp_pipe_added(moved);
+                outcome.progressed = true;
+                budget = budget.saturating_sub(moved);
+                if moved < reserved {
+                    // A short splice drained the socket or filled the pipe;
+                    // level-triggered readiness re-reports whatever remains.
+                    break;
+                }
+                continue;
+            }
+            resources.release_pending(reserved);
+            if rc == 0 {
+                outcome.eof = true;
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                if self.len > 0 {
+                    // EAGAIN with queued bytes may mean the pipe is full even
+                    // below `capacity` (slot fragmentation). Parking the read
+                    // side until the pipe drains cannot lose a wakeup.
+                    self.full = true;
+                }
+                break;
+            }
+            if outcome.progressed {
+                // The socket error persists; surfacing it mid-batch would
+                // tear down the relay before this batch's bytes are flushed.
+                // The next round drains the pipe first and then observes it.
+                break;
+            }
+            return Err(err);
+        }
+        Ok(outcome)
+    }
+
+    fn flush_to_socket(
+        &mut self,
+        stream: &TcpStream,
+        resources: &BrokerResources,
+    ) -> io::Result<WriteOutcome> {
+        let mut outcome = WriteOutcome::Idle;
+        while self.len > 0 {
+            let want = self.len;
+            let rc = splice_fds(self.read_end.as_raw_fd(), stream.as_raw_fd(), want);
+            resources.observability.tcp_splice_out();
+            if rc > 0 {
+                let moved = rc as usize;
+                self.len -= moved;
+                self.full = false;
+                resources.release_pending(moved);
+                resources.observability.tcp_pending_removed(moved);
+                resources.observability.tcp_pipe_removed(moved);
+                outcome = WriteOutcome::Progress;
+                if moved < want {
+                    // A partial drain means the socket buffer is full; the
+                    // next splice would only report EAGAIN.
+                    break;
+                }
+                continue;
+            }
+            if rc == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "TCP broker splice wrote zero",
+                ));
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            return Err(err);
+        }
+        Ok(outcome)
+    }
+}
+
+fn splice_fds(from: RawFd, to: RawFd, len: usize) -> libc::ssize_t {
+    loop {
+        let rc = unsafe {
+            libc::splice(
+                from,
+                std::ptr::null_mut(),
+                to,
+                std::ptr::null_mut(),
+                len,
+                libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+            )
+        };
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break rc;
     }
 }
 
@@ -1747,16 +2058,26 @@ mod tests {
 
     #[test]
     fn relays_data_and_propagates_half_closes() {
-        relays_data_and_propagates_half_closes_case(ReactorKind::Poll);
+        relays_data_and_propagates_half_closes_case(ReactorKind::Poll, DataMoverKind::Buffered);
     }
 
     #[test]
     fn relays_data_and_propagates_half_closes_with_epoll() {
-        relays_data_and_propagates_half_closes_case(ReactorKind::Epoll);
+        relays_data_and_propagates_half_closes_case(ReactorKind::Epoll, DataMoverKind::Buffered);
     }
 
-    fn relays_data_and_propagates_half_closes_case(kind: ReactorKind) {
-        let (broker, reactor) = test_broker_kind(kind, 32, DEFAULT_MAX_PENDING_BYTES);
+    #[test]
+    fn relays_data_and_propagates_half_closes_with_epoll_splice() {
+        relays_data_and_propagates_half_closes_case(ReactorKind::Epoll, DataMoverKind::Splice);
+    }
+
+    #[test]
+    fn relays_data_and_propagates_half_closes_with_poll_splice() {
+        relays_data_and_propagates_half_closes_case(ReactorKind::Poll, DataMoverKind::Splice);
+    }
+
+    fn relays_data_and_propagates_half_closes_case(kind: ReactorKind, mover: DataMoverKind) {
+        let (broker, reactor) = test_broker_backends(kind, mover, 32, DEFAULT_MAX_PENDING_BYTES);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
         let (mut target, broker_target) = tcp_pair();
         let (broker_upstream, mut remote) = tcp_pair();
@@ -1801,6 +2122,7 @@ mod tests {
             limits,
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
+            DataMoverKind::Buffered,
         )
         .unwrap();
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -1976,15 +2298,29 @@ mod tests {
 
     #[test]
     fn shutdown_joins_after_cancelling_active_relays() {
-        shutdown_joins_after_cancelling_active_relays_case(ReactorKind::Poll);
+        shutdown_joins_after_cancelling_active_relays_case(
+            ReactorKind::Poll,
+            DataMoverKind::Buffered,
+        );
     }
 
     #[test]
     fn shutdown_joins_after_cancelling_active_relays_with_epoll() {
-        shutdown_joins_after_cancelling_active_relays_case(ReactorKind::Epoll);
+        shutdown_joins_after_cancelling_active_relays_case(
+            ReactorKind::Epoll,
+            DataMoverKind::Buffered,
+        );
     }
 
-    fn shutdown_joins_after_cancelling_active_relays_case(kind: ReactorKind) {
+    #[test]
+    fn shutdown_joins_after_cancelling_active_relays_with_epoll_splice() {
+        shutdown_joins_after_cancelling_active_relays_case(
+            ReactorKind::Epoll,
+            DataMoverKind::Splice,
+        );
+    }
+
+    fn shutdown_joins_after_cancelling_active_relays_case(kind: ReactorKind, mover: DataMoverKind) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("metrics.jsonl");
         let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
@@ -2001,6 +2337,7 @@ mod tests {
             limits,
             FlowLimitReason::ActiveFlow,
             kind,
+            mover,
         )
         .unwrap();
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -2050,6 +2387,7 @@ mod tests {
             limits,
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
+            DataMoverKind::Buffered,
         )
         .unwrap();
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2072,15 +2410,20 @@ mod tests {
 
     #[test]
     fn reactor_panic_fails_started_relays() {
-        reactor_panic_fails_started_relays_case(ReactorKind::Poll);
+        reactor_panic_fails_started_relays_case(ReactorKind::Poll, DataMoverKind::Buffered);
     }
 
     #[test]
     fn reactor_panic_fails_started_relays_with_epoll() {
-        reactor_panic_fails_started_relays_case(ReactorKind::Epoll);
+        reactor_panic_fails_started_relays_case(ReactorKind::Epoll, DataMoverKind::Buffered);
     }
 
-    fn reactor_panic_fails_started_relays_case(kind: ReactorKind) {
+    #[test]
+    fn reactor_panic_fails_started_relays_with_epoll_splice() {
+        reactor_panic_fails_started_relays_case(ReactorKind::Epoll, DataMoverKind::Splice);
+    }
+
+    fn reactor_panic_fails_started_relays_case(kind: ReactorKind, mover: DataMoverKind) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("metrics.jsonl");
         let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
@@ -2097,6 +2440,7 @@ mod tests {
             limits,
             FlowLimitReason::ActiveFlow,
             kind,
+            mover,
         )
         .unwrap();
         let reactor_thread =
@@ -2208,6 +2552,252 @@ mod tests {
     }
 
     #[test]
+    fn spliced_flow_moves_patterned_payload_beyond_pipe_capacity() {
+        let (broker, mut reactor) = test_broker_backends(
+            ReactorKind::Poll,
+            DataMoverKind::Splice,
+            1,
+            DEFAULT_MAX_PENDING_BYTES,
+        );
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&target);
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        assert!(reactor.relay_mut(0).target_to_upstream.is_spliced());
+        assert!(reactor.relay_mut(0).upstream_to_target.is_spliced());
+
+        let payload: Vec<u8> = (0..256 * 1024_u32).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let writer = thread::spawn(move || {
+            target.write_all(&payload).unwrap();
+            target.shutdown(Shutdown::Write).unwrap();
+            target
+        });
+        let reader = thread::spawn(move || {
+            let mut received = Vec::new();
+            remote.read_to_end(&mut received).unwrap();
+            received
+        });
+        for _ in 0..20_000 {
+            let relay = reactor.relay_mut(0);
+            let progressed = relay
+                .process(libc::POLLIN | libc::POLLOUT, libc::POLLIN | libc::POLLOUT)
+                .unwrap();
+            if relay.target_read_eof
+                && relay.target_to_upstream.is_empty()
+                && relay.upstream_write_shutdown
+            {
+                break;
+            }
+            if !progressed {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let relay = reactor.relay_mut(0);
+        assert!(relay.target_read_eof);
+        assert!(relay.upstream_write_shutdown);
+        assert_eq!(reader.join().unwrap(), expected);
+        let _target = writer.join().unwrap();
+
+        drop(reactor);
+        assert_eq!(broker.resources.pending_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(
+            broker
+                .resources
+                .buffer_capacity_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn spliced_backpressure_parks_reads_and_half_closes_after_drain() {
+        let (broker, mut reactor) = test_broker_backends(
+            ReactorKind::Poll,
+            DataMoverKind::Splice,
+            1,
+            DEFAULT_MAX_PENDING_BYTES,
+        );
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&target);
+        set_timeout(&remote);
+        // Tiny socket buffers keep in-flight bytes bounded so the payload
+        // reliably backs up into the direction pipe.
+        set_socket_buffer(broker_upstream.as_raw_fd(), libc::SO_SNDBUF, 4096);
+        set_socket_buffer(remote.as_raw_fd(), libc::SO_RCVBUF, 4096);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        assert!(reactor.relay_mut(0).target_to_upstream.is_spliced());
+
+        // 128 KiB fits into the target-side socket buffers plus the pipe, so
+        // the writer completes and shuts down immediately, while the clogged
+        // downstream keeps the pipe full and the source EOF unread.
+        let payload: Vec<u8> = (0..128 * 1024_u32).map(|i| (i % 249) as u8).collect();
+        let expected = payload.clone();
+        let writer = thread::spawn(move || {
+            target.write_all(&payload).unwrap();
+            target.shutdown(Shutdown::Write).unwrap();
+            target
+        });
+
+        // Pump without a reader: the pipe must fill and park the read side
+        // while socket data (and the EOF behind it) is still queued.
+        let mut parked = false;
+        for _ in 0..20_000 {
+            let relay = reactor.relay_mut(0);
+            relay
+                .process(libc::POLLIN | libc::POLLRDHUP, libc::POLLIN | libc::POLLOUT)
+                .unwrap();
+            if !relay.target_read_eof
+                && relay.target_to_upstream.is_full()
+                && relay.target_events(&broker.resources) & libc::POLLIN == 0
+            {
+                parked = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let relay = reactor.relay_mut(0);
+        assert!(parked, "pipe never parked the read side");
+        assert!(
+            !relay.target_read_eof,
+            "EOF must still be queued behind the parked read side"
+        );
+        assert!(
+            !relay.upstream_write_shutdown,
+            "half-close must wait for the pipe to drain"
+        );
+
+        // Draining the far end must resume reads, deliver every byte before
+        // the FIN, and only then propagate the half-close.
+        let reader = thread::spawn(move || {
+            let mut received = Vec::new();
+            remote.read_to_end(&mut received).unwrap();
+            received
+        });
+        for _ in 0..20_000 {
+            let relay = reactor.relay_mut(0);
+            relay
+                .process(libc::POLLIN, libc::POLLIN | libc::POLLOUT)
+                .unwrap();
+            if relay.upstream_write_shutdown {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(reactor.relay_mut(0).upstream_write_shutdown);
+        assert_eq!(reader.join().unwrap(), expected);
+        let _target = writer.join().unwrap();
+    }
+
+    #[test]
+    fn spliced_flow_defers_read_error_until_pipe_flushes() {
+        let (broker, mut reactor) = test_broker_backends(
+            ReactorKind::Poll,
+            DataMoverKind::Splice,
+            1,
+            DEFAULT_MAX_PENDING_BYTES,
+        );
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = reactor.relay_mut(0);
+        assert!(relay.target_to_upstream.is_spliced());
+
+        let prefix = vec![0xa5_u8; 1024];
+        target.write_all(&prefix).unwrap();
+        wait_for_readable_bytes(&relay.target, prefix.len());
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                target.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of_val(&linger) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+        drop(target);
+
+        // The prefix and the reset may arrive in the same batch; the error
+        // must not surface before the prefix has left the pipe.
+        let mut error = None;
+        for _ in 0..200 {
+            match relay.process(libc::POLLIN | libc::POLLERR, 0) {
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+        let error = error.expect("relay never observed the reset");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        let mut received = vec![0_u8; prefix.len()];
+        remote.read_exact(&mut received).unwrap();
+        assert_eq!(received, prefix);
+    }
+
+    #[test]
+    fn splice_falls_back_to_buffered_when_capacity_is_denied() {
+        // A 16 KiB global capacity cap cannot admit a default 64 KiB pipe
+        // (kernel default; this test assumes fs.pipe-user-pages-soft has not
+        // degraded new pipes to a single page), so the flow must fall back
+        // to the buffered mover and still relay data.
+        let (broker, mut reactor) = TcpBroker::new_with_limits(
+            Observability::default(),
+            TcpBrokerLimits {
+                max_active_flows: 1,
+                max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+                max_buffer_capacity_bytes: READ_CHUNK_SIZE,
+                rlimit_nofile: 4096,
+                baseline_fds: 0,
+                reserved_fds: 256,
+            },
+            FlowLimitReason::ActiveFlow,
+            ReactorKind::Poll,
+            DataMoverKind::Splice,
+        )
+        .unwrap();
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = reactor.relay_mut(0);
+        assert!(!relay.target_to_upstream.is_spliced());
+        assert!(!relay.upstream_to_target.is_spliced());
+
+        target.write_all(b"ping").unwrap();
+        wait_for_readable_bytes(&relay.target, 4);
+        relay.process(libc::POLLIN, 0).unwrap();
+        let mut received = [0_u8; 4];
+        remote.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ping");
+    }
+
+    #[test]
     fn defers_read_error_until_buffered_data_flushes() {
         let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
         let (mut target, broker_target) = tcp_pair();
@@ -2260,16 +2850,21 @@ mod tests {
 
     #[test]
     fn stalled_relay_does_not_block_other_flows() {
-        stalled_relay_does_not_block_other_flows_case(ReactorKind::Poll);
+        stalled_relay_does_not_block_other_flows_case(ReactorKind::Poll, DataMoverKind::Buffered);
     }
 
     #[test]
     fn stalled_relay_does_not_block_other_flows_with_epoll() {
-        stalled_relay_does_not_block_other_flows_case(ReactorKind::Epoll);
+        stalled_relay_does_not_block_other_flows_case(ReactorKind::Epoll, DataMoverKind::Buffered);
     }
 
-    fn stalled_relay_does_not_block_other_flows_case(kind: ReactorKind) {
-        let (broker, reactor) = test_broker_kind(kind, 32, DEFAULT_MAX_PENDING_BYTES);
+    #[test]
+    fn stalled_relay_does_not_block_other_flows_with_epoll_splice() {
+        stalled_relay_does_not_block_other_flows_case(ReactorKind::Epoll, DataMoverKind::Splice);
+    }
+
+    fn stalled_relay_does_not_block_other_flows_case(kind: ReactorKind, mover: DataMoverKind) {
+        let (broker, reactor) = test_broker_backends(kind, mover, 32, DEFAULT_MAX_PENDING_BYTES);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
         let (mut stalled_target, stalled_broker_target) = tcp_pair();
         let (stalled_broker_upstream, _stalled_remote) = tcp_pair();
@@ -2316,16 +2911,24 @@ mod tests {
 
     #[test]
     fn pending_byte_cap_allows_progress_in_chunks() {
-        pending_byte_cap_allows_progress_in_chunks_case(ReactorKind::Poll);
+        pending_byte_cap_allows_progress_in_chunks_case(ReactorKind::Poll, DataMoverKind::Buffered);
     }
 
     #[test]
     fn pending_byte_cap_allows_progress_in_chunks_with_epoll() {
-        pending_byte_cap_allows_progress_in_chunks_case(ReactorKind::Epoll);
+        pending_byte_cap_allows_progress_in_chunks_case(
+            ReactorKind::Epoll,
+            DataMoverKind::Buffered,
+        );
     }
 
-    fn pending_byte_cap_allows_progress_in_chunks_case(kind: ReactorKind) {
-        let (broker, reactor) = test_broker_kind(kind, 2, 4);
+    #[test]
+    fn pending_byte_cap_allows_progress_in_chunks_with_epoll_splice() {
+        pending_byte_cap_allows_progress_in_chunks_case(ReactorKind::Epoll, DataMoverKind::Splice);
+    }
+
+    fn pending_byte_cap_allows_progress_in_chunks_case(kind: ReactorKind, mover: DataMoverKind) {
+        let (broker, reactor) = test_broker_backends(kind, mover, 2, 4);
         let resources = Arc::clone(&broker.resources);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
         let (mut target, broker_target) = tcp_pair();
@@ -2367,6 +2970,7 @@ mod tests {
             limits,
             FlowLimitReason::ActiveFlow,
             ReactorKind::Poll,
+            DataMoverKind::Buffered,
         )
         .unwrap();
         let mut first = PendingBuffer::default();
@@ -2471,7 +3075,8 @@ mod tests {
     fn epoll_dispatch_discards_stale_generation_events() {
         let (broker, mut reactor) =
             test_broker_kind(ReactorKind::Epoll, 4, DEFAULT_MAX_PENDING_BYTES);
-        let mut ep = EpollState::new(reactor.wake_fd.as_raw_fd()).unwrap();
+        let mut ep =
+            EpollState::new(reactor.wake_fd.as_raw_fd(), &Observability::default()).unwrap();
         let (_target_a, broker_target_a) = tcp_pair();
         let (broker_upstream_a, _remote_a) = tcp_pair();
         let permit = broker.reserve_flow().unwrap();
@@ -2509,7 +3114,8 @@ mod tests {
     #[test]
     fn epoll_suppresses_reads_on_global_saturation_and_rearms() {
         let (broker, mut reactor) = test_broker_kind(ReactorKind::Epoll, 2, 4);
-        let mut ep = EpollState::new(reactor.wake_fd.as_raw_fd()).unwrap();
+        let mut ep =
+            EpollState::new(reactor.wake_fd.as_raw_fd(), &Observability::default()).unwrap();
         let (mut target, broker_target) = tcp_pair();
         let (broker_upstream, mut remote) = tcp_pair();
         set_timeout(&remote);
@@ -2569,6 +3175,20 @@ mod tests {
         max_active_flows: usize,
         max_pending_bytes: usize,
     ) -> (TcpBroker, TcpBrokerReactor) {
+        test_broker_backends(
+            kind,
+            DataMoverKind::Buffered,
+            max_active_flows,
+            max_pending_bytes,
+        )
+    }
+
+    fn test_broker_backends(
+        kind: ReactorKind,
+        mover: DataMoverKind,
+        max_active_flows: usize,
+        max_pending_bytes: usize,
+    ) -> (TcpBroker, TcpBrokerReactor) {
         TcpBroker::new_with_limits(
             Observability::default(),
             TcpBrokerLimits {
@@ -2581,6 +3201,7 @@ mod tests {
             },
             FlowLimitReason::ActiveFlow,
             kind,
+            mover,
         )
         .unwrap()
     }
@@ -2599,6 +3220,19 @@ mod tests {
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
+    }
+
+    fn set_socket_buffer(fd: RawFd, option: libc::c_int, bytes: libc::c_int) {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
     }
 
     fn wait_for_readable_bytes(stream: &TcpStream, expected: usize) {
