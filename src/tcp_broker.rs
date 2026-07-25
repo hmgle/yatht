@@ -15,8 +15,8 @@ const READ_CHUNK_SIZE: usize = 16 * 1024;
 // Per-direction byte budget for one reactor round; bounds how long a hot
 // flow can keep reading before other flows are serviced again.
 const READ_BATCH_BUDGET_BYTES: usize = RELAY_BUFFER_CAPACITY;
-// Internal selector for the readiness backend; poll remains the explicit
-// rollback path while epoll is validated (TCP_BROKER_ROADMAP.md M2).
+// Internal selector for the readiness backend; epoll is the default and
+// poll remains the explicit rollback path (TCP_BROKER_ROADMAP.md M2).
 const REACTOR_KIND_ENV: &str = "SUP_TCP_REACTOR";
 // Upper bound on events handled per epoll_wait; LT re-reports whatever a
 // bounded batch leaves behind, keeping per-round work finite.
@@ -39,7 +39,7 @@ fn reactor_kind_from_env() -> io::Result<ReactorKind> {
             io::ErrorKind::InvalidInput,
             format!("unsupported {REACTOR_KIND_ENV} value: {value}"),
         )),
-        Err(std::env::VarError::NotPresent) => Ok(ReactorKind::Poll),
+        Err(std::env::VarError::NotPresent) => Ok(ReactorKind::Epoll),
         Err(err) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid {REACTOR_KIND_ENV} value: {err}"),
