@@ -103,8 +103,17 @@ fn redirects_local_tcp_connect_through_socks5() {
     assert_eq!(summary["tcp_pending_bytes"], 0);
     assert_eq!(summary["notification_queue_depth"], 0);
     assert_eq!(summary["tcp_registration_queue_depth"], 0);
-    assert!(summary["tcp_recv_syscalls"].as_u64().unwrap() > 0);
-    assert!(summary["tcp_send_syscalls"].as_u64().unwrap() > 0);
+    // The buffered mover reports recv/send syscalls, the splice mover
+    // reports splice syscalls; either way bytes must have moved through
+    // the broker in both directions.
+    let moved_reads = summary["tcp_recv_syscalls"].as_u64().unwrap()
+        + summary["tcp_splice_in_syscalls"].as_u64().unwrap();
+    let moved_writes = summary["tcp_send_syscalls"].as_u64().unwrap()
+        + summary["tcp_splice_out_syscalls"].as_u64().unwrap();
+    assert!(moved_reads > 0);
+    assert!(moved_writes > 0);
+    assert!(summary["tcp_target_to_upstream_bytes"].as_u64().unwrap() > 0);
+    assert!(summary["tcp_upstream_to_target_bytes"].as_u64().unwrap() > 0);
     assert_eq!(summary["dropped_metric_events"], 0);
 }
 
