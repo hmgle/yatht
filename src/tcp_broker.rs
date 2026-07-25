@@ -12,6 +12,9 @@ use crate::observability::Observability;
 const REGISTRATION_QUEUE_CAPACITY: usize = 128;
 const RELAY_BUFFER_CAPACITY: usize = 64 * 1024;
 const READ_CHUNK_SIZE: usize = 16 * 1024;
+// Per-direction byte budget for one reactor round; bounds how long a hot
+// flow can keep reading before other flows are serviced again.
+const READ_BATCH_BUDGET_BYTES: usize = RELAY_BUFFER_CAPACITY;
 const DEFAULT_MAX_ACTIVE_FLOWS: usize = 16_384;
 const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFER_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
@@ -673,15 +676,15 @@ impl TcpRelay {
                 true,
             )?
         } else {
-            ReadOutcome::Idle
+            BatchedRead::IDLE
         };
-        if target_read == ReadOutcome::Eof {
+        if target_read.eof {
             self.target_read_eof = true;
         }
-        target_progress |= target_read != ReadOutcome::Idle;
+        target_progress |= target_read.progressed || target_read.eof;
         // Freshly read data is flushed in the same round; waiting for the
         // next POLLOUT wakeup would cost one extra poll round per chunk.
-        if target_read == ReadOutcome::Progress
+        if target_read.progressed
             && !self.upstream_write_shutdown
             && !self.target_to_upstream.is_empty()
         {
@@ -702,13 +705,13 @@ impl TcpRelay {
                 false,
             )?
         } else {
-            ReadOutcome::Idle
+            BatchedRead::IDLE
         };
-        if upstream_read == ReadOutcome::Eof {
+        if upstream_read.eof {
             self.upstream_read_eof = true;
         }
-        upstream_progress |= upstream_read != ReadOutcome::Idle;
-        if upstream_read == ReadOutcome::Progress
+        upstream_progress |= upstream_read.progressed || upstream_read.eof;
+        if upstream_read.progressed
             && !self.target_write_shutdown
             && !self.upstream_to_target.is_empty()
         {
@@ -802,11 +805,17 @@ impl Drop for TcpRelay {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadOutcome {
-    Idle,
-    Progress,
-    Eof,
+#[derive(Clone, Copy)]
+struct BatchedRead {
+    progressed: bool,
+    eof: bool,
+}
+
+impl BatchedRead {
+    const IDLE: Self = Self {
+        progressed: false,
+        eof: false,
+    };
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -921,53 +930,69 @@ fn read_socket(
     pending: &mut PendingBuffer,
     resources: &BrokerResources,
     target_to_upstream: bool,
-) -> io::Result<ReadOutcome> {
-    if pending.is_full() {
-        return Ok(ReadOutcome::Idle);
-    }
-    let Some(chunk) = pending.prepare_read(resources)? else {
-        return Ok(ReadOutcome::Idle);
-    };
-    let reserved = resources.reserve_pending(chunk.len());
-    if reserved == 0 {
-        pending.discard_empty_tail(resources);
-        return Ok(ReadOutcome::Idle);
-    }
-    loop {
-        let rc = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                chunk.as_mut_ptr().cast(),
-                reserved,
-                libc::MSG_DONTWAIT,
-            )
+) -> io::Result<BatchedRead> {
+    let mut outcome = BatchedRead::IDLE;
+    let mut budget = READ_BATCH_BUDGET_BYTES;
+    while budget > 0 && !pending.is_full() {
+        let Some(chunk) = pending.prepare_read(resources)? else {
+            break;
+        };
+        let want = chunk.len().min(budget);
+        let reserved = resources.reserve_pending(want);
+        if reserved == 0 {
+            pending.discard_empty_tail(resources);
+            break;
+        }
+        let rc = loop {
+            let rc = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    chunk.as_mut_ptr().cast(),
+                    reserved,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break rc;
         };
         resources
             .observability
             .tcp_recv(rc.max(0) as usize, target_to_upstream);
         if rc > 0 {
-            resources.release_pending(reserved - rc as usize);
-            pending.commit_read(rc as usize);
-            resources.observability.tcp_pending_added(rc as usize);
-            return Ok(ReadOutcome::Progress);
-        }
-        if rc == 0 {
-            resources.release_pending(reserved);
-            pending.discard_empty_tail(resources);
-            return Ok(ReadOutcome::Eof);
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::Interrupted {
+            let received = rc as usize;
+            resources.release_pending(reserved - received);
+            pending.commit_read(received);
+            resources.observability.tcp_pending_added(received);
+            outcome.progressed = true;
+            budget = budget.saturating_sub(received);
+            if received < reserved {
+                // A short read drained the socket; the next recv would only
+                // report EAGAIN.
+                break;
+            }
             continue;
         }
         resources.release_pending(reserved);
-        if err.kind() == io::ErrorKind::WouldBlock {
-            pending.discard_empty_tail(resources);
-            return Ok(ReadOutcome::Idle);
-        }
         pending.discard_empty_tail(resources);
+        if rc == 0 {
+            outcome.eof = true;
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            break;
+        }
+        if outcome.progressed {
+            // The socket error persists; surfacing it mid-batch would tear
+            // down the relay before this batch's bytes are flushed. The next
+            // round flushes pending data first and then observes the error.
+            break;
+        }
         return Err(err);
     }
+    Ok(outcome)
 }
 
 fn flush_socket(
@@ -1496,6 +1521,109 @@ mod tests {
     }
 
     #[test]
+    fn drains_socket_backlog_within_single_round() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+
+        let payload: Vec<u8> = (0..40 * 1024_u32).map(|i| (i % 251) as u8).collect();
+        target.write_all(&payload).unwrap();
+        wait_for_readable_bytes(&relay.target, payload.len());
+
+        assert!(relay.process(libc::POLLIN, 0).unwrap());
+        assert!(relay.target_to_upstream.is_empty());
+        let mut received = vec![0_u8; payload.len()];
+        remote.read_exact(&mut received).unwrap();
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn bounds_batched_reads_to_relay_capacity() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+
+        let payload = vec![0x5a_u8; READ_BATCH_BUDGET_BYTES + READ_CHUNK_SIZE];
+        target.write_all(&payload).unwrap();
+        wait_for_readable_bytes(&relay.target, payload.len());
+
+        assert!(relay.process(libc::POLLIN, 0).unwrap());
+        let mut received = vec![0_u8; READ_BATCH_BUDGET_BYTES];
+        remote.read_exact(&mut received).unwrap();
+        wait_for_readable_bytes(&relay.target, READ_CHUNK_SIZE);
+
+        assert!(relay.process(libc::POLLIN, 0).unwrap());
+        let mut rest = vec![0_u8; READ_CHUNK_SIZE];
+        remote.read_exact(&mut rest).unwrap();
+        assert!(relay.target_to_upstream.is_empty());
+    }
+
+    #[test]
+    fn defers_read_error_until_buffered_data_flushes() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+
+        let prefix = vec![0xa5_u8; 1024];
+        target.write_all(&prefix).unwrap();
+        wait_for_readable_bytes(&relay.target, prefix.len());
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                target.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of_val(&linger) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+        drop(target);
+
+        // The prefix and the reset may arrive in the same batch; the error
+        // must not surface before the prefix has been flushed onward.
+        let mut error = None;
+        for _ in 0..200 {
+            match relay.process(libc::POLLIN | libc::POLLERR, 0) {
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+        let error = error.expect("relay never observed the reset");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        let mut received = vec![0_u8; prefix.len()];
+        remote.read_exact(&mut received).unwrap();
+        assert_eq!(received, prefix);
+    }
+
+    #[test]
     fn stalled_relay_does_not_block_other_flows() {
         let (broker, reactor) = test_broker(32, DEFAULT_MAX_PENDING_BYTES);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -1694,5 +1822,18 @@ mod tests {
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
+    }
+
+    fn wait_for_readable_bytes(stream: &TcpStream, expected: usize) {
+        for _ in 0..2000 {
+            let mut available: libc::c_int = 0;
+            let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut available) };
+            assert_eq!(rc, 0);
+            if available as usize >= expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("socket never reported {expected} readable bytes");
     }
 }
