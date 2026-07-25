@@ -120,8 +120,8 @@ enum BrokerCommand {
 struct TcpRelay {
     target: TcpStream,
     upstream: TcpStream,
-    target_to_upstream: PendingBuffer,
-    upstream_to_target: PendingBuffer,
+    target_to_upstream: RelayChannel,
+    upstream_to_target: RelayChannel,
     target_read_eof: bool,
     upstream_read_eof: bool,
     target_write_shutdown: bool,
@@ -130,6 +130,13 @@ struct TcpRelay {
     accepted_by_reactor: bool,
     outcome_recorded: bool,
     registration_cancelled: Arc<AtomicBool>,
+}
+
+/// Per-direction relay storage. The flow state machine (EOF, half-close,
+/// error deferral, teardown) lives in `TcpRelay` and must never depend on
+/// how a direction stores bytes in flight.
+struct RelayChannel {
+    buffer: PendingBuffer,
 }
 
 #[derive(Default)]
@@ -1100,8 +1107,8 @@ impl TcpRelay {
         Ok(Self {
             target,
             upstream,
-            target_to_upstream: PendingBuffer::default(),
-            upstream_to_target: PendingBuffer::default(),
+            target_to_upstream: RelayChannel::buffered(),
+            upstream_to_target: RelayChannel::buffered(),
             target_read_eof: false,
             upstream_read_eof: false,
             target_write_shutdown: false,
@@ -1208,31 +1215,25 @@ impl TcpRelay {
             && !self.upstream_to_target.is_empty()
             && target_events & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
         {
-            target_progress = flush_socket(
-                &self.target,
-                &mut self.upstream_to_target,
-                &self.permit.resources,
-            )? == WriteOutcome::Progress;
+            target_progress = self
+                .upstream_to_target
+                .flush_to(&self.target, &self.permit.resources)?
+                == WriteOutcome::Progress;
         }
         if !self.upstream_write_shutdown
             && !self.target_to_upstream.is_empty()
             && upstream_events & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
         {
-            upstream_progress = flush_socket(
-                &self.upstream,
-                &mut self.target_to_upstream,
-                &self.permit.resources,
-            )? == WriteOutcome::Progress;
+            upstream_progress = self
+                .target_to_upstream
+                .flush_to(&self.upstream, &self.permit.resources)?
+                == WriteOutcome::Progress;
         }
         let target_read = if self.can_read_target(&self.permit.resources)
             && target_events & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
         {
-            read_socket(
-                &self.target,
-                &mut self.target_to_upstream,
-                &self.permit.resources,
-                true,
-            )?
+            self.target_to_upstream
+                .read_from(&self.target, &self.permit.resources, true)?
         } else {
             BatchedRead::IDLE
         };
@@ -1246,22 +1247,17 @@ impl TcpRelay {
             && !self.upstream_write_shutdown
             && !self.target_to_upstream.is_empty()
         {
-            upstream_progress |= flush_socket(
-                &self.upstream,
-                &mut self.target_to_upstream,
-                &self.permit.resources,
-            )? == WriteOutcome::Progress;
+            upstream_progress |= self
+                .target_to_upstream
+                .flush_to(&self.upstream, &self.permit.resources)?
+                == WriteOutcome::Progress;
         }
         let upstream_read = if self.can_read_upstream(&self.permit.resources)
             && upstream_events & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)
                 != 0
         {
-            read_socket(
-                &self.upstream,
-                &mut self.upstream_to_target,
-                &self.permit.resources,
-                false,
-            )?
+            self.upstream_to_target
+                .read_from(&self.upstream, &self.permit.resources, false)?
         } else {
             BatchedRead::IDLE
         };
@@ -1273,11 +1269,10 @@ impl TcpRelay {
             && !self.target_write_shutdown
             && !self.upstream_to_target.is_empty()
         {
-            target_progress |= flush_socket(
-                &self.target,
-                &mut self.upstream_to_target,
-                &self.permit.resources,
-            )? == WriteOutcome::Progress;
+            target_progress |= self
+                .upstream_to_target
+                .flush_to(&self.target, &self.permit.resources)?
+                == WriteOutcome::Progress;
         }
 
         if target_events & libc::POLLERR != 0 && !target_progress {
@@ -1348,10 +1343,8 @@ impl Drop for TcpRelay {
             .len()
             .saturating_add(self.upstream_to_target.len());
         self.permit.resources.release_pending(pending);
-        self.target_to_upstream
-            .release_capacity(&self.permit.resources);
-        self.upstream_to_target
-            .release_capacity(&self.permit.resources);
+        self.target_to_upstream.release(&self.permit.resources);
+        self.upstream_to_target.release(&self.permit.resources);
         self.permit
             .resources
             .observability
@@ -1480,6 +1473,61 @@ impl PendingBuffer {
             self.commit_read(copied);
             bytes = &bytes[copied..];
         }
+    }
+}
+
+impl RelayChannel {
+    fn buffered() -> Self {
+        Self {
+            buffer: PendingBuffer::default(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.buffer.is_full()
+    }
+
+    fn has_writable_capacity(&self) -> bool {
+        self.buffer.has_writable_capacity()
+    }
+
+    fn read_from(
+        &mut self,
+        stream: &TcpStream,
+        resources: &BrokerResources,
+        target_to_upstream: bool,
+    ) -> io::Result<BatchedRead> {
+        read_socket(stream, &mut self.buffer, resources, target_to_upstream)
+    }
+
+    fn flush_to(
+        &mut self,
+        stream: &TcpStream,
+        resources: &BrokerResources,
+    ) -> io::Result<WriteOutcome> {
+        flush_socket(stream, &mut self.buffer, resources)
+    }
+
+    fn release(&mut self, resources: &BrokerResources) {
+        self.buffer.release_capacity(resources);
+    }
+
+    #[cfg(test)]
+    fn append(&mut self, bytes: &[u8], resources: &BrokerResources) {
+        self.buffer.append(bytes, resources);
+    }
+
+    #[cfg(test)]
+    fn chunk_count(&self) -> usize {
+        self.buffer.chunks.len()
     }
 }
 
@@ -1849,7 +1897,7 @@ mod tests {
             payload.len()
         );
         relay.target_to_upstream.append(&payload, &broker.resources);
-        assert!(relay.target_to_upstream.chunks.len() > 1);
+        assert!(relay.target_to_upstream.chunk_count() > 1);
 
         let length = payload.len();
         let reader = thread::spawn(move || {
@@ -1858,12 +1906,10 @@ mod tests {
             received
         });
         while !relay.target_to_upstream.is_empty() {
-            let outcome = flush_socket(
-                &relay.upstream,
-                &mut relay.target_to_upstream,
-                &broker.resources,
-            )
-            .unwrap();
+            let outcome = relay
+                .target_to_upstream
+                .flush_to(&relay.upstream, &broker.resources)
+                .unwrap();
             if outcome == WriteOutcome::Idle {
                 thread::sleep(Duration::from_millis(1));
             }
