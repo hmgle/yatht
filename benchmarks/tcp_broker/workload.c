@@ -197,7 +197,8 @@ static int run_request(const struct endpoint *endpoint, size_t flows, size_t pay
     return successful == flows ? 0 : 1;
 }
 
-static int run_idle(const struct endpoint *endpoint, size_t flows, size_t hold_ms) {
+static int run_idle(const struct endpoint *endpoint, size_t flows, size_t hold_ms,
+                    const char *ready_path) {
     int *fds = malloc(flows * sizeof(*fds));
     if (fds == NULL) {
         perror("malloc");
@@ -217,6 +218,22 @@ static int run_idle(const struct endpoint *endpoint, size_t flows, size_t hold_m
         printf("{\"event\":\"flow\",\"flow\":%zu,\"ok\":%s,"
                "\"errno\":%d,\"connect_ns\":%" PRIu64 "}\n",
                flow, error == 0 ? "true" : "false", error, connect_ns);
+    }
+    if (ready_path != NULL) {
+        // Marks the registration/steady-state boundary so the harness can
+        // attribute supervisor CPU to each phase separately.
+        FILE *ready = fopen(ready_path, "w");
+        if (ready == NULL || fprintf(ready, "%zu\n", successful) < 0 ||
+            fclose(ready) != 0) {
+            perror("idle ready path");
+            for (size_t flow = 0; flow < flows; ++flow) {
+                if (fds[flow] >= 0) {
+                    close(fds[flow]);
+                }
+            }
+            free(fds);
+            return 2;
+        }
     }
     struct timespec hold = {
         .tv_sec = (time_t)(hold_ms / 1000),
@@ -1298,7 +1315,7 @@ int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr,
                 "usage: %s request HOST PORT FLOWS PAYLOAD_BYTES\n"
-                "       %s idle HOST PORT FLOWS HOLD_MS\n"
+                "       %s idle HOST PORT FLOWS HOLD_MS [READY_PATH]\n"
                 "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS READY_PATH\n"
                 "       %s stream HOST PORT FLOWS BYTES_PER_FLOW DIRECTION RATE_BYTES_PER_SECOND\n"
                 "       %s reset HOST PORT FLOWS REQUEST_BYTES PREFIX_BYTES CONSUME_BYTES\n"
@@ -1331,8 +1348,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "request") == 0 && argc == 6) {
         return run_request(&endpoint, flows, value);
     }
-    if (strcmp(argv[1], "idle") == 0 && argc == 6) {
-        return run_idle(&endpoint, flows, value);
+    if (strcmp(argv[1], "idle") == 0 && (argc == 6 || argc == 7)) {
+        return run_idle(&endpoint, flows, value, argc == 7 ? argv[6] : NULL);
     }
     if (strcmp(argv[1], "stalled") == 0 && argc == 8) {
         return run_stalled(&endpoint, flows, value,

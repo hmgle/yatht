@@ -828,6 +828,54 @@ def host_cpu_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, i
 
 _SAMPLE_DENIED_WARNED: set[int] = set()
 
+_NS_PER_CLOCK_TICK = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+
+
+def process_cpu_ns(pid: int) -> int | None:
+    """Return utime+stime of one process (excluding children) in nanoseconds."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat.rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) * _NS_PER_CLOCK_TICK
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def start_perf_stat(
+    events: str, pid: int, output_path: Path
+) -> subprocess.Popen[str] | None:
+    command = [
+        "perf",
+        "stat",
+        "-x",
+        ",",
+        "-e",
+        events,
+        "--pid",
+        str(pid),
+        "-o",
+        str(output_path),
+    ]
+    try:
+        return subprocess.Popen(
+            command, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+    except OSError:
+        return None
+
+
+def parse_perf_stat_csv(text: str) -> list[dict[str, str]]:
+    counters = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(",")
+        if len(parts) < 3:
+            continue
+        counters.append({"value": parts[0], "unit": parts[1], "event": parts[2]})
+    return counters
+
 
 def process_resources(pid: int) -> dict[str, int] | None:
     try:
@@ -984,6 +1032,7 @@ def variant_command(
     scenario: dict[str, Any],
     metrics_path: Path | None = None,
     stalled_ready_path: Path | None = None,
+    idle_ready_path: Path | None = None,
 ) -> list[str]:
     if scenario["mode"] == "fairness":
         workload = [
@@ -1017,6 +1066,8 @@ def variant_command(
             if stalled_ready_path is None:
                 raise ValueError("stalled workload requires a ready path")
             workload.append(str(stalled_ready_path))
+        if scenario["mode"] == "idle" and idle_ready_path is not None:
+            workload.append(str(idle_ready_path))
         if scenario["mode"] == "stream":
             workload.append(scenario["direction"])
             workload.append(str(scenario["rate"]))
@@ -1050,6 +1101,8 @@ def run_one(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     with tempfile.TemporaryDirectory(prefix="yatht-benchmark-control-") as control_dir:
         stalled_ready_path = Path(control_dir) / "stalled-ready"
+        idle_ready_path = Path(control_dir) / "idle-ready"
+        perf_output_path = Path(control_dir) / "perf-stat.csv"
         if scenario["mode"] == "stalled":
             servers.prepare_stalled_run()
         if scenario["mode"] in ("stream", "fairness", "reset"):
@@ -1061,6 +1114,7 @@ def run_one(
             scenario,
             metrics_path,
             stalled_ready_path if scenario["mode"] == "stalled" else None,
+            idle_ready_path if scenario["mode"] == "idle" else None,
         )
         args.command_log.write(shlex.join(command) + "\n")
         args.command_log.flush()
@@ -1073,6 +1127,14 @@ def run_one(
         stalled_ready_flows: int | None = None
         stalled_released = False
         release_at: float | None = None
+        idle_ready = False
+        idle_ready_flows: int | None = None
+        idle_ready_wall_ns: int | None = None
+        supervisor_cpu_sampled_ns: int | None = None
+        target_cpu_sampled_ns: int | None = None
+        supervisor_cpu_at_idle_ready_ns: int | None = None
+        target_cpu_at_idle_ready_ns: int | None = None
+        perf_process: subprocess.Popen[str] | None = None
         supervisor_peaks = empty_process_peaks()
         target_peaks = empty_process_peaks()
         server_peaks = empty_process_peaks()
@@ -1096,6 +1158,10 @@ def run_one(
                     target_pid = process.pid
                 else:
                     supervisor_pid = process.pid
+                if args.perf_stat_events and measurement_kind == "diagnostic":
+                    perf_process = start_perf_stat(
+                        args.perf_stat_events, process.pid, perf_output_path
+                    )
                 deadline = time.monotonic() + args.timeout
                 iteration = 0
                 while process.poll() is None:
@@ -1108,6 +1174,14 @@ def run_one(
                     if target_pid is not None:
                         update_process_peak(target_peaks, process_resources(target_pid))
                     update_process_peak(server_peaks, process_resources(os.getpid()))
+                    if supervisor_pid is not None:
+                        sampled_cpu = process_cpu_ns(supervisor_pid)
+                        if sampled_cpu is not None:
+                            supervisor_cpu_sampled_ns = sampled_cpu
+                    if target_pid is not None:
+                        sampled_cpu = process_cpu_ns(target_pid)
+                        if sampled_cpu is not None:
+                            target_cpu_sampled_ns = sampled_cpu
                     if iteration % TREE_SAMPLE_STRIDE == 0:
                         tree_samples = [
                             sample
@@ -1125,6 +1199,24 @@ def run_one(
                             )
                     iteration += 1
                     now = time.monotonic()
+                    if scenario["mode"] == "idle" and not idle_ready:
+                        if idle_ready_path.exists():
+                            try:
+                                idle_ready_flows = int(
+                                    idle_ready_path.read_text().strip()
+                                )
+                            except (OSError, ValueError):
+                                pass
+                            else:
+                                # Registration/steady boundary: everything the
+                                # supervisor burns after this point is idle
+                                # readiness cost, not connection setup.
+                                idle_ready = True
+                                idle_ready_wall_ns = time.perf_counter_ns() - started
+                                supervisor_cpu_at_idle_ready_ns = (
+                                    supervisor_cpu_sampled_ns
+                                )
+                                target_cpu_at_idle_ready_ns = target_cpu_sampled_ns
                     if scenario["mode"] == "stalled" and not stalled_ready:
                         if stalled_ready_path.exists():
                             try:
@@ -1159,6 +1251,28 @@ def run_one(
                 stdout_file.read(),
                 stderr_file.read(),
             )
+        perf_stat: dict[str, Any] | None = None
+        if perf_process is not None:
+            try:
+                perf_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                perf_process.send_signal(signal.SIGINT)
+                with suppress(subprocess.TimeoutExpired):
+                    perf_process.wait(timeout=5)
+                if perf_process.poll() is None:
+                    perf_process.kill()
+                    perf_process.wait()
+            perf_stderr = perf_process.stderr.read() if perf_process.stderr else ""
+            try:
+                perf_csv = perf_output_path.read_text()
+            except OSError:
+                perf_csv = ""
+            perf_stat = {
+                "events": args.perf_stat_events,
+                "returncode": perf_process.returncode,
+                "counters": parse_perf_stat_csv(perf_csv),
+                "stderr": perf_stderr[-2000:],
+            }
     wall_ns = time.perf_counter_ns() - started
     host_cpu_after = host_cpu_ticks()
     benchmark_server_cpu_ns = servers.cpu_ns() - benchmark_server_before
@@ -1293,6 +1407,8 @@ def run_one(
             and fairness_quiet_samples == quiet_expected
             and workload_summary.get("bytes") == expected_payload_total
         )
+    if scenario["mode"] == "idle":
+        ok = ok and idle_ready and idle_ready_flows == scenario["flows"]
     if scenario["mode"] == "reset":
         assert stream_server_results is not None
         stream_server_connections = len(stream_server_results)
@@ -1365,6 +1481,14 @@ def run_one(
         "stream_server_quiescent": stream_server_quiescent,
         "fairness_quiet_samples": fairness_quiet_samples,
         "reset_outcome_counts": reset_outcome_counts,
+        "idle_ready": idle_ready if scenario["mode"] == "idle" else None,
+        "idle_ready_flows": idle_ready_flows if scenario["mode"] == "idle" else None,
+        "idle_ready_wall_ns": idle_ready_wall_ns,
+        "supervisor_cpu_sampled_ns": supervisor_cpu_sampled_ns,
+        "target_cpu_sampled_ns": target_cpu_sampled_ns,
+        "supervisor_cpu_at_idle_ready_ns": supervisor_cpu_at_idle_ready_ns,
+        "target_cpu_at_idle_ready_ns": target_cpu_at_idle_ready_ns,
+        "perf_stat": perf_stat,
         "broker_pending_peak_bytes": (
             metric_summary.get("tcp_peak_pending_bytes")
             if scenario["mode"] == "stalled" and metric_summary is not None
@@ -1581,6 +1705,17 @@ def summarize(
             and flow.get("sent_bytes")
             and flow.get("total_ns")
         ]
+        idle_steady_cpu = [
+            run["supervisor_cpu_sampled_ns"] - run["supervisor_cpu_at_idle_ready_ns"]
+            for run in valid_runs
+            if run.get("supervisor_cpu_sampled_ns") is not None
+            and run.get("supervisor_cpu_at_idle_ready_ns") is not None
+        ]
+        idle_steady_wall = [
+            run["wall_ns"] - run["idle_ready_wall_ns"]
+            for run in valid_runs
+            if run.get("idle_ready_wall_ns") is not None
+        ]
         rows.append(
             {
                 "scenario": scenario,
@@ -1618,6 +1753,12 @@ def summarize(
                 ),
                 "reset_outcome_eof_flows": sum(
                     1 for flow in selected_flows if flow.get("outcome") == "eof"
+                ),
+                "idle_steady_supervisor_cpu_median_ns": (
+                    statistics.median(idle_steady_cpu) if idle_steady_cpu else None
+                ),
+                "idle_steady_wall_median_ns": (
+                    statistics.median(idle_steady_wall) if idle_steady_wall else None
                 ),
                 "child_cpu_median_ns": median_field(valid_runs, "child_cpu_ns"),
                 "benchmark_server_cpu_median_ns": median_field(
@@ -1697,6 +1838,10 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
         "rlimit_nofile": resource.getrlimit(resource.RLIMIT_NOFILE),
         "perf_available": shutil.which("perf") is not None,
+        "kernel_perf_event_paranoid": command_output(
+            ["cat", "/proc/sys/kernel/perf_event_paranoid"]
+        ),
+        "perf_stat_events": args.perf_stat_events,
         "yatht": binary_metadata(args.yatht, args.yatht_commit, args.yatht_build_command),
         "addfd_yatht": binary_metadata(
             args.addfd_yatht,
@@ -1783,6 +1928,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-flows", type=int, default=128)
     parser.add_argument("--reset-request-bytes", type=int, default=65536)
     parser.add_argument("--reset-prefix-bytes", type=int, default=1024)
+    # Attached to the root benchmark process for diagnostic runs only; empty
+    # disables. Requires kernel.perf_event_paranoid <= 2 (1 for kernel-side
+    # counts); failures are recorded per run instead of failing the gate.
+    parser.add_argument("--perf-stat-events", default="")
     parser.add_argument("--stalled-flows", type=int, default=128)
     # The proxied chain (kernel socket autotuning on both yatht hops, the 64 KiB
     # relay buffer, and the SOCKS proxy's stream buffers) can absorb several MiB

@@ -683,6 +683,62 @@ class BenchmarkTests(unittest.TestCase):
         finally:
             servers.stop()
 
+    def test_process_cpu_ns_samples_live_and_missing_processes(self) -> None:
+        cpu = benchmark.process_cpu_ns(os.getpid())
+        self.assertIsNotNone(cpu)
+        assert cpu is not None
+        self.assertGreaterEqual(cpu, 0)
+        self.assertIsNone(benchmark.process_cpu_ns(2**31 - 1))
+
+    def test_parse_perf_stat_csv_keeps_counter_rows(self) -> None:
+        text = (
+            "# started on Fri Jul 25\n"
+            "\n"
+            "12345,,task-clock,1000,100.00,,\n"
+            "<not supported>,,cache-misses,0,0.00,,\n"
+        )
+        counters = benchmark.parse_perf_stat_csv(text)
+        self.assertEqual(
+            counters,
+            [
+                {"value": "12345", "unit": "", "event": "task-clock"},
+                {"value": "<not supported>", "unit": "", "event": "cache-misses"},
+            ],
+        )
+
+    @unittest.skipIf(shutil.which("cc") is None, "cc not available")
+    def test_workload_idle_writes_ready_file(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5)
+        servers.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workload = Path(directory) / "workload"
+                ready_path = Path(directory) / "idle-ready"
+                benchmark.build_workload("cc", workload)
+                completed = subprocess.run(
+                    [
+                        str(workload),
+                        "idle",
+                        "127.0.0.1",
+                        str(servers.destination_port),
+                        "2",
+                        "50",
+                        str(ready_path),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(completed.returncode, 0, msg=completed.stderr[-500:])
+                self.assertEqual(ready_path.read_text().strip(), "2")
+                flow_records, samples, _summary = benchmark.parse_workload_output(
+                    completed.stdout
+                )
+                self.assertEqual(samples, [])
+                self.assertTrue(benchmark.workload_flows_are_valid(flow_records, 2))
+        finally:
+            servers.stop()
+
     def test_reset_result_cleanliness_matrix(self) -> None:
         clean = {
             "header_ok": True,
