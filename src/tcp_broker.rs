@@ -15,6 +15,37 @@ const READ_CHUNK_SIZE: usize = 16 * 1024;
 // Per-direction byte budget for one reactor round; bounds how long a hot
 // flow can keep reading before other flows are serviced again.
 const READ_BATCH_BUDGET_BYTES: usize = RELAY_BUFFER_CAPACITY;
+// Internal selector for the readiness backend; poll remains the explicit
+// rollback path while epoll is validated (TCP_BROKER_ROADMAP.md M2).
+const REACTOR_KIND_ENV: &str = "SUP_TCP_REACTOR";
+// Upper bound on events handled per epoll_wait; LT re-reports whatever a
+// bounded batch leaves behind, keeping per-round work finite.
+const EPOLL_EVENT_BATCH: usize = 1024;
+// epoll_event.data value reserved for the wake eventfd; real flow tokens
+// cannot collide because slot indices stay far below 2^31.
+const EPOLL_WAKE_TOKEN: u64 = u64::MAX;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReactorKind {
+    Poll,
+    Epoll,
+}
+
+fn reactor_kind_from_env() -> io::Result<ReactorKind> {
+    match std::env::var(REACTOR_KIND_ENV) {
+        Ok(value) if value == "poll" => Ok(ReactorKind::Poll),
+        Ok(value) if value == "epoll" => Ok(ReactorKind::Epoll),
+        Ok(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {REACTOR_KIND_ENV} value: {value}"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(ReactorKind::Poll),
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {REACTOR_KIND_ENV} value: {err}"),
+        )),
+    }
+}
 const DEFAULT_MAX_ACTIVE_FLOWS: usize = 16_384;
 const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFER_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
@@ -31,12 +62,16 @@ pub struct TcpBroker {
 pub struct TcpBrokerReactor {
     rx: channel::Receiver<BrokerCommand>,
     wake_fd: Arc<OwnedFd>,
+    kind: ReactorKind,
     // Relays live in a generational slot arena: slot indices stay stable for
     // a relay's whole lifetime and generations invalidate references to
     // released slots, which readiness backends can rely on for tokens.
     slots: Vec<Option<TcpRelay>>,
     generations: Vec<u32>,
     free_slots: Vec<usize>,
+    // Slots inserted by drain_commands since the backend last synchronized;
+    // the epoll backend registers them, the poll backend just clears.
+    new_slots: Vec<usize>,
     resources: Arc<BrokerResources>,
     teardown_recorded: bool,
     // Reused across iterations; registration-heavy phases would otherwise
@@ -114,14 +149,16 @@ impl TcpBroker {
         observability: Observability,
         setup_concurrency: usize,
     ) -> io::Result<(Self, TcpBrokerReactor)> {
+        let kind = reactor_kind_from_env()?;
         let (limits, flow_limit_reason) = TcpBrokerLimits::detect(setup_concurrency)?;
-        Self::new_with_limits(observability, limits, flow_limit_reason)
+        Self::new_with_limits(observability, limits, flow_limit_reason, kind)
     }
 
     fn new_with_limits(
         observability: Observability,
         limits: TcpBrokerLimits,
         flow_limit_reason: FlowLimitReason,
+        kind: ReactorKind,
     ) -> io::Result<(Self, TcpBrokerReactor)> {
         let wake_fd = Arc::new(create_eventfd()?);
         let (tx, rx) = channel::bounded(REGISTRATION_QUEUE_CAPACITY);
@@ -152,9 +189,11 @@ impl TcpBroker {
             TcpBrokerReactor {
                 rx,
                 wake_fd,
+                kind,
                 slots: Vec::new(),
                 generations: Vec::new(),
                 free_slots: Vec::new(),
+                new_slots: Vec::new(),
                 resources,
                 teardown_recorded: false,
                 pollfds: Vec::new(),
@@ -445,11 +484,19 @@ fn open_fd_count() -> io::Result<usize> {
 }
 
 impl TcpBrokerReactor {
-    pub fn run(mut self) -> io::Result<()> {
+    pub fn run(self) -> io::Result<()> {
+        match self.kind {
+            ReactorKind::Poll => self.run_poll(),
+            ReactorKind::Epoll => self.run_epoll(),
+        }
+    }
+
+    fn run_poll(mut self) -> io::Result<()> {
         loop {
             if self.drain_commands()? {
                 return Ok(());
             }
+            self.new_slots.clear();
 
             self.pollfds.clear();
             self.poll_slots.clear();
@@ -489,6 +536,7 @@ impl TcpBrokerReactor {
                 if self.drain_commands()? {
                     return Ok(());
                 }
+                self.new_slots.clear();
             }
 
             for index in 0..self.poll_slots.len() {
@@ -517,7 +565,7 @@ impl TcpBrokerReactor {
     }
 
     fn insert_relay(&mut self, relay: TcpRelay) -> usize {
-        if let Some(slot) = self.free_slots.pop() {
+        let slot = if let Some(slot) = self.free_slots.pop() {
             debug_assert!(self.slots[slot].is_none());
             self.slots[slot] = Some(relay);
             slot
@@ -525,14 +573,18 @@ impl TcpBrokerReactor {
             self.slots.push(Some(relay));
             self.generations.push(0);
             self.slots.len() - 1
-        }
+        };
+        self.new_slots.push(slot);
+        slot
     }
 
     fn release_slot(&mut self, slot: usize) {
         let relay = self.slots[slot].take();
         debug_assert!(relay.is_some());
-        drop(relay);
+        // Invalidate the slot's tokens before the relay drop closes its
+        // sockets; stale readiness events must fail generation validation.
         self.generations[slot] = self.generations[slot].wrapping_add(1);
+        drop(relay);
         self.free_slots.push(slot);
     }
 
@@ -574,6 +626,450 @@ impl TcpBrokerReactor {
     #[cfg(test)]
     fn active_relays(&self) -> usize {
         self.slots.iter().flatten().count()
+    }
+
+    fn run_epoll(mut self) -> io::Result<()> {
+        let mut ep = match EpollState::new(self.wake_fd.as_raw_fd()) {
+            Ok(ep) => ep,
+            Err(err) => return self.fail(err),
+        };
+        loop {
+            if self.drain_commands()? {
+                return Ok(());
+            }
+            self.epoll_register_new_flows(&mut ep);
+
+            self.resources.observability.tcp_poll();
+            let count = match ep.wait() {
+                Ok(count) => count,
+                Err(err) => return self.fail(err),
+            };
+            self.resources.observability.tcp_poll_ready(count);
+
+            let saw_wake = self.epoll_collect(&mut ep, count);
+            let mut made_progress = false;
+            if saw_wake {
+                if let Err(err) = drain_eventfd(self.wake_fd.as_raw_fd()) {
+                    return self.fail(err);
+                }
+                self.resources.observability.tcp_command_wakeup();
+                made_progress = true;
+                if self.drain_commands()? {
+                    return Ok(());
+                }
+                self.epoll_register_new_flows(&mut ep);
+            }
+            made_progress |= self.epoll_process_touched(&mut ep);
+            made_progress |= self.epoll_rearm_suppressed(&mut ep);
+            if !made_progress {
+                self.resources.observability.tcp_no_progress_iteration();
+            }
+        }
+    }
+
+    fn epoll_register_new_flows(&mut self, ep: &mut EpollState) {
+        let mut new_slots = std::mem::take(&mut self.new_slots);
+        for slot in new_slots.drain(..) {
+            ep.ensure_slot(slot);
+            if let Err(err) = self.epoll_add_flow(ep, slot) {
+                if let Some(relay) = self.slots[slot].as_mut() {
+                    relay.record_outcome(Some(&err));
+                }
+                self.release_slot(slot);
+            }
+        }
+        self.new_slots = new_slots;
+    }
+
+    fn epoll_add_flow(&mut self, ep: &mut EpollState, slot: usize) -> io::Result<()> {
+        let Some(relay) = self.slots[slot].as_ref() else {
+            return Ok(());
+        };
+        let generation = self.generations[slot];
+        let target = InterestSnapshot::capture_target(relay, &self.resources);
+        let upstream = InterestSnapshot::capture_upstream(relay, &self.resources);
+        let epfd = ep.epfd.as_raw_fd();
+        // A failed second add leaves the first registration behind only until
+        // the caller drops the relay: closing the sole descriptor reference
+        // detaches it from the epoll set.
+        epoll_ctl(
+            epfd,
+            libc::EPOLL_CTL_ADD,
+            relay.target.as_raw_fd(),
+            poll_to_epoll_interest(target.events),
+            encode_flow_token(slot, generation, false),
+        )?;
+        epoll_ctl(
+            epfd,
+            libc::EPOLL_CTL_ADD,
+            relay.upstream.as_raw_fd(),
+            poll_to_epoll_interest(upstream.events),
+            encode_flow_token(slot, generation, true),
+        )?;
+        ep.interests[slot] = SlotInterest {
+            target: target.events,
+            upstream: upstream.events,
+            target_suppressed: target.globally_suppressed,
+            upstream_suppressed: upstream.globally_suppressed,
+        };
+        if target.globally_suppressed {
+            ep.suppressed.push(SuppressedEndpoint {
+                slot,
+                generation,
+                upstream: false,
+            });
+        }
+        if upstream.globally_suppressed {
+            ep.suppressed.push(SuppressedEndpoint {
+                slot,
+                generation,
+                upstream: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn epoll_collect(&self, ep: &mut EpollState, count: usize) -> bool {
+        ep.batch_seq = ep.batch_seq.wrapping_add(1);
+        ep.touched.clear();
+        let mut saw_wake = false;
+        for index in 0..count {
+            let event = ep.events[index];
+            let token = event.u64;
+            if token == EPOLL_WAKE_TOKEN {
+                saw_wake = true;
+                continue;
+            }
+            let (slot, generation, upstream) = decode_flow_token(token);
+            if slot >= self.generations.len()
+                || self.generations[slot] != generation
+                || self.slots[slot].is_none()
+            {
+                // Stale event: the slot was released (and possibly reused)
+                // after the kernel queued this entry.
+                continue;
+            }
+            let bits = epoll_to_poll_events(event.events);
+            let (seq, touched_index) = ep.batch_marks[slot];
+            let entry = if seq == ep.batch_seq
+                && (touched_index as usize) < ep.touched.len()
+                && ep.touched[touched_index as usize].slot == slot
+            {
+                &mut ep.touched[touched_index as usize]
+            } else {
+                ep.batch_marks[slot] = (ep.batch_seq, ep.touched.len() as u32);
+                ep.touched.push(TouchedFlow {
+                    slot,
+                    generation,
+                    target_events: 0,
+                    upstream_events: 0,
+                });
+                ep.touched.last_mut().unwrap()
+            };
+            if upstream {
+                entry.upstream_events |= bits;
+            } else {
+                entry.target_events |= bits;
+            }
+        }
+        saw_wake
+    }
+
+    fn epoll_process_touched(&mut self, ep: &mut EpollState) -> bool {
+        let mut made_progress = false;
+        let mut touched = std::mem::take(&mut ep.touched);
+        for entry in touched.drain(..) {
+            if entry.slot >= self.generations.len()
+                || self.generations[entry.slot] != entry.generation
+            {
+                // The flow was removed while processing an earlier entry of
+                // this same batch.
+                continue;
+            }
+            let Some(relay) = self.slots[entry.slot].as_mut() else {
+                continue;
+            };
+            let result = relay.process(entry.target_events, entry.upstream_events);
+            made_progress |= result.as_ref().copied().unwrap_or(true);
+            let finished = result.is_ok() && relay.is_finished();
+            if let Err(err) = &result {
+                relay.record_outcome(Some(err));
+            } else if finished {
+                relay.record_outcome(None);
+            }
+            if result.is_err() || finished {
+                self.release_slot(entry.slot);
+                continue;
+            }
+            match self.epoll_update_interest(ep, entry.slot) {
+                Ok(changed) => made_progress |= changed,
+                Err(err) => {
+                    // Keep the reactor alive: an interest update failure is a
+                    // per-flow defect, not a broker-wide one.
+                    if let Some(relay) = self.slots[entry.slot].as_mut() {
+                        relay.record_outcome(Some(&err));
+                    }
+                    self.release_slot(entry.slot);
+                }
+            }
+        }
+        ep.touched = touched;
+        made_progress
+    }
+
+    fn epoll_update_interest(&mut self, ep: &mut EpollState, slot: usize) -> io::Result<bool> {
+        let Some(relay) = self.slots[slot].as_ref() else {
+            return Ok(false);
+        };
+        let generation = self.generations[slot];
+        let target = InterestSnapshot::capture_target(relay, &self.resources);
+        let upstream = InterestSnapshot::capture_upstream(relay, &self.resources);
+        let target_fd = relay.target.as_raw_fd();
+        let upstream_fd = relay.upstream.as_raw_fd();
+        let epfd = ep.epfd.as_raw_fd();
+        let cached = ep.interests[slot];
+        let mut changed = false;
+        if cached.target != target.events {
+            epoll_ctl(
+                epfd,
+                libc::EPOLL_CTL_MOD,
+                target_fd,
+                poll_to_epoll_interest(target.events),
+                encode_flow_token(slot, generation, false),
+            )?;
+            changed = true;
+        }
+        if cached.upstream != upstream.events {
+            epoll_ctl(
+                epfd,
+                libc::EPOLL_CTL_MOD,
+                upstream_fd,
+                poll_to_epoll_interest(upstream.events),
+                encode_flow_token(slot, generation, true),
+            )?;
+            changed = true;
+        }
+        ep.interests[slot] = SlotInterest {
+            target: target.events,
+            upstream: upstream.events,
+            target_suppressed: target.globally_suppressed,
+            upstream_suppressed: upstream.globally_suppressed,
+        };
+        if target.globally_suppressed && !cached.target_suppressed {
+            ep.suppressed.push(SuppressedEndpoint {
+                slot,
+                generation,
+                upstream: false,
+            });
+        }
+        if upstream.globally_suppressed && !cached.upstream_suppressed {
+            ep.suppressed.push(SuppressedEndpoint {
+                slot,
+                generation,
+                upstream: true,
+            });
+        }
+        Ok(changed)
+    }
+
+    fn epoll_rearm_suppressed(&mut self, ep: &mut EpollState) -> bool {
+        if ep.suppressed.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut list = std::mem::take(&mut ep.suppressed);
+        list.retain(|entry| {
+            if entry.slot >= self.generations.len()
+                || self.generations[entry.slot] != entry.generation
+                || self.slots[entry.slot].is_none()
+            {
+                return false;
+            }
+            match self.epoll_update_interest(ep, entry.slot) {
+                Ok(updated) => changed |= updated,
+                Err(err) => {
+                    if let Some(relay) = self.slots[entry.slot].as_mut() {
+                        relay.record_outcome(Some(&err));
+                    }
+                    self.release_slot(entry.slot);
+                    return false;
+                }
+            }
+            let flags = ep.interests[entry.slot];
+            if entry.upstream {
+                flags.upstream_suppressed
+            } else {
+                flags.target_suppressed
+            }
+        });
+        // Interest updates during the pass may have suppressed other
+        // endpoints; keep both the survivors and the fresh entries.
+        list.append(&mut ep.suppressed);
+        ep.suppressed = list;
+        changed
+    }
+}
+
+struct EpollState {
+    epfd: OwnedFd,
+    events: Vec<libc::epoll_event>,
+    interests: Vec<SlotInterest>,
+    suppressed: Vec<SuppressedEndpoint>,
+    batch_marks: Vec<(u32, u32)>,
+    batch_seq: u32,
+    touched: Vec<TouchedFlow>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SlotInterest {
+    target: libc::c_short,
+    upstream: libc::c_short,
+    target_suppressed: bool,
+    upstream_suppressed: bool,
+}
+
+struct SuppressedEndpoint {
+    slot: usize,
+    generation: u32,
+    upstream: bool,
+}
+
+struct TouchedFlow {
+    slot: usize,
+    generation: u32,
+    target_events: libc::c_short,
+    upstream_events: libc::c_short,
+}
+
+struct InterestSnapshot {
+    events: libc::c_short,
+    globally_suppressed: bool,
+}
+
+impl InterestSnapshot {
+    fn capture_target(relay: &TcpRelay, resources: &BrokerResources) -> Self {
+        Self {
+            events: relay.target_events(resources),
+            globally_suppressed: relay.target_read_globally_suppressed(resources),
+        }
+    }
+
+    fn capture_upstream(relay: &TcpRelay, resources: &BrokerResources) -> Self {
+        Self {
+            events: relay.upstream_events(resources),
+            globally_suppressed: relay.upstream_read_globally_suppressed(resources),
+        }
+    }
+}
+
+impl EpollState {
+    fn new(wake_fd: RawFd) -> io::Result<Self> {
+        let rc = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let epfd = unsafe { OwnedFd::from_raw_fd(rc) };
+        epoll_ctl(
+            epfd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            wake_fd,
+            libc::EPOLLIN as u32,
+            EPOLL_WAKE_TOKEN,
+        )?;
+        Ok(Self {
+            epfd,
+            events: vec![libc::epoll_event { events: 0, u64: 0 }; EPOLL_EVENT_BATCH],
+            interests: Vec::new(),
+            suppressed: Vec::new(),
+            batch_marks: Vec::new(),
+            batch_seq: 0,
+            touched: Vec::new(),
+        })
+    }
+
+    fn ensure_slot(&mut self, slot: usize) {
+        if slot >= self.interests.len() {
+            self.interests.resize(slot + 1, SlotInterest::default());
+            self.batch_marks.resize(slot + 1, (0, 0));
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<usize> {
+        loop {
+            let rc = unsafe {
+                libc::epoll_wait(
+                    self.epfd.as_raw_fd(),
+                    self.events.as_mut_ptr(),
+                    self.events.len() as libc::c_int,
+                    -1,
+                )
+            };
+            if rc >= 0 {
+                return Ok(rc as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+// Flow tokens pack [generation:32][slot:31][endpoint side:1]; slot indices
+// stay far below 2^31, so the wake sentinel u64::MAX cannot collide.
+fn encode_flow_token(slot: usize, generation: u32, upstream: bool) -> u64 {
+    debug_assert!(slot < (1 << 31));
+    (u64::from(generation) << 32) | ((slot as u64) << 1) | u64::from(upstream)
+}
+
+fn decode_flow_token(token: u64) -> (usize, u32, bool) {
+    let upstream = token & 1 != 0;
+    let slot = ((token >> 1) & 0x7FFF_FFFF) as usize;
+    let generation = (token >> 32) as u32;
+    (slot, generation, upstream)
+}
+
+fn epoll_to_poll_events(events: u32) -> libc::c_short {
+    let mut bits = 0;
+    if events & libc::EPOLLIN as u32 != 0 {
+        bits |= libc::POLLIN;
+    }
+    if events & libc::EPOLLOUT as u32 != 0 {
+        bits |= libc::POLLOUT;
+    }
+    if events & libc::EPOLLERR as u32 != 0 {
+        bits |= libc::POLLERR;
+    }
+    if events & libc::EPOLLHUP as u32 != 0 {
+        bits |= libc::POLLHUP;
+    }
+    if events & libc::EPOLLRDHUP as u32 != 0 {
+        bits |= libc::POLLRDHUP;
+    }
+    bits
+}
+
+fn poll_to_epoll_interest(events: libc::c_short) -> u32 {
+    let mut bits = 0;
+    if events & libc::POLLIN != 0 {
+        bits |= libc::EPOLLIN as u32;
+    }
+    if events & libc::POLLOUT != 0 {
+        bits |= libc::EPOLLOUT as u32;
+    }
+    if events & libc::POLLRDHUP != 0 {
+        bits |= libc::EPOLLRDHUP as u32;
+    }
+    bits
+}
+
+fn epoll_ctl(epfd: RawFd, op: libc::c_int, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
+    let mut event = libc::epoll_event { events, u64: token };
+    let rc = unsafe { libc::epoll_ctl(epfd, op, fd, &mut event) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -679,6 +1175,22 @@ impl TcpRelay {
             && !resources.pending_is_saturated()
             && (self.upstream_to_target.has_writable_capacity()
                 || !resources.buffer_capacity_is_saturated())
+    }
+
+    // True when only a global budget blocks reads: the flow itself could
+    // read (no EOF, buffer not full). Poll recomputes interest for every
+    // flow each round, but epoll must remember these endpoints and re-arm
+    // them once the budget frees, or they would stay silent forever.
+    fn target_read_globally_suppressed(&self, resources: &BrokerResources) -> bool {
+        !self.target_read_eof
+            && !self.target_to_upstream.is_full()
+            && !self.can_read_target(resources)
+    }
+
+    fn upstream_read_globally_suppressed(&self, resources: &BrokerResources) -> bool {
+        !self.upstream_read_eof
+            && !self.upstream_to_target.is_full()
+            && !self.can_read_upstream(resources)
     }
 
     fn process(
@@ -1187,7 +1699,16 @@ mod tests {
 
     #[test]
     fn relays_data_and_propagates_half_closes() {
-        let (broker, reactor) = test_broker(32, DEFAULT_MAX_PENDING_BYTES);
+        relays_data_and_propagates_half_closes_case(ReactorKind::Poll);
+    }
+
+    #[test]
+    fn relays_data_and_propagates_half_closes_with_epoll() {
+        relays_data_and_propagates_half_closes_case(ReactorKind::Epoll);
+    }
+
+    fn relays_data_and_propagates_half_closes_case(kind: ReactorKind) {
+        let (broker, reactor) = test_broker_kind(kind, 32, DEFAULT_MAX_PENDING_BYTES);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
         let (mut target, broker_target) = tcp_pair();
         let (broker_upstream, mut remote) = tcp_pair();
@@ -1231,6 +1752,7 @@ mod tests {
             runtime.observability(),
             limits,
             FlowLimitReason::ActiveFlow,
+            ReactorKind::Poll,
         )
         .unwrap();
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -1408,6 +1930,15 @@ mod tests {
 
     #[test]
     fn shutdown_joins_after_cancelling_active_relays() {
+        shutdown_joins_after_cancelling_active_relays_case(ReactorKind::Poll);
+    }
+
+    #[test]
+    fn shutdown_joins_after_cancelling_active_relays_with_epoll() {
+        shutdown_joins_after_cancelling_active_relays_case(ReactorKind::Epoll);
+    }
+
+    fn shutdown_joins_after_cancelling_active_relays_case(kind: ReactorKind) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("metrics.jsonl");
         let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
@@ -1423,6 +1954,7 @@ mod tests {
             runtime.observability(),
             limits,
             FlowLimitReason::ActiveFlow,
+            kind,
         )
         .unwrap();
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
@@ -1471,6 +2003,7 @@ mod tests {
             runtime.observability(),
             limits,
             FlowLimitReason::ActiveFlow,
+            ReactorKind::Poll,
         )
         .unwrap();
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1493,6 +2026,15 @@ mod tests {
 
     #[test]
     fn reactor_panic_fails_started_relays() {
+        reactor_panic_fails_started_relays_case(ReactorKind::Poll);
+    }
+
+    #[test]
+    fn reactor_panic_fails_started_relays_with_epoll() {
+        reactor_panic_fails_started_relays_case(ReactorKind::Epoll);
+    }
+
+    fn reactor_panic_fails_started_relays_case(kind: ReactorKind) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("metrics.jsonl");
         let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
@@ -1508,6 +2050,7 @@ mod tests {
             runtime.observability(),
             limits,
             FlowLimitReason::ActiveFlow,
+            kind,
         )
         .unwrap();
         let reactor_thread =
@@ -1671,7 +2214,16 @@ mod tests {
 
     #[test]
     fn stalled_relay_does_not_block_other_flows() {
-        let (broker, reactor) = test_broker(32, DEFAULT_MAX_PENDING_BYTES);
+        stalled_relay_does_not_block_other_flows_case(ReactorKind::Poll);
+    }
+
+    #[test]
+    fn stalled_relay_does_not_block_other_flows_with_epoll() {
+        stalled_relay_does_not_block_other_flows_case(ReactorKind::Epoll);
+    }
+
+    fn stalled_relay_does_not_block_other_flows_case(kind: ReactorKind) {
+        let (broker, reactor) = test_broker_kind(kind, 32, DEFAULT_MAX_PENDING_BYTES);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
         let (mut stalled_target, stalled_broker_target) = tcp_pair();
         let (stalled_broker_upstream, _stalled_remote) = tcp_pair();
@@ -1718,7 +2270,16 @@ mod tests {
 
     #[test]
     fn pending_byte_cap_allows_progress_in_chunks() {
-        let (broker, reactor) = test_broker(2, 4);
+        pending_byte_cap_allows_progress_in_chunks_case(ReactorKind::Poll);
+    }
+
+    #[test]
+    fn pending_byte_cap_allows_progress_in_chunks_with_epoll() {
+        pending_byte_cap_allows_progress_in_chunks_case(ReactorKind::Epoll);
+    }
+
+    fn pending_byte_cap_allows_progress_in_chunks_case(kind: ReactorKind) {
+        let (broker, reactor) = test_broker_kind(kind, 2, 4);
         let resources = Arc::clone(&broker.resources);
         let reactor_thread = thread::spawn(move || reactor.run().unwrap());
         let (mut target, broker_target) = tcp_pair();
@@ -1759,6 +2320,7 @@ mod tests {
             Observability::default(),
             limits,
             FlowLimitReason::ActiveFlow,
+            ReactorKind::Poll,
         )
         .unwrap();
         let mut first = PendingBuffer::default();
@@ -1835,7 +2397,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flow_tokens_roundtrip_and_never_collide_with_wake_sentinel() {
+        for (slot, generation, upstream) in [(0, 0, false), (1, 7, true), (16_383, u32::MAX, true)]
+        {
+            let token = encode_flow_token(slot, generation, upstream);
+            assert_ne!(token, EPOLL_WAKE_TOKEN);
+            assert_eq!(decode_flow_token(token), (slot, generation, upstream));
+        }
+    }
+
+    #[test]
+    fn epoll_event_bits_mirror_poll_bits() {
+        let interest = libc::POLLIN | libc::POLLRDHUP | libc::POLLOUT;
+        assert_eq!(
+            epoll_to_poll_events(poll_to_epoll_interest(interest)),
+            interest
+        );
+        let kernel_bits = (libc::EPOLLERR | libc::EPOLLHUP) as u32 | libc::EPOLLIN as u32;
+        assert_eq!(
+            epoll_to_poll_events(kernel_bits),
+            libc::POLLERR | libc::POLLHUP | libc::POLLIN
+        );
+    }
+
+    #[test]
+    fn epoll_dispatch_discards_stale_generation_events() {
+        let (broker, mut reactor) =
+            test_broker_kind(ReactorKind::Epoll, 4, DEFAULT_MAX_PENDING_BYTES);
+        let mut ep = EpollState::new(reactor.wake_fd.as_raw_fd()).unwrap();
+        let (_target_a, broker_target_a) = tcp_pair();
+        let (broker_upstream_a, _remote_a) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target_a, broker_upstream_a, permit)
+            .unwrap();
+        let (_target_b, broker_target_b) = tcp_pair();
+        let (broker_upstream_b, _remote_b) = tcp_pair();
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target_b, broker_upstream_b, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        reactor.epoll_register_new_flows(&mut ep);
+        assert_eq!(reactor.active_relays(), 2);
+
+        ep.events[0] = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: encode_flow_token(0, 0, false),
+        };
+        ep.events[1] = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: encode_flow_token(1, 7, false),
+        };
+        assert!(!reactor.epoll_collect(&mut ep, 2));
+        assert_eq!(ep.touched.len(), 1);
+        assert_eq!(ep.touched[0].slot, 0);
+
+        // Removing the flow mid-batch invalidates its queued entry as well.
+        reactor.release_slot(0);
+        assert!(!reactor.epoll_process_touched(&mut ep));
+        assert_eq!(reactor.active_relays(), 1);
+    }
+
+    #[test]
+    fn epoll_suppresses_reads_on_global_saturation_and_rearms() {
+        let (broker, mut reactor) = test_broker_kind(ReactorKind::Epoll, 2, 4);
+        let mut ep = EpollState::new(reactor.wake_fd.as_raw_fd()).unwrap();
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        reactor.epoll_register_new_flows(&mut ep);
+        assert_ne!(ep.interests[0].target & libc::POLLIN, 0);
+
+        // Simulate another flow exhausting the global pending budget.
+        assert_eq!(broker.resources.reserve_pending(4), 4);
+        ep.events[0] = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: encode_flow_token(0, 0, false),
+        };
+        assert!(!reactor.epoll_collect(&mut ep, 1));
+        assert!(reactor.epoll_process_touched(&mut ep));
+        assert_eq!(ep.interests[0].target & libc::POLLIN, 0);
+        assert!(ep.interests[0].target_suppressed);
+        // Global saturation gates both directions of the flow.
+        assert!(ep.interests[0].upstream_suppressed);
+        assert_eq!(ep.suppressed.len(), 2);
+
+        // Re-arming is a no-op while the budget stays saturated.
+        assert!(!reactor.epoll_rearm_suppressed(&mut ep));
+        assert_eq!(ep.suppressed.len(), 2);
+
+        broker.resources.release_pending(4);
+        assert!(reactor.epoll_rearm_suppressed(&mut ep));
+        assert!(ep.suppressed.is_empty());
+        assert_ne!(ep.interests[0].target & libc::POLLIN, 0);
+
+        target.write_all(b"ping").unwrap();
+        wait_for_readable_bytes(&reactor.relay_mut(0).target, 4);
+        ep.events[0] = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: encode_flow_token(0, 0, false),
+        };
+        reactor.epoll_collect(&mut ep, 1);
+        assert!(reactor.epoll_process_touched(&mut ep));
+        let mut received = [0_u8; 4];
+        remote.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ping");
+    }
+
     fn test_broker(
+        max_active_flows: usize,
+        max_pending_bytes: usize,
+    ) -> (TcpBroker, TcpBrokerReactor) {
+        test_broker_kind(ReactorKind::Poll, max_active_flows, max_pending_bytes)
+    }
+
+    fn test_broker_kind(
+        kind: ReactorKind,
         max_active_flows: usize,
         max_pending_bytes: usize,
     ) -> (TcpBroker, TcpBrokerReactor) {
@@ -1850,6 +2534,7 @@ mod tests {
                 reserved_fds: 256,
             },
             FlowLimitReason::ActiveFlow,
+            kind,
         )
         .unwrap()
     }
