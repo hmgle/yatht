@@ -31,12 +31,18 @@ pub struct TcpBroker {
 pub struct TcpBrokerReactor {
     rx: channel::Receiver<BrokerCommand>,
     wake_fd: Arc<OwnedFd>,
-    relays: Vec<TcpRelay>,
+    // Relays live in a generational slot arena: slot indices stay stable for
+    // a relay's whole lifetime and generations invalidate references to
+    // released slots, which readiness backends can rely on for tokens.
+    slots: Vec<Option<TcpRelay>>,
+    generations: Vec<u32>,
+    free_slots: Vec<usize>,
     resources: Arc<BrokerResources>,
     teardown_recorded: bool,
     // Reused across iterations; registration-heavy phases would otherwise
     // allocate and free a 2N+1 entry array on every wakeup.
     pollfds: Vec<libc::pollfd>,
+    poll_slots: Vec<usize>,
 }
 
 struct BrokerResources {
@@ -146,10 +152,13 @@ impl TcpBroker {
             TcpBrokerReactor {
                 rx,
                 wake_fd,
-                relays: Vec::new(),
+                slots: Vec::new(),
+                generations: Vec::new(),
+                free_slots: Vec::new(),
                 resources,
                 teardown_recorded: false,
                 pollfds: Vec::new(),
+                poll_slots: Vec::new(),
             },
         ))
     }
@@ -443,13 +452,18 @@ impl TcpBrokerReactor {
             }
 
             self.pollfds.clear();
-            self.pollfds.reserve(1 + self.relays.len() * 2);
+            self.poll_slots.clear();
+            self.pollfds.reserve(1 + self.slots.len() * 2);
             self.pollfds.push(libc::pollfd {
                 fd: self.wake_fd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             });
-            for relay in &self.relays {
+            for (slot, entry) in self.slots.iter().enumerate() {
+                let Some(relay) = entry else {
+                    continue;
+                };
+                self.poll_slots.push(slot);
                 self.pollfds.push(relay.target_pollfd(&self.resources));
                 self.pollfds.push(relay.upstream_pollfd(&self.resources));
             }
@@ -477,11 +491,13 @@ impl TcpBrokerReactor {
                 }
             }
 
-            let polled_relays = (self.pollfds.len() - 1) / 2;
-            for index in (0..polled_relays).rev() {
+            for index in 0..self.poll_slots.len() {
+                let slot = self.poll_slots[index];
                 let target_events = self.pollfds[1 + index * 2].revents;
                 let upstream_events = self.pollfds[2 + index * 2].revents;
-                let relay = &mut self.relays[index];
+                let Some(relay) = self.slots[slot].as_mut() else {
+                    continue;
+                };
                 let result = relay.process(target_events, upstream_events);
                 made_progress |= result.as_ref().copied().unwrap_or(true);
                 let finished = result.is_ok() && relay.is_finished();
@@ -491,13 +507,33 @@ impl TcpBrokerReactor {
                     relay.record_outcome(None);
                 }
                 if result.is_err() || finished {
-                    self.relays.swap_remove(index);
+                    self.release_slot(slot);
                 }
             }
             if !made_progress {
                 self.resources.observability.tcp_no_progress_iteration();
             }
         }
+    }
+
+    fn insert_relay(&mut self, relay: TcpRelay) -> usize {
+        if let Some(slot) = self.free_slots.pop() {
+            debug_assert!(self.slots[slot].is_none());
+            self.slots[slot] = Some(relay);
+            slot
+        } else {
+            self.slots.push(Some(relay));
+            self.generations.push(0);
+            self.slots.len() - 1
+        }
+    }
+
+    fn release_slot(&mut self, slot: usize) {
+        let relay = self.slots[slot].take();
+        debug_assert!(relay.is_some());
+        drop(relay);
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
+        self.free_slots.push(slot);
     }
 
     fn drain_commands(&mut self) -> io::Result<bool> {
@@ -510,7 +546,7 @@ impl TcpBrokerReactor {
                     }
                     relay.accepted_by_reactor = true;
                     self.resources.observability.tcp_flow_started();
-                    self.relays.push(relay);
+                    self.insert_relay(relay);
                 }
                 Ok(BrokerCommand::Shutdown) => return Ok(true),
                 #[cfg(test)]
@@ -523,11 +559,21 @@ impl TcpBrokerReactor {
 
     fn fail(&mut self, err: io::Error) -> io::Result<()> {
         self.resources.observability.tcp_reactor_failed();
-        for relay in &mut self.relays {
+        for relay in self.slots.iter_mut().flatten() {
             relay.record_outcome(Some(&err));
         }
         self.teardown_recorded = true;
         Err(err)
+    }
+
+    #[cfg(test)]
+    fn relay_mut(&mut self, slot: usize) -> &mut TcpRelay {
+        self.slots[slot].as_mut().expect("relay slot is empty")
+    }
+
+    #[cfg(test)]
+    fn active_relays(&self) -> usize {
+        self.slots.iter().flatten().count()
     }
 }
 
@@ -536,7 +582,7 @@ impl Drop for TcpBrokerReactor {
         if std::thread::panicking() && !self.teardown_recorded {
             let err = io::Error::other("TCP broker reactor panicked");
             self.resources.observability.tcp_reactor_failed();
-            for relay in &mut self.relays {
+            for relay in self.slots.iter_mut().flatten() {
                 relay.record_outcome(Some(&err));
             }
             self.teardown_recorded = true;
@@ -1245,7 +1291,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
         assert_eq!(
             relay
                 .permit
@@ -1273,7 +1319,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
 
         let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 251) as u8).collect();
         assert_eq!(
@@ -1321,7 +1367,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
 
         assert_eq!(relay.permit.resources.reserve_pending(4), 4);
         target.shutdown(Shutdown::Write).unwrap();
@@ -1348,7 +1394,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
         assert_eq!(relay.permit.resources.reserve_pending(8), 8);
         relay
             .upstream_to_target
@@ -1502,7 +1548,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
 
         target.write_all(b"request").unwrap();
         let mut progressed = false;
@@ -1531,7 +1577,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
 
         let payload: Vec<u8> = (0..40 * 1024_u32).map(|i| (i % 251) as u8).collect();
         target.write_all(&payload).unwrap();
@@ -1555,7 +1601,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
 
         let payload = vec![0x5a_u8; READ_BATCH_BUDGET_BYTES + READ_CHUNK_SIZE];
         target.write_all(&payload).unwrap();
@@ -1583,7 +1629,7 @@ mod tests {
             .register(broker_target, broker_upstream, permit)
             .unwrap();
         assert!(!reactor.drain_commands().unwrap());
-        let relay = &mut reactor.relays[0];
+        let relay = reactor.relay_mut(0);
 
         let prefix = vec![0xa5_u8; 1024];
         target.write_all(&prefix).unwrap();
@@ -1778,7 +1824,7 @@ mod tests {
         assert_eq!(broker.resources.active_flows.load(Ordering::Acquire), 1);
 
         assert!(!reactor.drain_commands().unwrap());
-        assert!(reactor.relays.is_empty());
+        assert_eq!(reactor.active_relays(), 0);
         assert_eq!(broker.resources.active_flows.load(Ordering::Acquire), 0);
         assert_eq!(
             broker
