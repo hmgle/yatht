@@ -40,7 +40,7 @@ DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
 # workload binary stays under target/.
 DEFAULT_OUTPUT_ROOT = ROOT / "bench-results" / "tcp-broker"
 VARIANT_ORDER = ("direct", "addfd", "stable")
-METRICS_SCHEMA_VERSION = 4
+METRICS_SCHEMA_VERSION = 5
 SAMPLE_INTERVAL_SECONDS = 0.005
 # Walking /proc for the whole process tree at 5 ms is a measurable observer
 # effect with thousands of flows; per-role samples stay at 5 ms while the tree
