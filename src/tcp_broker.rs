@@ -679,6 +679,18 @@ impl TcpRelay {
             self.target_read_eof = true;
         }
         target_progress |= target_read != ReadOutcome::Idle;
+        // Freshly read data is flushed in the same round; waiting for the
+        // next POLLOUT wakeup would cost one extra poll round per chunk.
+        if target_read == ReadOutcome::Progress
+            && !self.upstream_write_shutdown
+            && !self.target_to_upstream.is_empty()
+        {
+            upstream_progress |= flush_socket(
+                &self.upstream,
+                &mut self.target_to_upstream,
+                &self.permit.resources,
+            )? == WriteOutcome::Progress;
+        }
         let upstream_read = if self.can_read_upstream(&self.permit.resources)
             && upstream_events & (libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)
                 != 0
@@ -696,6 +708,16 @@ impl TcpRelay {
             self.upstream_read_eof = true;
         }
         upstream_progress |= upstream_read != ReadOutcome::Idle;
+        if upstream_read == ReadOutcome::Progress
+            && !self.target_write_shutdown
+            && !self.upstream_to_target.is_empty()
+        {
+            target_progress |= flush_socket(
+                &self.target,
+                &mut self.upstream_to_target,
+                &self.permit.resources,
+            )? == WriteOutcome::Progress;
+        }
 
         if target_events & libc::POLLERR != 0 && !target_progress {
             return Err(socket_error(self.target.as_raw_fd()));
@@ -1441,6 +1463,36 @@ mod tests {
         assert_eq!(summary["tcp_flows_cancelled"], 0);
         assert_eq!(summary["tcp_reactor_failures"], 1);
         assert_eq!(summary["tcp_active_flows"], 0);
+    }
+
+    #[test]
+    fn flushes_freshly_read_data_without_waiting_for_pollout() {
+        let (broker, mut reactor) = test_broker(1, DEFAULT_MAX_PENDING_BYTES);
+        let (mut target, broker_target) = tcp_pair();
+        let (broker_upstream, mut remote) = tcp_pair();
+        set_timeout(&target);
+        set_timeout(&remote);
+        let permit = broker.reserve_flow().unwrap();
+        broker
+            .register(broker_target, broker_upstream, permit)
+            .unwrap();
+        assert!(!reactor.drain_commands().unwrap());
+        let relay = &mut reactor.relays[0];
+
+        target.write_all(b"request").unwrap();
+        let mut progressed = false;
+        for _ in 0..100 {
+            if relay.process(libc::POLLIN, 0).unwrap() {
+                progressed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(progressed);
+        assert!(relay.target_to_upstream.is_empty());
+        let mut received = [0_u8; 7];
+        remote.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"request");
     }
 
     #[test]
