@@ -34,6 +34,81 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(events, [{"event": "run_start"}])
         self.assertEqual([error["line"] for error in errors], [2, 3])
 
+    def test_tcp_setup_stage_summary_aggregates_completed_flows(self) -> None:
+        def completed(index: int) -> dict[str, object]:
+            return {
+                "event": "tcp_setup",
+                "outcome": "completed",
+                "queue_wait_ns": 10 * index,
+                "handler_ns": 100 * index + 30,
+                "fd_inspection_ns": 1,
+                "proxy_connect_ns": 2,
+                "proxy_handshake_ns": 100 * index,
+                "loopback_connect_accept_ns": 5,
+                "broker_register_ns": 1,
+                "notification_reply_ns": 1,
+            }
+
+        events = [
+            {"event": "run_start"},
+            *[completed(index) for index in range(1, 5)],
+            {
+                "event": "tcp_setup",
+                "outcome": "failed",
+                "failure_stage": "proxy_connect",
+                "queue_wait_ns": 7,
+                "handler_ns": 9,
+                "fd_inspection_ns": 1,
+                "proxy_connect_ns": None,
+                "proxy_handshake_ns": None,
+                "loopback_connect_accept_ns": None,
+                "broker_register_ns": None,
+                "notification_reply_ns": None,
+            },
+        ]
+
+        summary = benchmark.summarize_tcp_setup_stages(events)
+
+        assert summary is not None
+        self.assertEqual(summary["setup_events"], 5)
+        self.assertEqual(summary["completed_events"], 4)
+        self.assertEqual(summary["failure_stage_counts"], {"proxy_connect": 1})
+        self.assertEqual(summary["total"]["sum_ns"], 1220)
+        self.assertEqual(summary["handler"]["sum_ns"], 1120)
+        handshake = summary["stages"]["proxy_handshake"]
+        self.assertEqual(handshake["sum_ns"], 1000)
+        self.assertEqual(handshake["mean_ns"], 250)
+        self.assertEqual(handshake["p50_ns"], 200)
+        self.assertEqual(handshake["p99_ns"], 400)
+        self.assertEqual(handshake["max_ns"], 400)
+        self.assertEqual(summary["stages"]["queue_wait"]["share_of_total"], 100 / 1220)
+        residual = summary["stages"]["handler_residual"]
+        self.assertEqual(residual["sum_ns"], 80)
+        self.assertEqual(residual["mean_ns"], 20)
+        share_total = sum(
+            stage["share_of_total"] for stage in summary["stages"].values()
+        )
+        self.assertAlmostEqual(share_total, 1.0)
+
+    def test_tcp_setup_stage_summary_without_setup_events_is_none(self) -> None:
+        self.assertIsNone(
+            benchmark.summarize_tcp_setup_stages([{"event": "run_start"}])
+        )
+
+    def test_tcp_setup_stage_summary_counts_failures_without_completed_flows(self) -> None:
+        summary = benchmark.summarize_tcp_setup_stages(
+            [{"event": "tcp_setup", "outcome": "cancelled", "failure_stage": None}]
+        )
+
+        self.assertEqual(
+            summary,
+            {
+                "setup_events": 1,
+                "completed_events": 0,
+                "failure_stage_counts": {"unknown": 1},
+            },
+        )
+
     def test_summary_excludes_flows_from_failed_parent_run(self) -> None:
         runs = [
             {

@@ -1006,6 +1006,81 @@ def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]
     return events, errors
 
 
+TCP_SETUP_STAGE_FIELDS = (
+    "queue_wait_ns",
+    "fd_inspection_ns",
+    "proxy_connect_ns",
+    "proxy_handshake_ns",
+    "loopback_connect_accept_ns",
+    "broker_register_ns",
+    "notification_reply_ns",
+)
+
+
+def tcp_setup_stage_stats(values: list[int]) -> dict[str, float | int]:
+    return {
+        "sum_ns": sum(values),
+        "mean_ns": sum(values) / len(values),
+        "p50_ns": percentile(values, 0.50),
+        "p95_ns": percentile(values, 0.95),
+        "p99_ns": percentile(values, 0.99),
+        "max_ns": max(values),
+    }
+
+
+def summarize_tcp_setup_stages(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    setups = [event for event in events if event.get("event") == "tcp_setup"]
+    if not setups:
+        return None
+    completed = [event for event in setups if event.get("outcome") == "completed"]
+    failure_stage_counts: dict[str, int] = {}
+    for event in setups:
+        if event.get("outcome") != "completed":
+            stage = event.get("failure_stage") or "unknown"
+            failure_stage_counts[stage] = failure_stage_counts.get(stage, 0) + 1
+    summary: dict[str, Any] = {
+        "setup_events": len(setups),
+        "completed_events": len(completed),
+        "failure_stage_counts": failure_stage_counts,
+    }
+    if not completed:
+        return summary
+    total_values = [
+        (event.get("queue_wait_ns") or 0) + (event.get("handler_ns") or 0)
+        for event in completed
+    ]
+    total_sum = sum(total_values)
+    stages: dict[str, Any] = {}
+    handler_stage_sum = 0
+    for field in TCP_SETUP_STAGE_FIELDS:
+        values = [event.get(field) or 0 for event in completed]
+        stats = tcp_setup_stage_stats(values)
+        if total_sum:
+            stats["share_of_total"] = stats["sum_ns"] / total_sum
+        stages[field.removesuffix("_ns")] = stats
+        if field != "queue_wait_ns":
+            handler_stage_sum += stats["sum_ns"]
+    residual_values = [
+        (event.get("handler_ns") or 0)
+        - sum(
+            event.get(field) or 0
+            for field in TCP_SETUP_STAGE_FIELDS
+            if field != "queue_wait_ns"
+        )
+        for event in completed
+    ]
+    residual = tcp_setup_stage_stats(residual_values)
+    if total_sum:
+        residual["share_of_total"] = residual["sum_ns"] / total_sum
+    stages["handler_residual"] = residual
+    summary["total"] = tcp_setup_stage_stats(total_values)
+    summary["handler"] = tcp_setup_stage_stats(
+        [event.get("handler_ns") or 0 for event in completed]
+    )
+    summary["stages"] = stages
+    return summary
+
+
 def terminate_process_group(process: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGTERM)
@@ -1301,6 +1376,7 @@ def run_one(
 
     metric_summary: dict[str, Any] | None = None
     metric_parse_errors: list[dict[str, Any]] = []
+    tcp_setup_stage_summary: dict[str, Any] | None = None
     if metrics_path is not None:
         metric_events, metric_parse_errors = parse_jsonl(metrics_path)
         summaries = [event for event in metric_events if event.get("event") == "run_summary"]
@@ -1314,6 +1390,7 @@ def run_one(
                     "fragment": None,
                 }
             )
+        tcp_setup_stage_summary = summarize_tcp_setup_stages(metric_events)
 
     successful = [flow for flow in flows if flow.get("ok")]
     ok = (
@@ -1517,6 +1594,7 @@ def run_one(
         "metrics_file": str(metrics_path) if metrics_path is not None else None,
         "metric_summary": metric_summary,
         "metric_parse_errors": metric_parse_errors,
+        "tcp_setup_stage_summary": tcp_setup_stage_summary,
     }
     enriched = [
         {
