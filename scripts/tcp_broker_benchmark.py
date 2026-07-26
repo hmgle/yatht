@@ -845,6 +845,15 @@ def comma_data_movers(raw: str) -> list[str]:
     return values
 
 
+def proxy_rtt_ms(raw: str) -> float:
+    value = float(raw)
+    # NaN compares false against every bound and would also leak an invalid
+    # bare NaN token into environment.json, so demand a finite value here.
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("proxy RTT must be a finite nonnegative number")
+    return value
+
+
 def comma_proxy_sessions(raw: str) -> list[str]:
     values = raw.split(",")
     if not raw or any(not value for value in values):
@@ -2635,6 +2644,11 @@ def warm_pool_health(runs: list[dict[str, Any]]) -> dict[str, Any]:
     stale = sum(summary.get("tcp_warm_sessions_stale", 0) for summary in summaries)
     return {
         "diagnostic_runs": len(summaries),
+        # What the binary itself claims to be running; anything other than
+        # warm-one-shot means the injected knob never took effect.
+        "reported_sources": sorted(
+            {str(summary.get("tcp_proxy_session_source")) for summary in summaries}
+        ),
         "hits": hits,
         "misses": sum(summary.get("tcp_warm_sessions_miss", 0) for summary in summaries),
         "stale": stale,
@@ -2698,6 +2712,22 @@ def warm_readiness_gate(
     health_reasons: list[str] = []
     if health["diagnostic_runs"] == 0:
         health_reasons.append("no warm diagnostic run with metrics")
+    else:
+        # A warm run whose binary reports another source, or that never
+        # recorded a single hit, means the comparison measured cold against
+        # cold; noise could then still clear the improvement thresholds.
+        wrong_sources = [
+            source
+            for source in health["reported_sources"]
+            if source != "warm-one-shot"
+        ]
+        if wrong_sources:
+            health_reasons.append(
+                "warm diagnostic reports proxy session source "
+                + ", ".join(wrong_sources)
+            )
+        if health["hits"] == 0:
+            health_reasons.append("warm pool never engaged")
     if health["replenish_failures"] != 0:
         health_reasons.append("replenish failures are nonzero")
     if health["stale_per_hit"] is not None and health["stale_per_hit"] > WARM_MAX_STALE_PER_HIT:
@@ -2919,7 +2949,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--proxy-rtt-ms",
-        type=float,
+        type=proxy_rtt_ms,
         default=0.0,
         help="artificial delay before each SOCKS5 reply to model proxy RTT",
     )
@@ -3057,8 +3087,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
-    if args.proxy_rtt_ms < 0:
-        parser.error("proxy RTT must be nonnegative")
     if len(args.stable_data_movers) > 1 and len(args.proxy_session_sources) > 1:
         parser.error(
             "only one paired dimension per suite: use multiple data movers "

@@ -427,12 +427,16 @@ class BenchmarkTests(unittest.TestCase):
 
     @staticmethod
     def warm_diagnostic_run(
-        hits: int = 100, stale: int = 0, replenish_failures: int = 0
+        hits: int = 100,
+        stale: int = 0,
+        replenish_failures: int = 0,
+        reported_source: str = "warm-one-shot",
     ) -> dict:
         return {
             "measurement_kind": "diagnostic",
             "proxy_session_source": "warm-one-shot",
             "metric_summary": {
+                "tcp_proxy_session_source": reported_source,
                 "tcp_warm_sessions_hit": hits,
                 "tcp_warm_sessions_miss": 5,
                 "tcp_warm_sessions_stale": stale,
@@ -494,6 +498,36 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(stale["passed"])
         self.assertFalse(failing["passed"])
         self.assertFalse(missing["passed"])
+
+    def test_warm_readiness_gate_rejects_never_engaged_pool(self) -> None:
+        gate = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 25.0, -35.0)]},
+            [self.warm_diagnostic_run(hits=0)],
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn(
+            "warm pool never engaged", gate["warm_pool_health"]["reasons"]
+        )
+
+    def test_warm_readiness_gate_rejects_wrong_reported_source(self) -> None:
+        gate = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 25.0, -35.0)]},
+            [self.warm_diagnostic_run(hits=0, reported_source="cold")],
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn(
+            "warm diagnostic reports proxy session source cold",
+            gate["warm_pool_health"]["reasons"],
+        )
+
+    def test_proxy_rtt_parser_rejects_non_finite_and_negative(self) -> None:
+        self.assertEqual(benchmark.proxy_rtt_ms("5"), 5.0)
+        self.assertEqual(benchmark.proxy_rtt_ms("0"), 0.0)
+        for raw in ("nan", "inf", "-inf", "-1"):
+            with self.assertRaises(benchmark.argparse.ArgumentTypeError):
+                benchmark.proxy_rtt_ms(raw)
 
     def test_warm_readiness_gate_requires_ten_valid_pairs(self) -> None:
         gate = benchmark.warm_readiness_gate(
