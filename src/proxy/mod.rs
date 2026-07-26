@@ -9,6 +9,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::ProxyConfig;
 use crate::supervisor::Destination;
 
+pub mod warm;
+
 pub fn dial(proxy: &ProxyConfig, dest: Destination, timeout: Duration) -> Result<TcpStream> {
     dial_with_timings(proxy, dest, timeout, &mut DialTimings::default())
 }
@@ -386,12 +388,18 @@ fn dial_http_connect_with_timings(
 /// consumes the response header. Shared by the cold dial path and
 /// warm-session lease completion.
 fn http_connect_request(stream: &mut TcpStream, dest: Destination) -> Result<()> {
-    let authority = dest.authority();
-    let req = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(http_connect_frame(dest).as_bytes())?;
+    http_connect_read_reply(stream)
+}
 
+fn http_connect_frame(dest: Destination) -> String {
+    let authority = dest.authority();
+    format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    )
+}
+
+fn http_connect_read_reply(stream: &mut TcpStream) -> Result<()> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0_u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {

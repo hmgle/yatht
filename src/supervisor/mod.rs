@@ -19,6 +19,9 @@ use crossbeam_channel as channel;
 use crate::config::{EffectiveConfig, Route};
 use crate::observability::{Observability, ObservabilityRuntime};
 use crate::proxy;
+use crate::proxy::warm::{
+    ProxySessionSource, WarmCompletionError, WarmSessionPool, WARM_POOL_MAX_SESSIONS,
+};
 use crate::seccomp::{self, SeccompNotif, SeccompNotifAddfd};
 use crate::tcp_broker::TcpBroker;
 
@@ -225,13 +228,38 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         }
     };
     let worker_count = notification_worker_count();
-    let (tcp_broker, tcp_broker_reactor) = match TcpBroker::new(observability.clone(), worker_count)
-    {
-        Ok(broker) => broker,
+    let session_source = match proxy::warm::proxy_session_source_from_env() {
+        Ok(source) => source,
         Err(err) => {
             close_fd(parent_sock);
-            return Err(err).context("create TCP broker");
+            return Err(err).context("select proxy session source");
         }
+    };
+    // Warm pool fds are long-lived and outside per-flow accounting, so they
+    // must come out of the broker's reserved headroom.
+    let warm_reserved_fds = if session_source == ProxySessionSource::WarmOneShot {
+        WARM_POOL_MAX_SESSIONS
+    } else {
+        0
+    };
+    let (tcp_broker, tcp_broker_reactor) =
+        match TcpBroker::new(observability.clone(), worker_count, warm_reserved_fds) {
+            Ok(broker) => broker,
+            Err(err) => {
+                close_fd(parent_sock);
+                return Err(err).context("create TCP broker");
+            }
+        };
+    let warm_pool = if session_source == ProxySessionSource::WarmOneShot {
+        match WarmSessionPool::start(cfg.proxy.clone(), cfg.connect_timeout) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(err) => {
+                close_fd(parent_sock);
+                return Err(err).context("start warm proxy session pool");
+            }
+        }
+    } else {
+        None
     };
     if let Err(err) = write_all_fd(parent_sock, b"G") {
         close_fd(parent_sock);
@@ -274,6 +302,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     let loop_state = Arc::clone(&failure);
     let loop_observability = observability;
     let worker_tcp_broker = tcp_broker.clone();
+    let loop_warm_pool = warm_pool.clone();
     let notification_thread = thread::spawn(move || {
         if std::panic::catch_unwind(|| {
             notification_loop(
@@ -281,6 +310,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
                 loop_cfg,
                 loop_relays,
                 worker_tcp_broker,
+                loop_warm_pool,
                 loop_state,
                 loop_observability,
                 worker_count,
@@ -313,6 +343,10 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     let notification_join_result = notification_thread
         .join()
         .map_err(|_| anyhow!("seccomp notification thread panicked"));
+    // Workers are joined, so no lease can race the pool teardown.
+    if let Some(pool) = &warm_pool {
+        pool.shutdown();
+    }
     let shutdown_result = tcp_broker.shutdown();
     let reactor_join_result = reactor_thread
         .join()
@@ -541,11 +575,13 @@ pub fn run_child_stage() -> Result<i32> {
     exec_target(target_path.into(), argv)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn notification_loop(
     listener_fd: Arc<OwnedFd>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
+    warm_pool: Option<Arc<WarmSessionPool>>,
     failure: Arc<NotificationFailure>,
     observability: Observability,
     worker_count: usize,
@@ -560,6 +596,7 @@ fn notification_loop(
         let worker_cfg = Arc::clone(&cfg);
         let worker_relays = Arc::clone(&relays);
         let worker_tcp_broker = tcp_broker.clone();
+        let worker_warm_pool = warm_pool.clone();
         let worker_failure = Arc::clone(&failure);
         let worker_observability = observability.clone();
         worker_threads.push(thread::spawn(move || {
@@ -569,6 +606,7 @@ fn notification_loop(
                 worker_cfg,
                 worker_relays,
                 worker_tcp_broker,
+                worker_warm_pool,
                 worker_failure,
                 worker_observability,
             )
@@ -846,12 +884,14 @@ fn drain_eventfd(fd: RawFd) -> io::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn notification_worker(
     listener_fd: Arc<OwnedFd>,
     rx: channel::Receiver<QueuedNotification>,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
+    warm_pool: Option<Arc<WarmSessionPool>>,
     failure: Arc<NotificationFailure>,
     observability: Observability,
 ) {
@@ -869,6 +909,7 @@ fn notification_worker(
                 Arc::clone(&cfg),
                 Arc::clone(&relays),
                 tcp_broker.clone(),
+                warm_pool.clone(),
                 observability.clone(),
                 queue_wait,
             );
@@ -1210,12 +1251,14 @@ fn handle_recv_notification_once(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_notification(
     listener_fd: RawFd,
     notif: SeccompNotif,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
+    warm_pool: Option<Arc<WarmSessionPool>>,
     observability: Observability,
     queue_wait: Duration,
 ) {
@@ -1226,6 +1269,7 @@ fn handle_notification(
             cfg,
             relays,
             tcp_broker,
+            warm_pool,
             observability,
             queue_wait,
         ),
@@ -1271,12 +1315,14 @@ fn close_range_closes_fds(first: u32, last: u32, flags: u32) -> bool {
         && flags & (CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connect(
     listener_fd: RawFd,
     notif: SeccompNotif,
     cfg: Arc<EffectiveConfig>,
     relays: Arc<UdpRelayRegistry>,
     tcp_broker: TcpBroker,
+    warm_pool: Option<Arc<WarmSessionPool>>,
     observability: Observability,
     queue_wait: Duration,
 ) {
@@ -1471,25 +1517,30 @@ fn handle_connect(
     );
 
     let mut dial_timings = proxy::DialTimings::default();
-    let stream =
-        match proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, &mut dial_timings) {
-            Ok(stream) => stream,
-            Err(err) => {
-                setup.set_proxy_timings(dial_timings.connect, dial_timings.handshake);
-                disconnect_tcp_socket(target.as_raw_fd());
-                if cfg.debug {
-                    eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
-                }
-                seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
-                let stage = if dial_timings.handshake.is_some() {
-                    "proxy_handshake"
-                } else {
-                    "proxy_connect"
-                };
-                setup.failed(stage, format!("{err:#}"));
-                return;
+    let stream = match dial_proxy_session(
+        &cfg,
+        warm_pool.as_deref(),
+        dest,
+        handler_started,
+        &mut dial_timings,
+    ) {
+        Ok(stream) => stream,
+        Err(err) => {
+            setup.set_proxy_timings(dial_timings.connect, dial_timings.handshake);
+            disconnect_tcp_socket(target.as_raw_fd());
+            if cfg.debug {
+                eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
             }
-        };
+            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            let stage = if dial_timings.handshake.is_some() {
+                "proxy_handshake"
+            } else {
+                "proxy_connect"
+            };
+            setup.failed(stage, format!("{err:#}"));
+            return;
+        }
+    };
     setup.set_proxy_timings(dial_timings.connect, dial_timings.handshake);
     setup.set_proxy_cookie(socket_cookie(stream.as_raw_fd()));
 
@@ -1536,6 +1587,57 @@ fn handle_connect(
     seccomp::send_success(listener_fd, notif.id);
     setup.set_notification_reply(reply_started.elapsed());
     setup.completed();
+}
+
+/// Obtains the proxy-side connection for one flow: a warm lease when the
+/// pool is enabled and can serve one, otherwise a cold dial. All warm-path
+/// fallbacks stay inside the flow's original connect budget.
+fn dial_proxy_session(
+    cfg: &EffectiveConfig,
+    warm_pool: Option<&WarmSessionPool>,
+    dest: Destination,
+    handler_started: Instant,
+    timings: &mut proxy::DialTimings,
+) -> Result<TcpStream> {
+    let Some(pool) = warm_pool else {
+        return proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, timings);
+    };
+    let Some(warm) = pool.lease() else {
+        return proxy::dial_with_timings(
+            &cfg.proxy,
+            dest,
+            remaining_connect_budget(cfg, handler_started),
+            timings,
+        );
+    };
+    match proxy::warm::complete_warm_lease(
+        &cfg.proxy,
+        warm,
+        dest,
+        remaining_connect_budget(cfg, handler_started),
+        timings,
+    ) {
+        Ok(stream) => Ok(stream),
+        Err(WarmCompletionError::NothingSent(_)) => {
+            // No request byte reached the kernel, so the proxy cannot have
+            // observed a request; one cold retry inside the original budget.
+            proxy::dial_with_timings(
+                &cfg.proxy,
+                dest,
+                remaining_connect_budget(cfg, handler_started),
+                timings,
+            )
+        }
+        Err(err) => Err(err.into_error()),
+    }
+}
+
+fn remaining_connect_budget(cfg: &EffectiveConfig, handler_started: Instant) -> Duration {
+    // Keep at least a token budget: timeout setters reject zero, and an
+    // exhausted deadline should fail fast inside the dial instead.
+    cfg.connect_timeout
+        .saturating_sub(handler_started.elapsed())
+        .max(Duration::from_millis(1))
 }
 
 fn handle_sendto(

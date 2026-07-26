@@ -270,11 +270,13 @@ impl TcpBroker {
     pub fn new(
         observability: Observability,
         setup_concurrency: usize,
+        reserved_extra_fds: usize,
     ) -> io::Result<(Self, TcpBrokerReactor)> {
         let kind = reactor_kind_from_env()?;
         let mover = data_mover_kind_from_env()?;
         let splice_quickack = splice_quickack_from_env()?;
-        let (limits, flow_limit_reason) = TcpBrokerLimits::detect(setup_concurrency, mover)?;
+        let (limits, flow_limit_reason) =
+            TcpBrokerLimits::detect(setup_concurrency, mover, reserved_extra_fds)?;
         Self::new_with_limits(
             observability,
             limits,
@@ -441,6 +443,7 @@ impl TcpBrokerLimits {
     fn detect(
         setup_concurrency: usize,
         mover: DataMoverKind,
+        reserved_extra_fds: usize,
     ) -> io::Result<(Self, FlowLimitReason)> {
         let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
@@ -455,7 +458,11 @@ impl TcpBrokerLimits {
         let baseline_fds = open_fd_count()?;
         let policy_headroom = (soft_limit / 5).max(256);
         let setup_headroom = setup_concurrency.saturating_mul(SETUP_EXTRA_FDS_PER_WORKER);
-        let reserved_fds = policy_headroom.saturating_add(setup_headroom);
+        // reserved_extra_fds covers long-lived fd consumers outside the
+        // per-flow accounting, such as the warm proxy session pool.
+        let reserved_fds = policy_headroom
+            .saturating_add(setup_headroom)
+            .saturating_add(reserved_extra_fds);
         let fd_flow_limit = soft_limit
             .saturating_sub(baseline_fds)
             .saturating_sub(reserved_fds)
