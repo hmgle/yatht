@@ -65,7 +65,8 @@ Required work:
    mihomo TUN environment and a local fake proxy.
 4. Prototype `splice(2)` pipes only after the buffered reactor remains the
    correctness oracle. Keep a per-round work budget so one hot flow cannot
-   starve registrations or quiet flows.
+   starve registrations or quiet flows. Status: delivered as the opt-in
+   experimental `SUP_TCP_DATA_MOVER=splice` mover; buffered stays the default.
 5. Record target and physical `SO_COOKIE` values for diagnostics. Do not put
    `kcmp(2)` on the normal data path; use `KCMP_FILE`/`KCMP_EPOLL_TFD` only for
    tests and exceptional reconciliation.

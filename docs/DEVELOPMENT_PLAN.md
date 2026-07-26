@@ -90,15 +90,28 @@ is `socks5://127.0.0.1:1080`.
   natively preserves epoll registrations, descriptor aliases, bind state, and
   options on the target-side TCP leg. The reactor propagates half-closes and
   isolates ordinary flow errors without dedicating a thread to each flow.
+- The broker reactor runs on epoll by default; `SUP_TCP_REACTOR=poll` is the
+  explicit rollback path. Relay bytes travel through buffered user-space
+  copies by default; `SUP_TCP_DATA_MOVER=splice` opts into an experimental
+  kernel-pipe mover with a per-round budget, and `SUP_TCP_SPLICE_QUICKACK`
+  (default `on`) flushes the pending delayed ACK after small drained splice
+  rounds to avoid a delayed-ACK/Nagle interlock.
+- Proxy sessions dial cold per flow by default.
+  `SUP_TCP_PROXY_SESSION=warm-one-shot` opts into an experimental
+  demand-driven pool of at most 16 pre-established proxy sessions with a 30 s
+  idle timeout; each warm session serves one flow and misses fall back to
+  cold dials.
 - Before proxy setup, the broker reserves an active-flow permit. The default
   ceiling is 16,384 flows and is reduced from `RLIMIT_NOFILE` after preserving
   the larger of 20% or 256 fds, plus setup-worker headroom. Registration has a
   fixed capacity of 128, and buffered relay data shares a 256 MiB global
   pending-byte budget. Rejections are fail-closed and separately classified.
-- Optional JSONL telemetry uses a bounded writer queue and records versioned run
-  metadata, detected broker limits, per-flow setup spans and socket cookies,
-  and a final resource/data/error summary. The destination path must not exist,
-  so separate runs cannot silently overwrite one another.
+- Optional JSONL telemetry (schema version 6) uses a bounded writer queue and
+  records versioned run metadata, detected broker limits, per-flow setup spans
+  with stage timings, proxy session outcomes, and socket cookies, and a final
+  resource/data/error summary including warm session pool counters. The
+  destination path must not exist, so separate runs cannot silently overwrite
+  one another.
 - TCP proxy failures are fail-closed and return `ECONNREFUSED`; they do not
   fall back to direct connections.
 - Nonblocking notifications are dispatched through a bounded queue to a bounded
@@ -170,11 +183,18 @@ cargo test
 
 - The deterministic local TCP benchmark compares direct control, the fixed
   pre-stable `b5554b9` ADDFD binary, and the current stable broker. It covers
-  short request/response flows, mostly-idle concurrency, and stalled readers;
-  randomizes variant order after three warmups; repeats each measurement ten
-  times; and archives raw samples, partial failure results, commands, binary
-  hashes/commits/build commands, dirty-worktree artifacts, role-specific
-  `VmHWM`/sampled fd peaks, and stable-broker diagnostics under `target/`.
+  short request/response flows, mostly-idle concurrency, streaming and
+  slow-consumer transfers, hot/quiet fairness, mid-stream resets, stalled
+  readers, and optional long-lived soak runs; randomizes variant order after
+  three warmups; repeats each measurement ten times; and archives raw samples,
+  partial failure results, commands, binary hashes/commits/build commands,
+  dirty-worktree artifacts, role-specific `VmHWM`/sampled fd peaks, and
+  stable-broker diagnostics under `bench-results/tcp-broker/`. Paired
+  same-repetition comparisons of the experimental data paths run through
+  `--stable-data-movers` and `--proxy-session-sources`, with `--proxy-rtt-ms`
+  RTT injection and `--splice-readiness-gate` / `--warm-readiness-gate`
+  acceptance checks. The harness ships its own dependency-free test suite,
+  `python3 -X dev scripts/test_tcp_broker_benchmark.py`.
   Stalled runs set the same small application send buffer for every variant,
   pause destination transport reads, require every flow to report `EAGAIN`,
   hold for the requested interval, then release and drain all bytes while the
