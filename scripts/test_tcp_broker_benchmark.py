@@ -34,6 +34,22 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(events, [{"event": "run_start"}])
         self.assertEqual([error["line"] for error in errors], [2, 3])
 
+    def test_streaming_metric_parser_keeps_only_run_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.jsonl"
+            path.write_bytes(
+                b'{"event":"tcp_setup","outcome":"completed"}\n'
+                b'{"event":"run_summary","tcp_active_flows":0}\n'
+                b'{"event":\n'
+            )
+
+            summaries, errors = benchmark.parse_run_summaries_streaming(path)
+
+        self.assertEqual(
+            summaries, [{"event": "run_summary", "tcp_active_flows": 0}]
+        )
+        self.assertEqual(len(errors), 1)
+
     def test_tcp_setup_stage_summary_aggregates_completed_flows(self) -> None:
         def completed(index: int) -> dict[str, object]:
             return {
@@ -204,6 +220,8 @@ class BenchmarkTests(unittest.TestCase):
     def test_scenarios_expand_multiple_stream_sizes(self) -> None:
         args = benchmark.argparse.Namespace(
             payload_sizes=[],
+            soak_seconds=0,
+            soak_profile="smoke",
             connections=1,
             idle_flows=[],
             idle_hold_ms=0,
@@ -916,6 +934,62 @@ class BenchmarkTests(unittest.TestCase):
             servers.stop()
 
     @unittest.skipIf(shutil.which("cc") is None, "cc not available")
+    def test_workload_soak_smoke_profile_runs_complete_cycles(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=10)
+        servers.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workload = Path(directory) / "workload"
+                progress_path = Path(directory) / "soak-progress"
+                ack_path = Path(directory) / "soak-ack"
+                benchmark.build_workload("cc", workload)
+                servers.prepare_soak_stream_run()
+                process = subprocess.Popen(
+                    [
+                        str(workload),
+                        "soak",
+                        "127.0.0.1",
+                        str(servers.destination_port),
+                        str(servers.stream_port),
+                        "1",
+                        "smoke",
+                        str(progress_path),
+                        str(ack_path),
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                acknowledged = 0
+                deadline = time.monotonic() + 30
+                while process.poll() is None:
+                    self.assertLess(time.monotonic(), deadline)
+                    if progress_path.exists():
+                        cycle = int(progress_path.read_text().strip())
+                        if cycle > acknowledged:
+                            acknowledged = cycle
+                            ack_path.write_text(f"{cycle}\n")
+                    time.sleep(0.005)
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, msg=stderr[-500:])
+                flows, samples, summary = benchmark.parse_workload_output(stdout)
+                self.assertEqual(flows, [])
+                self.assertEqual(samples, [])
+                self.assertGreaterEqual(summary["cycles"], 1)
+                self.assertEqual(summary["completed_phases"], summary["cycles"] * 12)
+                self.assertEqual(summary["successful"], summary["flows"])
+                aggregate, complete = servers.soak_stream_results(
+                    summary["stream_connections"]
+                )
+                self.assertTrue(complete)
+                self.assertEqual(aggregate["violations"], 0)
+                self.assertEqual(
+                    aggregate["connections"], summary["stream_connections"]
+                )
+        finally:
+            servers.stop()
+
+    @unittest.skipIf(shutil.which("cc") is None, "cc not available")
     def test_workload_fairness_roundtrip(self) -> None:
         servers = benchmark.BenchmarkServers(safety_timeout=10)
         servers.start()
@@ -978,6 +1052,36 @@ class BenchmarkTests(unittest.TestCase):
         assert cpu is not None
         self.assertGreaterEqual(cpu, 0)
         self.assertIsNone(benchmark.process_cpu_ns(2**31 - 1))
+
+    def test_soak_resource_acceptance_checks_quiescent_growth(self) -> None:
+        samples = [
+            {
+                "kind": "cycle_boundary",
+                "cycle": cycle,
+                "elapsed_ns": cycle * 1_000_000_000,
+                "supervisor": {"fds": 10, "rss_kib": 6000},
+                "target": {"fds": 4, "rss_kib": 1000},
+            }
+            for cycle in range(1, 31)
+        ]
+
+        accepted = benchmark.soak_resource_acceptance(samples, 30, "standard")
+        leaked = benchmark.soak_resource_acceptance(
+            [
+                *samples[:-1],
+                {
+                    **samples[-1],
+                    "supervisor": {"fds": 11, "rss_kib": 16000},
+                },
+            ],
+            30,
+            "standard",
+        )
+
+        self.assertTrue(accepted["passed"])
+        self.assertFalse(leaked["passed"])
+        self.assertTrue(any("fd delta" in reason for reason in leaked["reasons"]))
+        self.assertTrue(any("RSS grew" in reason for reason in leaked["reasons"]))
 
     def test_parse_perf_stat_csv_keeps_counter_rows(self) -> None:
         text = (

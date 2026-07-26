@@ -47,6 +47,8 @@ SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT = -5.0
 SPLICE_STEADY_MAX_CPU_DELTA_PERCENT = -15.0
 METRICS_SCHEMA_VERSION = 5
 SAMPLE_INTERVAL_SECONDS = 0.005
+SOAK_SAMPLE_INTERVAL_SECONDS = 1.0
+SOAK_POLL_INTERVAL_SECONDS = 0.05
 # Walking /proc for the whole process tree at 5 ms is a measurable observer
 # effect with thousands of flows; per-role samples stay at 5 ms while the tree
 # aggregate is refreshed every TREE_SAMPLE_STRIDE iterations.
@@ -85,6 +87,7 @@ class BenchmarkServers:
         self.stalled_release: asyncio.Event | None = None
         self.stalled_results: list[dict[str, int | bool]] | None = None
         self.stream_results: list[dict[str, Any]] | None = None
+        self.stream_aggregate: dict[str, Any] | None = None
         self.connection_tasks: set[asyncio.Task[None]] = set()
         self.connection_writers: set[asyncio.StreamWriter] = set()
         self.safety_timeout = safety_timeout
@@ -175,6 +178,50 @@ class BenchmarkServers:
 
     async def _prepare_stream_run(self) -> None:
         self.stream_results = []
+        self.stream_aggregate = None
+
+    def prepare_soak_stream_run(self) -> None:
+        if self.loop is None:
+            raise RuntimeError("benchmark servers are not running")
+        self._run_on_loop(self._prepare_soak_stream_run(), self.loop)
+
+    async def _prepare_soak_stream_run(self) -> None:
+        self.stream_results = None
+        self.stream_aggregate = {
+            "connections": 0,
+            "violations": 0,
+            "direction_counts": {},
+        }
+
+    def soak_stream_results(
+        self, expected_connections: int
+    ) -> tuple[dict[str, Any], bool]:
+        if self.loop is None:
+            raise RuntimeError("benchmark servers are not running")
+        aggregate, complete = self._run_on_loop(
+            self._soak_stream_wait_results(expected_connections), self.loop
+        )
+        return aggregate, complete
+
+    async def _soak_stream_wait_results(
+        self, expected_connections: int
+    ) -> tuple[dict[str, Any], bool]:
+        if self.stream_aggregate is None:
+            raise RuntimeError("soak stream run was not prepared")
+        assert self.loop is not None
+        deadline = self.loop.time() + STREAM_RESULT_WAIT_SECONDS
+        while (
+            self.stream_aggregate["connections"] < expected_connections
+            and self.loop.time() < deadline
+        ):
+            await asyncio.sleep(0.005)
+        return (
+            {
+                **self.stream_aggregate,
+                "direction_counts": dict(self.stream_aggregate["direction_counts"]),
+            },
+            self.stream_aggregate["connections"] >= expected_connections,
+        )
 
     def stream_run_results(
         self, expected_connections: int
@@ -307,7 +354,10 @@ class BenchmarkServers:
         # Same capture rule as the stalled listener: a late connection from a
         # finished run must not append into the next run's result list.
         results = self.stream_results
-        self._spawn_connection(self._handle_stream(reader, writer, results), writer)
+        aggregate = self.stream_aggregate
+        self._spawn_connection(
+            self._handle_stream(reader, writer, results, aggregate), writer
+        )
 
     def _connection_done(
         self,
@@ -456,6 +506,7 @@ class BenchmarkServers:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         results: list[dict[str, Any]] | None,
+        aggregate: dict[str, Any] | None,
     ) -> None:
         record: dict[str, Any] = {
             "header_ok": False,
@@ -468,7 +519,7 @@ class BenchmarkServers:
             "aborted": False,
         }
         try:
-            if results is None:
+            if results is None and aggregate is None:
                 raise RuntimeError("stream run was not prepared")
             try:
                 header = await reader.readexactly(STREAM_HEADER.size)
@@ -477,6 +528,9 @@ class BenchmarkServers:
             magic, direction_code, payload_bytes, aux, aux2 = (
                 STREAM_HEADER.unpack(header)
             )
+            record["payload_bytes"] = payload_bytes
+            record["aux"] = aux
+            record["aux2"] = aux2
             if magic != STREAM_MAGIC:
                 return
             direction = chr(direction_code)
@@ -545,6 +599,13 @@ class BenchmarkServers:
         finally:
             if results is not None:
                 results.append(record)
+            if aggregate is not None:
+                aggregate["connections"] += 1
+                direction = record.get("direction") or "unknown"
+                direction_counts = aggregate["direction_counts"]
+                direction_counts[direction] = direction_counts.get(direction, 0) + 1
+                if not soak_stream_result_is_clean(record):
+                    aggregate["violations"] += 1
             writer.close()
             with suppress(ConnectionError, OSError):
                 await writer.wait_closed()
@@ -658,7 +719,7 @@ def stream_result_is_clean(
 
 def require_stream_server_quiescence(run: dict[str, Any]) -> None:
     if (
-        run["mode"] not in ("stream", "fairness", "reset")
+        run["mode"] not in ("stream", "fairness", "reset", "soak")
         or run.get("stream_server_quiescent") is True
     ):
         return
@@ -684,6 +745,27 @@ def reset_result_is_clean(
         and result["received"] == expected_consume
         and result["sent"] == prefix_bytes
     )
+
+
+def soak_stream_result_is_clean(result: dict[str, Any]) -> bool:
+    direction = result.get("direction")
+    payload_bytes = result.get("payload_bytes")
+    if not isinstance(payload_bytes, int):
+        return False
+    if direction == "U":
+        return stream_result_is_clean(result, "up", payload_bytes)
+    if direction == "D":
+        return stream_result_is_clean(result, "down", payload_bytes)
+    if direction == "B":
+        return stream_result_is_clean(result, "bidi", payload_bytes)
+    if direction == "R":
+        return reset_result_is_clean(
+            result,
+            payload_bytes,
+            result.get("aux") or 0,
+            result.get("aux2") or 0,
+        )
+    return False
 
 
 def executable(value: str) -> str:
@@ -786,6 +868,8 @@ def comma_directions(raw: str) -> list[str]:
 
 def ensure_fd_limit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     selected_flow_counts = list(args.idle_flows)
+    if args.soak_seconds > 0:
+        selected_flow_counts.append(512 if args.soak_profile == "standard" else 2)
     if args.payload_sizes:
         selected_flow_counts.append(args.connections)
     if args.stream_flows > 0:
@@ -1069,6 +1153,38 @@ def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]
     return events, errors
 
 
+def parse_run_summaries_streaming(
+    path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    summaries: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    try:
+        metric_file = path.open("rb")
+    except OSError as error:
+        return summaries, [{"line": None, "error": str(error), "fragment": None}]
+    with metric_file:
+        for line_number, raw in enumerate(metric_file, start=1):
+            if not raw.strip():
+                continue
+            try:
+                event = json.loads(raw.decode("utf-8"))
+                if not isinstance(event, dict):
+                    raise ValueError("JSONL record is not an object")
+                if event.get("event") == "run_summary":
+                    summaries.append(event)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                errors.append(
+                    {
+                        "line": line_number,
+                        "error": str(error),
+                        "fragment": raw[:200].decode(
+                            "utf-8", errors="backslashreplace"
+                        ),
+                    }
+                )
+    return summaries, errors
+
+
 TCP_SETUP_STAGE_FIELDS = (
     "queue_wait_ns",
     "fd_inspection_ns",
@@ -1163,6 +1279,79 @@ def interrupt_benchmark(_signum: int, _frame: Any) -> None:
     raise KeyboardInterrupt
 
 
+def linear_slope(points: list[tuple[float, float]]) -> float | None:
+    if len(points) < 2:
+        return None
+    x_mean = statistics.mean(point[0] for point in points)
+    y_mean = statistics.mean(point[1] for point in points)
+    denominator = sum((x - x_mean) ** 2 for x, _y in points)
+    if denominator == 0:
+        return None
+    return sum((x - x_mean) * (y - y_mean) for x, y in points) / denominator
+
+
+def soak_resource_acceptance(
+    samples: list[dict[str, Any]], cycles: int, profile: str
+) -> dict[str, Any]:
+    boundaries = [sample for sample in samples if sample["kind"] == "cycle_boundary"]
+    minimum_cycles = 30 if profile == "standard" else 1
+    reasons: list[str] = []
+    if cycles < minimum_cycles:
+        reasons.append(f"requires {minimum_cycles} cycles, got {cycles}")
+    if len(boundaries) != cycles:
+        reasons.append(f"requires {cycles} boundary samples, got {len(boundaries)}")
+
+    first = boundaries[0] if boundaries else None
+    last = boundaries[-1] if boundaries else None
+    fd_deltas: dict[str, int | None] = {}
+    rss_growth_kib: dict[str, int | None] = {}
+    if first is not None and last is not None:
+        for role in ("supervisor", "target"):
+            first_role = first.get(role)
+            last_role = last.get(role)
+            if first_role is None or last_role is None:
+                reasons.append(f"missing {role} boundary resources")
+                fd_deltas[role] = None
+                rss_growth_kib[role] = None
+                continue
+            fd_delta = last_role["fds"] - first_role["fds"]
+            rss_growth = last_role["rss_kib"] - first_role["rss_kib"]
+            fd_deltas[role] = fd_delta
+            rss_growth_kib[role] = rss_growth
+            if fd_delta != 0:
+                reasons.append(f"{role} quiescent fd delta is {fd_delta}, expected 0")
+            rss_limit = max(8192, int(first_role["rss_kib"] * 0.10))
+            if rss_growth > rss_limit:
+                reasons.append(
+                    f"{role} RSS grew {rss_growth} KiB, limit is {rss_limit} KiB"
+                )
+
+    slope_boundaries = boundaries[9:] if len(boundaries) > 10 else boundaries
+    rss_points = [
+        (
+            sample["elapsed_ns"] / 3_600_000_000_000,
+            float(sample["supervisor"]["rss_kib"] + sample["target"]["rss_kib"]),
+        )
+        for sample in slope_boundaries
+        if sample.get("supervisor") is not None and sample.get("target") is not None
+    ]
+    rss_slope_kib_per_hour = linear_slope(rss_points)
+    if rss_slope_kib_per_hour is not None and rss_slope_kib_per_hour > 4096:
+        reasons.append(
+            f"combined RSS slope is {rss_slope_kib_per_hour:.1f} KiB/hour, limit is 4096"
+        )
+    return {
+        "passed": not reasons,
+        "reasons": reasons,
+        "minimum_cycles": minimum_cycles,
+        "cycles": cycles,
+        "boundary_samples": len(boundaries),
+        "fd_deltas": fd_deltas,
+        "rss_growth_kib": rss_growth_kib,
+        "combined_rss_slope_kib_per_hour": rss_slope_kib_per_hour,
+    }
+
+
 def variant_command(
     variant: str,
     args: argparse.Namespace,
@@ -1171,8 +1360,24 @@ def variant_command(
     metrics_path: Path | None = None,
     stalled_ready_path: Path | None = None,
     idle_ready_path: Path | None = None,
+    soak_progress_path: Path | None = None,
+    soak_ack_path: Path | None = None,
 ) -> list[str]:
-    if scenario["mode"] == "fairness":
+    if scenario["mode"] == "soak":
+        if soak_progress_path is None or soak_ack_path is None:
+            raise ValueError("soak workload requires progress and ack paths")
+        workload = [
+            str(args.workload),
+            "soak",
+            "127.0.0.1",
+            str(servers.destination_port),
+            str(servers.stream_port),
+            str(scenario["duration_seconds"]),
+            scenario["profile"],
+            str(soak_progress_path),
+            str(soak_ack_path),
+        ]
+    elif scenario["mode"] == "fairness":
         workload = [
             str(args.workload),
             "fairness",
@@ -1237,15 +1442,20 @@ def run_one(
     repetition: int,
     measurement_kind: str,
     metrics_path: Path | None,
+    resource_samples_path: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     with tempfile.TemporaryDirectory(prefix="yatht-benchmark-control-") as control_dir:
         stalled_ready_path = Path(control_dir) / "stalled-ready"
         idle_ready_path = Path(control_dir) / "idle-ready"
         perf_output_path = Path(control_dir) / "perf-stat.csv"
+        soak_progress_path = Path(control_dir) / "soak-progress"
+        soak_ack_path = Path(control_dir) / "soak-ack"
         if scenario["mode"] == "stalled":
             servers.prepare_stalled_run()
         if scenario["mode"] in ("stream", "fairness", "reset"):
             servers.prepare_stream_run()
+        if scenario["mode"] == "soak":
+            servers.prepare_soak_stream_run()
         command = variant_command(
             variant,
             args,
@@ -1254,6 +1464,8 @@ def run_one(
             metrics_path,
             stalled_ready_path if scenario["mode"] == "stalled" else None,
             idle_ready_path if scenario["mode"] == "idle" else None,
+            soak_progress_path if scenario["mode"] == "soak" else None,
+            soak_ack_path if scenario["mode"] == "soak" else None,
         )
         process_environment = variant_environment(variant, data_mover)
         logged_command = command
@@ -1285,6 +1497,9 @@ def run_one(
         process_tree_fd_sampled_peak: int | None = None
         supervisor_pid: int | None = None
         target_pid: int | None = None
+        soak_last_cycle = 0
+        soak_resource_samples: list[dict[str, Any]] = []
+        next_soak_resource_sample = time.monotonic()
         with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(
             mode="w+"
         ) as stderr_file:
@@ -1343,6 +1558,51 @@ def run_one(
                             )
                     iteration += 1
                     now = time.monotonic()
+                    if scenario["mode"] == "soak" and now >= next_soak_resource_sample:
+                        sample = {
+                            "kind": "periodic",
+                            "cycle": soak_last_cycle,
+                            "elapsed_ns": time.perf_counter_ns() - started,
+                            "supervisor": process_resources(supervisor_pid)
+                            if supervisor_pid is not None
+                            else None,
+                            "target": process_resources(target_pid)
+                            if target_pid is not None
+                            else None,
+                            "benchmark_server": process_resources(os.getpid()),
+                        }
+                        soak_resource_samples.append(sample)
+                        if resource_samples_path is not None:
+                            with resource_samples_path.open("a") as resource_file:
+                                resource_file.write(json.dumps(sample, sort_keys=True) + "\n")
+                        next_soak_resource_sample = now + SOAK_SAMPLE_INTERVAL_SECONDS
+                    if scenario["mode"] == "soak" and soak_progress_path.exists():
+                        try:
+                            completed_cycle = int(soak_progress_path.read_text().strip())
+                        except (OSError, ValueError):
+                            pass
+                        else:
+                            if completed_cycle > soak_last_cycle:
+                                soak_last_cycle = completed_cycle
+                                sample = {
+                                    "kind": "cycle_boundary",
+                                    "cycle": completed_cycle,
+                                    "elapsed_ns": time.perf_counter_ns() - started,
+                                    "supervisor": process_resources(supervisor_pid)
+                                    if supervisor_pid is not None
+                                    else None,
+                                    "target": process_resources(target_pid)
+                                    if target_pid is not None
+                                    else None,
+                                    "benchmark_server": process_resources(os.getpid()),
+                                }
+                                soak_resource_samples.append(sample)
+                                if resource_samples_path is not None:
+                                    with resource_samples_path.open("a") as resource_file:
+                                        resource_file.write(
+                                            json.dumps(sample, sort_keys=True) + "\n"
+                                        )
+                                soak_ack_path.write_text(f"{completed_cycle}\n")
                     if scenario["mode"] == "idle" and not idle_ready:
                         if idle_ready_path.exists():
                             try:
@@ -1379,7 +1639,11 @@ def run_one(
                         timed_out = True
                         terminate_process_group(process)
                         break
-                    time.sleep(SAMPLE_INTERVAL_SECONDS)
+                    time.sleep(
+                        SOAK_POLL_INTERVAL_SECONDS
+                        if scenario["mode"] == "soak"
+                        else SAMPLE_INTERVAL_SECONDS
+                    )
             finally:
                 if scenario["mode"] == "stalled" and not stalled_released:
                     servers.release_stalled_run()
@@ -1443,12 +1707,26 @@ def run_one(
         flows, workload_samples, workload_summary = [], [], {}
         parse_error = str(error)
 
+    soak_stream_aggregate: dict[str, Any] | None = None
+    if scenario["mode"] == "soak" and parse_error is None:
+        expected_stream_connections = workload_summary.get("stream_connections")
+        if isinstance(expected_stream_connections, int):
+            soak_stream_aggregate, stream_results_complete = servers.soak_stream_results(
+                expected_stream_connections
+            )
+
     metric_summary: dict[str, Any] | None = None
     metric_parse_errors: list[dict[str, Any]] = []
     tcp_setup_stage_summary: dict[str, Any] | None = None
     if metrics_path is not None:
-        metric_events, metric_parse_errors = parse_jsonl(metrics_path)
-        summaries = [event for event in metric_events if event.get("event") == "run_summary"]
+        if scenario["mode"] == "soak":
+            summaries, metric_parse_errors = parse_run_summaries_streaming(metrics_path)
+            metric_events: list[dict[str, Any]] = []
+        else:
+            metric_events, metric_parse_errors = parse_jsonl(metrics_path)
+            summaries = [
+                event for event in metric_events if event.get("event") == "run_summary"
+            ]
         if len(summaries) == 1:
             metric_summary = summaries[0]
         else:
@@ -1459,14 +1737,26 @@ def run_one(
                     "fragment": None,
                 }
             )
-        tcp_setup_stage_summary = summarize_tcp_setup_stages(metric_events)
+        if scenario["mode"] != "soak":
+            tcp_setup_stage_summary = summarize_tcp_setup_stages(metric_events)
 
     successful = [flow for flow in flows if flow.get("ok")]
-    ok = (
-        completed.returncode == 0
-        and parse_error is None
-        and workload_flows_are_valid(flows, scenario["flows"])
-    )
+    if scenario["mode"] == "soak":
+        ok = bool(
+            completed.returncode == 0
+            and parse_error is None
+            and workload_summary.get("mode") == "soak"
+            and workload_summary.get("cycles", 0) > 0
+            and workload_summary.get("successful") == workload_summary.get("flows")
+            and workload_summary.get("failed_phase") is None
+            and workload_summary.get("phase_returncode") == 0
+        )
+    else:
+        ok = (
+            completed.returncode == 0
+            and parse_error is None
+            and workload_flows_are_valid(flows, scenario["flows"])
+        )
     stalled_server_connections: int | None = None
     stalled_server_corrupt_connections: int | None = None
     stalled_server_byte_mismatch_connections: int | None = None
@@ -1582,13 +1872,35 @@ def run_one(
             and stream_server_connections == scenario["flows"]
             and stream_server_violations == 0
         )
+    if scenario["mode"] == "soak":
+        stream_server_connections = (
+            soak_stream_aggregate.get("connections")
+            if soak_stream_aggregate is not None
+            else None
+        )
+        stream_server_violations = (
+            soak_stream_aggregate.get("violations")
+            if soak_stream_aggregate is not None
+            else None
+        )
+        stream_server_quiescent = bool(
+            stream_results_complete is True
+            and soak_stream_aggregate is not None
+            and stream_server_connections == workload_summary.get("stream_connections")
+        )
+        ok = ok and stream_server_quiescent and stream_server_violations == 0
     if metric_summary is not None and metric_summary.get("dropped_metric_events") != 0:
         ok = False
     if metrics_path is not None:
         ok = ok and metric_summary is not None and not metric_parse_errors
         if metric_summary is not None:
             ok = ok and metric_summary.get("schema_version") == METRICS_SCHEMA_VERSION
-            ok = ok and metric_summary.get("tcp_setup_completed") == scenario["flows"]
+            expected_setup_flows = (
+                workload_summary.get("flows")
+                if scenario["mode"] == "soak"
+                else scenario["flows"]
+            )
+            ok = ok and metric_summary.get("tcp_setup_completed") == expected_setup_flows
             ok = ok and metric_summary.get("tcp_active_flows") == 0
             ok = ok and metric_summary.get("tcp_pending_bytes") == 0
             ok = ok and metric_summary.get("tcp_reserved_pending_bytes") == 0
@@ -1602,6 +1914,9 @@ def run_one(
                 )
             )
             ok = ok and outcomes == metric_summary.get("tcp_flows_started")
+            if scenario["mode"] == "soak":
+                ok = ok and metric_summary.get("tcp_pipe_bytes") == 0
+                ok = ok and metric_summary.get("tcp_splice_fallbacks") == 0
     run = {
         "scenario": scenario["name"],
         "mode": scenario["mode"],
@@ -1650,8 +1965,16 @@ def run_one(
             if scenario["mode"] == "stalled" and metric_summary is not None
             else None
         ),
-        "expected_flows": scenario["flows"],
-        "successful_flows": len(successful),
+        "expected_flows": (
+            workload_summary.get("flows", 0)
+            if scenario["mode"] == "soak"
+            else scenario["flows"]
+        ),
+        "successful_flows": (
+            workload_summary.get("successful", 0)
+            if scenario["mode"] == "soak"
+            else len(successful)
+        ),
         "wall_ns": wall_ns,
         "child_cpu_ns": child_delta_ns,
         "benchmark_server_cpu_ns": benchmark_server_cpu_ns,
@@ -1674,7 +1997,20 @@ def run_one(
         "metric_summary": metric_summary,
         "metric_parse_errors": metric_parse_errors,
         "tcp_setup_stage_summary": tcp_setup_stage_summary,
+        "soak_resource_samples": soak_resource_samples,
+        "soak_cycles": workload_summary.get("cycles")
+        if scenario["mode"] == "soak"
+        else None,
+        "soak_stream_aggregate": soak_stream_aggregate,
     }
+    if scenario["mode"] == "soak":
+        soak_acceptance = soak_resource_acceptance(
+            soak_resource_samples,
+            workload_summary.get("cycles", 0),
+            scenario["profile"],
+        )
+        run["soak_acceptance"] = soak_acceptance
+        run["ok"] = run["ok"] and soak_acceptance["passed"]
     enriched = [
         {
             **record,
@@ -1690,6 +2026,16 @@ def run_one(
 
 
 def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.soak_seconds > 0:
+        return [
+            {
+                "name": f"soak-{args.soak_profile}-{args.soak_seconds}-seconds",
+                "mode": "soak",
+                "flows": 0,
+                "duration_seconds": args.soak_seconds,
+                "profile": args.soak_profile,
+            }
+        ]
     result = [
         {
             "name": f"request-{payload}-bytes",
@@ -1841,6 +2187,9 @@ def summarize(
         wall = [run["wall_ns"] for run in selected_runs if run["ok"]]
         valid_runs = [run for run in selected_runs if run["ok"]]
         successful = sum(run["successful_flows"] for run in valid_runs)
+        compact_soak = bool(selected_runs) and all(
+            run.get("mode") == "soak" for run in selected_runs
+        )
         wall_total = sum(wall)
         bytes_moved = sum(run.get("bytes") or 0 for run in valid_runs)
         cpu_per_byte = [
@@ -1895,8 +2244,10 @@ def summarize(
                 "data_mover": data_mover,
                 "valid_runs": sum(run["ok"] for run in selected_runs),
                 "total_runs": len(selected_runs),
-                "valid_flows": len(selected_flows),
-                "valid_flow_count_consistent": len(selected_flows) == successful,
+                "valid_flows": successful if compact_soak else len(selected_flows),
+                "valid_flow_count_consistent": (
+                    True if compact_soak else len(selected_flows) == successful
+                ),
                 "connect_p50_ns": percentile(connect, 0.50) if connect else None,
                 "connect_p95_ns": percentile(connect, 0.95) if connect else None,
                 "connect_p99_ns": percentile(connect, 0.99) if connect else None,
@@ -2208,6 +2559,8 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "stalled_flows": args.stalled_flows,
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
+        "soak_seconds": args.soak_seconds,
+        "soak_profile": args.soak_profile,
         "splice_readiness_gate": args.splice_readiness_gate,
         "random_seed": args.seed,
         "estimated_fd_limit": args.estimated_fd_limit,
@@ -2283,6 +2636,8 @@ def parse_args() -> argparse.Namespace:
     # per-flow budget must exceed that or flows never observe EAGAIN.
     parser.add_argument("--stalled-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--stalled-hold-ms", type=int, default=250)
+    parser.add_argument("--soak-seconds", type=int, default=0)
+    parser.add_argument("--soak-profile", choices=("standard", "smoke"), default="standard")
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -2367,6 +2722,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
+    if args.soak_seconds < 0:
+        parser.error("soak seconds must be nonnegative")
+    if args.soak_seconds > 0:
+        if args.variants != ["stable"]:
+            parser.error("soak requires --variants stable")
+        if len(args.stable_data_movers) != 1 or args.stable_data_movers == ["inherited"]:
+            parser.error("soak requires exactly one explicit stable data mover")
+        if args.warmups != 0 or args.repetitions != 1:
+            parser.error("soak requires --warmups 0 --repetitions 1")
+        if args.timeout <= args.soak_seconds:
+            parser.error("soak timeout must exceed soak duration")
     if args.splice_readiness_gate:
         if args.variants != ["stable"]:
             parser.error("splice readiness gate requires --variants stable")
@@ -2410,6 +2776,9 @@ def main() -> None:
     )
     for name in ("runs.jsonl", "flow_samples.jsonl", "commands.txt"):
         (output_dir / name).write_text("")
+    resource_samples_path = output_dir / "resource_samples.jsonl"
+    if args.soak_seconds > 0:
+        resource_samples_path.write_text("")
 
     servers = BenchmarkServers(args.timeout + 30)
     rng = random.Random(args.seed)
@@ -2478,6 +2847,11 @@ def main() -> None:
                             )
                 for repetition in range(args.repetitions):
                     for variant, data_mover in randomized_execution_order(args, rng):
+                        measurement_metrics_path = (
+                            metrics_dir / f"{scenario['name']}-{data_mover}.jsonl"
+                            if scenario["mode"] == "soak"
+                            else None
+                        )
                         run, flows = run_one(
                             variant,
                             data_mover,
@@ -2486,7 +2860,10 @@ def main() -> None:
                             scenario,
                             repetition,
                             "measurement",
-                            None,
+                            measurement_metrics_path,
+                            resource_samples_path
+                            if scenario["mode"] == "soak"
+                            else None,
                         )
                         runs.append(run)
                         flow_samples.extend(flows)
@@ -2510,7 +2887,11 @@ def main() -> None:
                             )
                         require_stalled_server_quiescence(run)
                         require_stream_server_quiescence(run)
-                if "stable" in args.variants and not args.skip_diagnostics:
+                if (
+                    "stable" in args.variants
+                    and not args.skip_diagnostics
+                    and scenario["mode"] != "soak"
+                ):
                     for data_mover in args.stable_data_movers:
                         metrics_path = metrics_dir / (
                             f"{scenario['name']}-{data_mover}.jsonl"

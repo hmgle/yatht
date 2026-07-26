@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1310,6 +1311,378 @@ static int run_reset(const struct endpoint *endpoint, size_t flows,
     return successful == flows ? 0 : 1;
 }
 
+struct soak_profile {
+    size_t request_flows;
+    size_t request_small_bytes;
+    size_t request_large_bytes;
+    size_t idle_flows;
+    size_t idle_hold_ms;
+    size_t ramp_flows;
+    size_t ramp_bytes;
+    size_t steady_flows;
+    size_t steady_bytes;
+    size_t slow_flows;
+    size_t slow_bytes;
+    size_t slow_rate;
+    size_t fairness_quiet_flows;
+    size_t fairness_iterations;
+    size_t fairness_payload;
+    size_t fairness_hot_bytes;
+    size_t reset_flows;
+    size_t reset_request_bytes;
+    size_t reset_prefix_bytes;
+};
+
+static const struct soak_profile SOAK_STANDARD = {
+    .request_flows = 128,
+    .request_small_bytes = 1024,
+    .request_large_bytes = 65536,
+    .idle_flows = 512,
+    .idle_hold_ms = 100,
+    .ramp_flows = 32,
+    .ramp_bytes = 4 * 1024 * 1024,
+    .steady_flows = 32,
+    .steady_bytes = 32 * 1024 * 1024,
+    .slow_flows = 16,
+    .slow_bytes = 256 * 1024,
+    .slow_rate = 128 * 1024,
+    .fairness_quiet_flows = 32,
+    .fairness_iterations = 40,
+    .fairness_payload = 1024,
+    .fairness_hot_bytes = 64 * 1024 * 1024,
+    .reset_flows = 128,
+    .reset_request_bytes = 65536,
+    .reset_prefix_bytes = 1024,
+};
+
+static const struct soak_profile SOAK_SMOKE = {
+    .request_flows = 2,
+    .request_small_bytes = 64,
+    .request_large_bytes = 1024,
+    .idle_flows = 2,
+    .idle_hold_ms = 1,
+    .ramp_flows = 2,
+    .ramp_bytes = 64 * 1024,
+    .steady_flows = 2,
+    .steady_bytes = 128 * 1024,
+    .slow_flows = 2,
+    .slow_bytes = 64 * 1024,
+    .slow_rate = 1024 * 1024,
+    .fairness_quiet_flows = 2,
+    .fairness_iterations = 2,
+    .fairness_payload = 64,
+    .fairness_hot_bytes = 64 * 1024,
+    .reset_flows = 2,
+    .reset_request_bytes = 4096,
+    .reset_prefix_bytes = 64,
+};
+
+static void format_size(char *buffer, size_t length, size_t value) {
+    int written = snprintf(buffer, length, "%zu", value);
+    if (written < 0 || (size_t)written >= length) {
+        fprintf(stderr, "cannot format soak argument\n");
+        exit(2);
+    }
+}
+
+static int run_soak_child(const char *self, const char *const *arguments,
+                          size_t argument_count) {
+    char *child_argv[12];
+    if (argument_count + 2 > sizeof(child_argv) / sizeof(child_argv[0])) {
+        fprintf(stderr, "too many soak phase arguments\n");
+        return 2;
+    }
+    child_argv[0] = (char *)self;
+    for (size_t index = 0; index < argument_count; ++index) {
+        child_argv[index + 1] = (char *)arguments[index];
+    }
+    child_argv[argument_count + 1] = NULL;
+
+    fflush(NULL);
+    pid_t child = fork();
+    if (child < 0) {
+        perror("fork soak phase");
+        return 2;
+    }
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) {
+            perror("redirect soak phase output");
+            _exit(127);
+        }
+        close(null_fd);
+        execvp(self, child_argv);
+        perror("exec soak phase");
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        perror("waitpid soak phase");
+        return 2;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 2;
+}
+
+static int run_soak_basic_phase(const char *self, const char *mode,
+                                const char *host, const char *port,
+                                size_t flows, size_t value,
+                                const char *extra_one, size_t extra_two,
+                                int has_extras) {
+    char flows_text[32];
+    char value_text[32];
+    char extra_two_text[32];
+    format_size(flows_text, sizeof(flows_text), flows);
+    format_size(value_text, sizeof(value_text), value);
+    format_size(extra_two_text, sizeof(extra_two_text), extra_two);
+    const char *arguments[] = {
+        mode, host, port, flows_text, value_text, extra_one, extra_two_text,
+    };
+    return run_soak_child(self, arguments, has_extras ? 7 : 5);
+}
+
+static int run_soak_fairness_phase(const char *self, const char *host,
+                                   const char *echo_port,
+                                   const char *stream_port,
+                                   const struct soak_profile *profile) {
+    char quiet_flows[32];
+    char iterations[32];
+    char payload[32];
+    char hot_bytes[32];
+    format_size(quiet_flows, sizeof(quiet_flows), profile->fairness_quiet_flows);
+    format_size(iterations, sizeof(iterations), profile->fairness_iterations);
+    format_size(payload, sizeof(payload), profile->fairness_payload);
+    format_size(hot_bytes, sizeof(hot_bytes), profile->fairness_hot_bytes);
+    const char *arguments[] = {
+        "fairness", host, echo_port, stream_port, quiet_flows,
+        iterations, payload, hot_bytes,
+    };
+    return run_soak_child(self, arguments, 8);
+}
+
+static int run_soak_reset_phase(const char *self, const char *host,
+                                const char *stream_port,
+                                const struct soak_profile *profile,
+                                size_t prefix_bytes, size_t consume_bytes) {
+    char flows[32];
+    char request_bytes[32];
+    char prefix[32];
+    char consume[32];
+    format_size(flows, sizeof(flows), profile->reset_flows);
+    format_size(request_bytes, sizeof(request_bytes), profile->reset_request_bytes);
+    format_size(prefix, sizeof(prefix), prefix_bytes);
+    format_size(consume, sizeof(consume), consume_bytes);
+    const char *arguments[] = {
+        "reset", host, stream_port, flows, request_bytes, prefix, consume,
+    };
+    return run_soak_child(self, arguments, 7);
+}
+
+static int publish_soak_cycle(size_t cycle, const char *progress_path,
+                              const char *ack_path) {
+    FILE *progress = fopen(progress_path, "w");
+    if (progress == NULL) {
+        perror("publish soak cycle");
+        return -1;
+    }
+    int write_failed = fprintf(progress, "%zu\n", cycle) < 0;
+    int close_failed = fclose(progress) != 0;
+    if (write_failed || close_failed) {
+        perror("publish soak cycle");
+        return -1;
+    }
+    for (;;) {
+        FILE *ack = fopen(ack_path, "r");
+        if (ack != NULL) {
+            size_t acknowledged = 0;
+            int matched = fscanf(ack, "%zu", &acknowledged) == 1;
+            fclose(ack);
+            if (matched && acknowledged >= cycle) {
+                return 0;
+            }
+        }
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+        }
+    }
+}
+
+static int run_soak(const char *self, const char *host, const char *echo_port,
+                    const char *stream_port, size_t duration_seconds,
+                    const char *profile_name, const char *progress_path,
+                    const char *ack_path) {
+    const struct soak_profile *profile = NULL;
+    if (strcmp(profile_name, "standard") == 0) {
+        profile = &SOAK_STANDARD;
+    } else if (strcmp(profile_name, "smoke") == 0) {
+        profile = &SOAK_SMOKE;
+    } else {
+        fprintf(stderr, "unknown soak profile: %s\n", profile_name);
+        return 2;
+    }
+    if (duration_seconds == 0) {
+        fprintf(stderr, "soak duration must be positive\n");
+        return 2;
+    }
+
+    const uint64_t started_ns = monotonic_ns();
+    const uint64_t duration_ns = (uint64_t)duration_seconds * UINT64_C(1000000000);
+    size_t completed_cycles = 0;
+    size_t completed_phases = 0;
+    uint64_t total_flows = 0;
+    uint64_t total_stream_connections = 0;
+    uint64_t total_bytes = 0;
+    int failure = 0;
+    const char *failed_phase = NULL;
+    const char *steady_directions[] = {"up", "down", "bidi"};
+
+#define RUN_SOAK_PHASE(name, expression)                                           \
+    do {                                                                            \
+        int phase_rc = (expression);                                                 \
+        if (phase_rc != 0) {                                                         \
+            failure = phase_rc;                                                      \
+            failed_phase = (name);                                                   \
+            goto finished;                                                          \
+        }                                                                            \
+        ++completed_phases;                                                          \
+    } while (0)
+
+    do {
+        const char *steady_direction =
+            steady_directions[completed_cycles % 3];
+        RUN_SOAK_PHASE(
+            "request-0",
+            run_soak_basic_phase(self, "request", host, echo_port,
+                                 profile->request_flows, 0, NULL, 0, 0));
+        RUN_SOAK_PHASE(
+            "request-small",
+            run_soak_basic_phase(self, "request", host, echo_port,
+                                 profile->request_flows,
+                                 profile->request_small_bytes, NULL, 0, 0));
+        RUN_SOAK_PHASE(
+            "request-large",
+            run_soak_basic_phase(self, "request", host, echo_port,
+                                 profile->request_flows,
+                                 profile->request_large_bytes, NULL, 0, 0));
+        RUN_SOAK_PHASE(
+            "idle",
+            run_soak_basic_phase(self, "idle", host, echo_port,
+                                 profile->idle_flows, profile->idle_hold_ms,
+                                 NULL, 0, 0));
+        for (size_t direction = 0; direction < 3; ++direction) {
+            RUN_SOAK_PHASE(
+                "ramp-stream",
+                run_soak_basic_phase(self, "stream", host, stream_port,
+                                     profile->ramp_flows, profile->ramp_bytes,
+                                     steady_directions[direction], 0, 1));
+        }
+        RUN_SOAK_PHASE(
+            "steady-stream",
+            run_soak_basic_phase(self, "stream", host, stream_port,
+                                 profile->steady_flows, profile->steady_bytes,
+                                 steady_direction, 0, 1));
+        RUN_SOAK_PHASE(
+            "slow-stream",
+            run_soak_basic_phase(self, "stream", host, stream_port,
+                                 profile->slow_flows, profile->slow_bytes,
+                                 "up", profile->slow_rate, 1));
+        RUN_SOAK_PHASE(
+            "fairness",
+            run_soak_fairness_phase(self, host, echo_port, stream_port, profile));
+        RUN_SOAK_PHASE(
+            "reset-response",
+            run_soak_reset_phase(self, host, stream_port, profile,
+                                 profile->reset_prefix_bytes, 0));
+        RUN_SOAK_PHASE(
+            "reset-early",
+            run_soak_reset_phase(self, host, stream_port, profile, 0,
+                                 profile->reset_request_bytes / 2));
+
+        ++completed_cycles;
+        uint64_t flows_this_cycle =
+            3 * profile->request_flows + profile->idle_flows +
+            3 * profile->ramp_flows + profile->steady_flows +
+            profile->slow_flows + profile->fairness_quiet_flows + 1 +
+            2 * profile->reset_flows;
+        uint64_t stream_connections_this_cycle =
+            3 * profile->ramp_flows + profile->steady_flows +
+            profile->slow_flows + 1 + 2 * profile->reset_flows;
+        uint64_t steady_multiplier =
+            strcmp(steady_direction, "bidi") == 0 ? 2 : 1;
+        uint64_t bytes_this_cycle =
+            2 * profile->request_flows *
+                (profile->request_small_bytes + profile->request_large_bytes) +
+            4 * profile->ramp_flows * profile->ramp_bytes +
+            steady_multiplier * profile->steady_flows * profile->steady_bytes +
+            profile->slow_flows * profile->slow_bytes +
+            profile->fairness_hot_bytes +
+            2 * profile->fairness_quiet_flows * profile->fairness_iterations *
+                profile->fairness_payload;
+        total_flows += flows_this_cycle;
+        total_stream_connections += stream_connections_this_cycle;
+        total_bytes += bytes_this_cycle;
+        printf("{\"event\":\"soak_cycle\",\"cycle\":%zu,"
+               "\"flows\":%" PRIu64 ",\"stream_connections\":%" PRIu64
+               ",\"bytes\":%" PRIu64 ",\"elapsed_ns\":%" PRIu64 "}\n",
+               completed_cycles, total_flows, total_stream_connections,
+               total_bytes, monotonic_ns() - started_ns);
+        fflush(stdout);
+        struct timespec quiescence = {.tv_sec = 0, .tv_nsec = 50000000};
+        while (nanosleep(&quiescence, &quiescence) != 0 && errno == EINTR) {
+        }
+        if (publish_soak_cycle(completed_cycles, progress_path, ack_path) != 0) {
+            failure = 2;
+            failed_phase = "cycle-publish";
+            goto finished;
+        }
+    } while (monotonic_ns() - started_ns < duration_ns);
+
+finished:
+#undef RUN_SOAK_PHASE
+    struct rusage self_usage;
+    struct rusage child_usage;
+    if (getrusage(RUSAGE_SELF, &self_usage) != 0 ||
+        getrusage(RUSAGE_CHILDREN, &child_usage) != 0) {
+        perror("getrusage soak");
+        return 2;
+    }
+    uint64_t user_cpu_ns = timeval_ns(self_usage.ru_utime) +
+                           timeval_ns(child_usage.ru_utime);
+    uint64_t system_cpu_ns = timeval_ns(self_usage.ru_stime) +
+                             timeval_ns(child_usage.ru_stime);
+    char failed_phase_json[64];
+    if (failed_phase == NULL) {
+        memcpy(failed_phase_json, "null", 5);
+    } else {
+        int written = snprintf(failed_phase_json, sizeof(failed_phase_json),
+                               "\"%s\"", failed_phase);
+        if (written < 0 || (size_t)written >= sizeof(failed_phase_json)) {
+            memcpy(failed_phase_json, "\"unknown\"", 10);
+        }
+    }
+    printf("{\"event\":\"workload_summary\",\"mode\":\"soak\","
+           "\"profile\":\"%s\",\"duration_seconds\":%zu,"
+           "\"cycles\":%zu,\"completed_phases\":%zu,"
+           "\"flows\":%" PRIu64 ",\"successful\":%" PRIu64
+           ",\"stream_connections\":%" PRIu64 ",\"bytes\":%" PRIu64
+           ",\"failed_phase\":%s,\"phase_returncode\":%d,"
+           "\"user_cpu_ns\":%" PRIu64 ",\"system_cpu_ns\":%" PRIu64 "}\n",
+           profile_name, duration_seconds, completed_cycles, completed_phases,
+           total_flows, total_flows, total_stream_connections, total_bytes,
+           failed_phase_json, failure,
+           user_cpu_ns, system_cpu_ns);
+    if (failed_phase != NULL) {
+        fprintf(stderr, "soak phase failed: %s (rc=%d)\n", failed_phase, failure);
+    }
+    return failure == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc < 6) {
@@ -1319,9 +1692,21 @@ int main(int argc, char **argv) {
                 "       %s stalled HOST PORT FLOWS BYTES_PER_FLOW HOLD_MS READY_PATH\n"
                 "       %s stream HOST PORT FLOWS BYTES_PER_FLOW DIRECTION RATE_BYTES_PER_SECOND\n"
                 "       %s reset HOST PORT FLOWS REQUEST_BYTES PREFIX_BYTES CONSUME_BYTES\n"
-                "       %s fairness HOST ECHO_PORT STREAM_PORT QUIET_FLOWS QUIET_ITERATIONS QUIET_PAYLOAD_BYTES HOT_BYTES\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "       %s fairness HOST ECHO_PORT STREAM_PORT QUIET_FLOWS QUIET_ITERATIONS QUIET_PAYLOAD_BYTES HOT_BYTES\n"
+                "       %s soak HOST ECHO_PORT STREAM_PORT DURATION_SECONDS PROFILE PROGRESS_PATH ACK_PATH\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
+    }
+    if (strcmp(argv[1], "soak") == 0) {
+        if (argc != 9) {
+            fprintf(stderr,
+                    "soak requires HOST ECHO_PORT STREAM_PORT DURATION_SECONDS "
+                    "PROFILE PROGRESS_PATH ACK_PATH\n");
+            return 2;
+        }
+        return run_soak(argv[0], argv[2], argv[3], argv[4],
+                        parse_size(argv[5], "duration seconds"), argv[6],
+                        argv[7], argv[8]);
     }
     if (strcmp(argv[1], "fairness") == 0) {
         if (argc != 9) {
