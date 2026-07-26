@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
@@ -44,12 +46,16 @@ fn redirects_local_tcp_connect_through_socks5() {
             .unwrap();
         handle_socks5_connect(&mut client, dest_tx);
     });
+    let metrics_dir = tempfile::tempdir().unwrap();
+    let metrics_path = metrics_dir.path().join("tcp-setup.jsonl");
 
     let bin = env!("CARGO_BIN_EXE_yatht");
     let output = Command::new(bin)
         .arg("--proxy")
         .arg(format!("socks5://{socks_addr}"))
         .arg("--proxy-local")
+        .arg("--metrics-file")
+        .arg(&metrics_path)
         .arg("--")
         .arg(curl)
         .arg("-fsS")
@@ -71,6 +77,214 @@ fn redirects_local_tcp_connect_through_socks5() {
 
     socks_thread.join().unwrap();
     target_thread.join().unwrap();
+
+    let events = fs::read_to_string(metrics_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let limits = events
+        .iter()
+        .find(|event| event["event"] == "tcp_broker_limits")
+        .expect("missing TCP broker limit metric");
+    assert!(limits["max_active_flows"].as_u64().unwrap() > 0);
+    assert_eq!(limits["max_pending_bytes"], 256 * 1024 * 1024_u64);
+    let setup = events
+        .iter()
+        .find(|event| event["event"] == "tcp_setup")
+        .expect("missing TCP setup metric");
+    assert_eq!(setup["outcome"], "completed");
+    assert!(setup["target_cookie"].as_u64().is_some());
+    assert!(setup["proxy_cookie"].as_u64().is_some());
+    let summary = events.last().unwrap();
+    assert_eq!(summary["event"], "run_summary");
+    assert_eq!(summary["tcp_setup_completed"], 1);
+    assert_eq!(summary["tcp_active_flows"], 0);
+    assert_eq!(summary["tcp_pending_bytes"], 0);
+    assert_eq!(summary["notification_queue_depth"], 0);
+    assert_eq!(summary["tcp_registration_queue_depth"], 0);
+    // The buffered mover reports recv/send syscalls, the splice mover
+    // reports splice syscalls; either way bytes must have moved through
+    // the broker in both directions.
+    let moved_reads = summary["tcp_recv_syscalls"].as_u64().unwrap()
+        + summary["tcp_splice_in_syscalls"].as_u64().unwrap();
+    let moved_writes = summary["tcp_send_syscalls"].as_u64().unwrap()
+        + summary["tcp_splice_out_syscalls"].as_u64().unwrap();
+    assert!(moved_reads > 0);
+    assert!(moved_writes > 0);
+    assert!(summary["tcp_target_to_upstream_bytes"].as_u64().unwrap() > 0);
+    assert!(summary["tcp_upstream_to_target_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(summary["dropped_metric_events"], 0);
+}
+
+#[test]
+fn warm_one_shot_session_pool_serves_repeat_connects() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let Some(curl) = find_in_path("curl") else {
+        return;
+    };
+
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().unwrap();
+            let mut req = [0_u8; 1024];
+            let _ = stream.read(&mut req).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        }
+    });
+
+    // Prewarmed sessions greet immediately but may never send a CONNECT
+    // request (pool shutdown closes surplus sessions), so every connection
+    // is served by a thread that tolerates an early close. The listener
+    // keeps accepting until the workload is done so a cold fallback can
+    // never hang on an unaccepted connection.
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let socks_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let socks_stop_flag = std::sync::Arc::clone(&socks_stop);
+    socks.set_nonblocking(true).unwrap();
+    let socks_thread = thread::spawn(move || {
+        let mut handlers = Vec::new();
+        while !socks_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+            match socks.accept() {
+                Ok((mut client, _)) => {
+                    handlers.push(thread::spawn(move || {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        handle_socks5_connect_tolerant(&mut client);
+                    }));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        handlers
+    });
+
+    let metrics_dir = tempfile::tempdir().unwrap();
+    let metrics_path = metrics_dir.path().join("warm-setup.jsonl");
+
+    let bin = env!("CARGO_BIN_EXE_yatht");
+    let url = format!("http://127.0.0.1:{}/", target_addr.port());
+    let output = Command::new(bin)
+        .env("SUP_TCP_PROXY_SESSION", "warm-one-shot")
+        .arg("--proxy")
+        .arg(format!("socks5://{socks_addr}"))
+        .arg("--proxy-local")
+        .arg("--metrics-file")
+        .arg(&metrics_path)
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        // The pause lets the replenisher warm a session between the two
+        // connects, so the second one exercises the warm-hit path.
+        .arg(format!(
+            "{curl} -fsS {url} && sleep 0.5 && {curl} -fsS {url}"
+        ))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "okok");
+
+    target_thread.join().unwrap();
+    socks_stop.store(true, std::sync::atomic::Ordering::Release);
+    for handler in socks_thread.join().unwrap() {
+        let _ = handler.join();
+    }
+
+    let events = fs::read_to_string(metrics_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let setups = events
+        .iter()
+        .filter(|event| event["event"] == "tcp_setup")
+        .collect::<Vec<_>>();
+    assert_eq!(setups.len(), 2);
+    assert!(setups.iter().all(|setup| setup["outcome"] == "completed"
+        && matches!(
+            setup["proxy_session"].as_str(),
+            Some("warm_hit" | "warm_miss")
+        )));
+    let warm_hit = setups
+        .iter()
+        .find(|setup| setup["proxy_session"] == "warm_hit")
+        .expect("no warm hit among repeat connects");
+    assert!(warm_hit["warm_lease_ns"].as_u64().is_some());
+    assert!(warm_hit["proxy_connect_ns"].is_null());
+    assert!(warm_hit["proxy_handshake_ns"].as_u64().is_some());
+
+    let summary = events.last().unwrap();
+    assert_eq!(summary["event"], "run_summary");
+    assert_eq!(summary["tcp_setup_completed"], 2);
+    assert_eq!(summary["tcp_proxy_session_source"], "warm-one-shot");
+    assert!(summary["tcp_warm_sessions_hit"].as_u64().unwrap() >= 1);
+    assert!(summary["tcp_warm_sessions_miss"].as_u64().unwrap() >= 1);
+    assert_eq!(summary["tcp_warm_replenish_failures"], 0);
+    assert!(summary["tcp_warm_pool_size_peak"].as_u64().unwrap() >= 1);
+    assert_eq!(summary["tcp_active_flows"], 0);
+    assert_eq!(summary["dropped_metric_events"], 0);
+}
+
+#[test]
+fn broker_initialization_failure_does_not_exec_target() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("target.pid");
+    let script = format!(
+        "echo $$ > {}; exec sleep 30",
+        pid_path.to_string_lossy().escape_default()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    command
+        .args(["--proxy", "socks5://127.0.0.1:9", "--", "sh", "-c"])
+        .arg(script);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("RLIMIT_NOFILE leaves no TCP broker flow capacity"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!pid_path.exists(), "target unexpectedly reached exec");
 }
 
 #[test]
@@ -126,24 +340,315 @@ fn keeps_proxy_alive_for_descendant_after_parent_exits() {
     target_thread.join().unwrap();
 }
 
-fn handle_socks5_connect(client: &mut TcpStream, dest_tx: mpsc::Sender<SocketAddr>) {
+#[test]
+fn preserves_tcp_socket_identity_aliases_and_epoll_registration() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        let mut req = [0_u8; 1024];
+        let _ = stream.read(&mut req).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .unwrap();
+    });
+
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let (dest_tx, dest_rx) = mpsc::channel();
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = socks.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        handle_socks5_connect(&mut client, dest_tx);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .arg("--proxy")
+        .arg(format!("socks5://{socks_addr}"))
+        .arg("--proxy-local")
+        .arg("--")
+        .arg(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "tcp_socket_semantics_probe",
+            "--nocapture",
+        ])
+        .env("YATHT_TCP_SEMANTICS_PROBE", "1")
+        .env("YATHT_TCP_TARGET", target_addr.to_string())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        target_addr
+    );
+    socks_thread.join().unwrap();
+    target_thread.join().unwrap();
+}
+
+#[test]
+fn preserves_tcp_socket_state_when_socks5_rejects_connect() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let (dest_tx, dest_rx) = mpsc::channel();
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = socks.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let dest = read_socks5_connect_request(&mut client);
+        dest_tx.send(dest).unwrap();
+        client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .arg("--proxy")
+        .arg(format!("socks5://{socks_addr}"))
+        .arg("--proxy-local")
+        .arg("--")
+        .arg(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "tcp_proxy_rejection_semantics_probe",
+            "--nocapture",
+        ])
+        .env("YATHT_TCP_REJECTION_PROBE", "1")
+        .env("YATHT_TCP_TARGET", target_addr.to_string())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        target_addr
+    );
+    socks_thread.join().unwrap();
+}
+
+#[test]
+#[ignore]
+fn tcp_socket_semantics_probe() {
+    if env::var_os("YATHT_TCP_SEMANTICS_PROBE").is_none() {
+        return;
+    }
+    let target = env::var("YATHT_TCP_TARGET")
+        .unwrap()
+        .parse::<SocketAddr>()
+        .unwrap();
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(
+        fd >= 0,
+        "socket failed: {}",
+        std::io::Error::last_os_error()
+    );
+    bind_ipv4(fd, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    set_socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set_socket_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    let identity = socket_identity(fd);
+    let local_addr = socket_address(fd);
+    let alias = unsafe { libc::dup(fd) };
+    assert!(
+        alias >= 0,
+        "dup failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    assert!(
+        epoll >= 0,
+        "epoll_create1 failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: 0x0059_4154_4854,
+    };
+    let rc = unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd, &mut event) };
+    assert_eq!(
+        rc,
+        0,
+        "epoll_ctl failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    connect_ipv4(fd, target);
+    assert_eq!(socket_identity(fd), identity);
+    assert_eq!(socket_identity(alias), identity);
+    assert_eq!(socket_address(fd), local_addr);
+    assert_eq!(get_socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+    assert_eq!(get_socket_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY), 1);
+
+    let mut stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let child_status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "tcp_inherited_socket_writer",
+            "--nocapture",
+        ])
+        .env("YATHT_INHERITED_TCP_FD", alias.to_string())
+        .status()
+        .unwrap();
+    assert!(child_status.success(), "inherited socket writer failed");
+    unsafe { libc::close(alias) };
+    let mut ready = libc::epoll_event { events: 0, u64: 0 };
+    let count = unsafe { libc::epoll_wait(epoll, &mut ready, 1, 2_000) };
+    assert_eq!(count, 1, "epoll did not observe the proxied response");
+    assert_ne!(ready.events & libc::EPOLLIN as u32, 0);
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with("\r\n\r\nok"), "response={response:?}");
+    unsafe { libc::close(epoll) };
+}
+
+#[test]
+#[ignore]
+fn tcp_proxy_rejection_semantics_probe() {
+    if env::var_os("YATHT_TCP_REJECTION_PROBE").is_none() {
+        return;
+    }
+    let target = env::var("YATHT_TCP_TARGET")
+        .unwrap()
+        .parse::<SocketAddr>()
+        .unwrap();
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(
+        fd >= 0,
+        "socket failed: {}",
+        std::io::Error::last_os_error()
+    );
+    bind_ipv4(fd, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    set_socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set_socket_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    let identity = socket_identity(fd);
+    let local_addr = socket_address(fd);
+
+    assert_eq!(connect_ipv4_error(fd, target), libc::ECONNREFUSED);
+    assert_eq!(socket_identity(fd), identity);
+    assert_eq!(socket_address(fd), local_addr);
+    assert_eq!(get_socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+    assert_eq!(get_socket_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY), 1);
+    unsafe { libc::close(fd) };
+}
+
+#[test]
+#[ignore]
+fn tcp_inherited_socket_writer() {
+    let Some(fd) = env::var("YATHT_INHERITED_TCP_FD")
+        .ok()
+        .and_then(|value| value.parse::<libc::c_int>().ok())
+    else {
+        return;
+    };
+    let mut stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+}
+
+/// Serves one SOCKS5 CONNECT like `handle_socks5_connect`, but returns
+/// quietly when the peer disappears at any stage: a prewarmed session may be
+/// closed by pool shutdown without ever sending a tunnel request.
+fn handle_socks5_connect_tolerant(client: &mut TcpStream) {
     let mut greeting = [0_u8; 2];
-    client.read_exact(&mut greeting).unwrap();
+    if client.read_exact(&mut greeting).is_err() {
+        return;
+    }
     assert_eq!(greeting[0], 5);
     let mut methods = vec![0_u8; greeting[1] as usize];
-    client.read_exact(&mut methods).unwrap();
+    if client.read_exact(&mut methods).is_err() {
+        return;
+    }
     assert!(methods.contains(&0));
-    client.write_all(&[5, 0]).unwrap();
+    if client.write_all(&[5, 0]).is_err() {
+        return;
+    }
 
     let mut head = [0_u8; 4];
-    client.read_exact(&mut head).unwrap();
+    if client.read_exact(&mut head).is_err() {
+        return;
+    }
     assert_eq!(&head[..3], &[5, 1, 0]);
     assert_eq!(head[3], 1);
     let mut ip = [0_u8; 4];
     let mut port = [0_u8; 2];
-    client.read_exact(&mut ip).unwrap();
-    client.read_exact(&mut port).unwrap();
+    if client.read_exact(&mut ip).is_err() || client.read_exact(&mut port).is_err() {
+        return;
+    }
     let dest = SocketAddr::from((Ipv4Addr::from(ip), u16::from_be_bytes(port)));
+    let Ok(mut upstream) = TcpStream::connect(dest) else {
+        return;
+    };
+    if client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).is_err() {
+        return;
+    }
+
+    let mut request = Vec::new();
+    let mut buf = [0_u8; 1024];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    if upstream.write_all(&request).is_err() {
+        return;
+    }
+    loop {
+        match upstream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if client.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn handle_socks5_connect(client: &mut TcpStream, dest_tx: mpsc::Sender<SocketAddr>) {
+    let dest = read_socks5_connect_request(client);
     dest_tx.send(dest).unwrap();
 
     let mut upstream = TcpStream::connect(dest).unwrap();
@@ -170,6 +675,26 @@ fn handle_socks5_connect(client: &mut TcpStream, dest_tx: mpsc::Sender<SocketAdd
     }
 }
 
+fn read_socks5_connect_request(client: &mut TcpStream) -> SocketAddr {
+    let mut greeting = [0_u8; 2];
+    client.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting[0], 5);
+    let mut methods = vec![0_u8; greeting[1] as usize];
+    client.read_exact(&mut methods).unwrap();
+    assert!(methods.contains(&0));
+    client.write_all(&[5, 0]).unwrap();
+
+    let mut head = [0_u8; 4];
+    client.read_exact(&mut head).unwrap();
+    assert_eq!(&head[..3], &[5, 1, 0]);
+    assert_eq!(head[3], 1);
+    let mut ip = [0_u8; 4];
+    let mut port = [0_u8; 2];
+    client.read_exact(&mut ip).unwrap();
+    client.read_exact(&mut port).unwrap();
+    SocketAddr::from((Ipv4Addr::from(ip), u16::from_be_bytes(port)))
+}
+
 fn find_in_path(name: &str) -> Option<String> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
@@ -179,6 +704,125 @@ fn find_in_path(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn bind_ipv4(fd: libc::c_int, address: SocketAddr) {
+    let address = socket_addr_in(address);
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            (&address as *const libc::sockaddr_in).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "bind failed: {}", std::io::Error::last_os_error());
+}
+
+fn connect_ipv4(fd: libc::c_int, address: SocketAddr) {
+    let address = socket_addr_in(address);
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_in).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "connect failed: {}", std::io::Error::last_os_error());
+}
+
+fn connect_ipv4_error(fd: libc::c_int, address: SocketAddr) -> libc::c_int {
+    let address = socket_addr_in(address);
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_in).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, -1, "connect unexpectedly succeeded");
+    std::io::Error::last_os_error().raw_os_error().unwrap()
+}
+
+fn socket_addr_in(address: SocketAddr) -> libc::sockaddr_in {
+    let SocketAddr::V4(address) = address else {
+        panic!("expected IPv4 address");
+    };
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: address.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(address.ip().octets()),
+        },
+        sin_zero: [0; 8],
+    }
+}
+
+fn socket_identity(fd: libc::c_int) -> (libc::dev_t, libc::ino_t) {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    assert_eq!(rc, 0, "fstat failed: {}", std::io::Error::last_os_error());
+    (stat.st_dev, stat.st_ino)
+}
+
+fn socket_address(fd: libc::c_int) -> SocketAddr {
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&address) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut address as *mut libc::sockaddr_in).cast(),
+            &mut length,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "getsockname failed: {}",
+        std::io::Error::last_os_error()
+    );
+    SocketAddr::from((
+        Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(address.sin_port),
+    ))
+}
+
+fn set_socket_int(fd: libc::c_int, level: libc::c_int, option: libc::c_int, value: libc::c_int) {
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "setsockopt failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn get_socket_int(fd: libc::c_int, level: libc::c_int, option: libc::c_int) -> libc::c_int {
+    let mut value = 0;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            option,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "getsockopt failed: {}",
+        std::io::Error::last_os_error()
+    );
+    value
 }
 
 fn build_descendant_tcp_probe() -> (TempDir, PathBuf) {

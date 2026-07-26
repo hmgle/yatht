@@ -1,7 +1,9 @@
 mod config;
+mod observability;
 mod proxy;
 mod seccomp;
 mod supervisor;
+mod tcp_broker;
 
 use anyhow::{Context, Result};
 use clap::Parser;
