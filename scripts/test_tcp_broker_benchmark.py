@@ -161,6 +161,205 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(benchmark.argparse.ArgumentTypeError):
             benchmark.comma_variants("direct,direct")
 
+    def test_data_mover_parser_rejects_inherited_comparisons(self) -> None:
+        self.assertEqual(
+            benchmark.comma_data_movers("buffered,splice"),
+            ["buffered", "splice"],
+        )
+        with self.assertRaises(benchmark.argparse.ArgumentTypeError):
+            benchmark.comma_data_movers("inherited,splice")
+        with self.assertRaises(benchmark.argparse.ArgumentTypeError):
+            benchmark.comma_data_movers("unknown")
+
+    def test_execution_order_keeps_stable_movers_adjacent(self) -> None:
+        args = benchmark.argparse.Namespace(
+            variants=["direct", "stable", "addfd"],
+            stable_data_movers=["buffered", "splice"],
+        )
+
+        order = benchmark.randomized_execution_order(
+            args, benchmark.random.Random(20260726)
+        )
+
+        stable_indexes = [
+            index for index, (variant, _mover) in enumerate(order) if variant == "stable"
+        ]
+        self.assertEqual(stable_indexes[1] - stable_indexes[0], 1)
+        self.assertEqual(
+            {order[index][1] for index in stable_indexes}, {"buffered", "splice"}
+        )
+
+    def test_variant_environment_overrides_only_explicit_stable_movers(self) -> None:
+        base = {"SUP_TCP_DATA_MOVER": "splice", "MARKER": "kept"}
+
+        buffered = benchmark.variant_environment("stable", "buffered", base)
+        inherited = benchmark.variant_environment("stable", "inherited", base)
+        direct = benchmark.variant_environment("direct", None, base)
+
+        self.assertEqual(buffered["SUP_TCP_DATA_MOVER"], "buffered")
+        self.assertEqual(inherited["SUP_TCP_DATA_MOVER"], "splice")
+        self.assertEqual(direct["SUP_TCP_DATA_MOVER"], "splice")
+        self.assertEqual(buffered["MARKER"], "kept")
+
+    def test_scenarios_expand_multiple_stream_sizes(self) -> None:
+        args = benchmark.argparse.Namespace(
+            payload_sizes=[],
+            connections=1,
+            idle_flows=[],
+            idle_hold_ms=0,
+            stream_flows=2,
+            stream_bytes=1024,
+            stream_byte_sizes=[1024, 2048],
+            stream_directions=["up", "down"],
+            slow_flows=0,
+            slow_bytes=0,
+            slow_rate=0,
+            fairness_quiet_flows=0,
+            fairness_quiet_payload=0,
+            fairness_quiet_iterations=0,
+            fairness_hot_bytes=0,
+            reset_flows=0,
+            reset_request_bytes=0,
+            reset_prefix_bytes=0,
+            stalled_flows=0,
+            stalled_bytes=0,
+            stalled_hold_ms=0,
+        )
+
+        scenarios = benchmark.scenarios(args)
+
+        self.assertEqual(len(scenarios), 4)
+        self.assertEqual({scenario["value"] for scenario in scenarios}, {1024, 2048})
+        self.assertEqual(
+            {scenario["direction"] for scenario in scenarios}, {"up", "down"}
+        )
+        self.assertTrue(all("-bytes" in scenario["name"] for scenario in scenarios))
+
+    def test_paired_mover_comparison_uses_pair_local_effects(self) -> None:
+        def run(mover: str, repetition: int, wall_ns: int, ok: bool = True) -> dict:
+            return {
+                "scenario": "stream-down",
+                "mode": "stream",
+                "variant": "stable",
+                "data_mover": mover,
+                "measurement_kind": "measurement",
+                "repetition": repetition,
+                "ok": ok,
+                "stream_direction": "down",
+                "stream_bytes_per_flow": benchmark.SPLICE_RAMP_BYTES,
+                "bytes": 1000,
+                "wall_ns": wall_ns,
+                "child_cpu_ns": 100 if mover == "buffered" else 50,
+            }
+
+        comparisons = benchmark.paired_mover_comparisons(
+            [
+                run("buffered", 0, 100),
+                run("splice", 0, 80),
+                run("buffered", 1, 100),
+                run("splice", 1, 50, ok=False),
+            ]
+        )
+
+        summary = comparisons["summaries"][0]
+        self.assertEqual(summary["total_pairs"], 2)
+        self.assertEqual(summary["valid_pairs"], 1)
+        self.assertAlmostEqual(summary["goodput_delta_percent"]["mean"], 25.0)
+        self.assertAlmostEqual(
+            summary["child_cpu_per_byte_delta_percent"]["mean"], -50.0
+        )
+        self.assertIsNone(summary["goodput_delta_percent"]["sample_stdev"])
+
+    def test_splice_readiness_gate_reports_ramp_without_thresholding_it(self) -> None:
+        summaries = []
+        for stream_bytes in (
+            benchmark.SPLICE_RAMP_BYTES,
+            benchmark.SPLICE_STEADY_BYTES,
+        ):
+            for direction in benchmark.STREAM_DIRECTION_CODES:
+                summaries.append(
+                    {
+                        "scenario": f"stream-{direction}-{stream_bytes}",
+                        "mode": "stream",
+                        "stream_direction": direction,
+                        "stream_bytes_per_flow": stream_bytes,
+                        "total_pairs": 10,
+                        "valid_pairs": 10,
+                        "splice_wins": 0,
+                        "goodput_delta_percent": {
+                            "count": 10,
+                            "mean": -30.0 if stream_bytes == benchmark.SPLICE_RAMP_BYTES else 0.0,
+                            "sample_stdev": 1.0,
+                            "median": 0.0,
+                            "min": -30.0,
+                            "max": 0.0,
+                        },
+                        "child_cpu_per_byte_delta_percent": {
+                            "count": 10,
+                            "mean": -20.0,
+                            "sample_stdev": 1.0,
+                            "median": -20.0,
+                            "min": -21.0,
+                            "max": -19.0,
+                        },
+                    }
+                )
+
+        gate = benchmark.splice_readiness_gate(
+            {"pairs": [], "summaries": summaries}
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertTrue(
+            all(check["passed"] for check in gate["checks"] if check["stage"] == "ramp")
+        )
+
+    def test_splice_readiness_gate_rejects_steady_regression(self) -> None:
+        comparisons = {"pairs": [], "summaries": []}
+        for stream_bytes in (
+            benchmark.SPLICE_RAMP_BYTES,
+            benchmark.SPLICE_STEADY_BYTES,
+        ):
+            for direction in benchmark.STREAM_DIRECTION_CODES:
+                comparisons["summaries"].append(
+                    {
+                        "scenario": f"stream-{direction}-{stream_bytes}",
+                        "mode": "stream",
+                        "stream_direction": direction,
+                        "stream_bytes_per_flow": stream_bytes,
+                        "total_pairs": 10,
+                        "valid_pairs": 10,
+                        "splice_wins": 0,
+                        "goodput_delta_percent": {
+                            "count": 10,
+                            "mean": -6.0,
+                            "sample_stdev": 1.0,
+                            "median": -6.0,
+                            "min": -7.0,
+                            "max": -5.0,
+                        },
+                        "child_cpu_per_byte_delta_percent": {
+                            "count": 10,
+                            "mean": -10.0,
+                            "sample_stdev": 1.0,
+                            "median": -10.0,
+                            "min": -11.0,
+                            "max": -9.0,
+                        },
+                    }
+                )
+
+        gate = benchmark.splice_readiness_gate(comparisons)
+
+        self.assertFalse(gate["passed"])
+        self.assertTrue(
+            all(
+                not check["passed"]
+                for check in gate["checks"]
+                if check["stage"] == "steady"
+            )
+        )
+
     def test_git_commit_parser_normalizes_and_rejects_revisions(self) -> None:
         self.assertEqual(len(benchmark.git_commit("HEAD")), 40)
         with self.assertRaises(benchmark.argparse.ArgumentTypeError):

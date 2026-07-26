@@ -40,6 +40,11 @@ DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
 # workload binary stays under target/.
 DEFAULT_OUTPUT_ROOT = ROOT / "bench-results" / "tcp-broker"
 VARIANT_ORDER = ("direct", "addfd", "stable")
+STABLE_DATA_MOVERS = ("inherited", "buffered", "splice")
+SPLICE_RAMP_BYTES = 4 * 1024 * 1024
+SPLICE_STEADY_BYTES = 32 * 1024 * 1024
+SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT = -5.0
+SPLICE_STEADY_MAX_CPU_DELTA_PERCENT = -15.0
 METRICS_SCHEMA_VERSION = 5
 SAMPLE_INTERVAL_SECONDS = 0.005
 # Walking /proc for the whole process tree at 5 ms is a measurable observer
@@ -725,6 +730,46 @@ def comma_variants(raw: str) -> list[str]:
     return values
 
 
+def comma_data_movers(raw: str) -> list[str]:
+    values = raw.split(",")
+    if not raw or any(not value for value in values):
+        raise argparse.ArgumentTypeError("data movers must not be empty")
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("data movers must not contain duplicates")
+    unknown = sorted(set(values) - set(STABLE_DATA_MOVERS))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown data movers: {', '.join(unknown)}")
+    if "inherited" in values and len(values) > 1:
+        raise argparse.ArgumentTypeError(
+            "inherited data mover cannot be combined with explicit movers"
+        )
+    return values
+
+
+def randomized_execution_order(
+    args: argparse.Namespace, rng: random.Random
+) -> list[tuple[str, str | None]]:
+    groups: list[list[tuple[str, str | None]]] = []
+    for variant in args.variants:
+        if variant == "stable":
+            group = [(variant, mover) for mover in args.stable_data_movers]
+            rng.shuffle(group)
+            groups.append(group)
+        else:
+            groups.append([(variant, None)])
+    rng.shuffle(groups)
+    return [target for group in groups for target in group]
+
+
+def variant_environment(
+    variant: str, data_mover: str | None, base: dict[str, str] | None = None
+) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    if variant == "stable" and data_mover in ("buffered", "splice"):
+        environment["SUP_TCP_DATA_MOVER"] = data_mover
+    return environment
+
+
 def comma_directions(raw: str) -> list[str]:
     if not raw:
         return []
@@ -1185,6 +1230,7 @@ def variant_command(
 
 def run_one(
     variant: str,
+    data_mover: str | None,
     args: argparse.Namespace,
     servers: BenchmarkServers,
     scenario: dict[str, Any],
@@ -1209,7 +1255,11 @@ def run_one(
             stalled_ready_path if scenario["mode"] == "stalled" else None,
             idle_ready_path if scenario["mode"] == "idle" else None,
         )
-        args.command_log.write(shlex.join(command) + "\n")
+        process_environment = variant_environment(variant, data_mover)
+        logged_command = command
+        if variant == "stable" and data_mover in ("buffered", "splice"):
+            logged_command = ["env", f"SUP_TCP_DATA_MOVER={data_mover}", *command]
+        args.command_log.write(shlex.join(logged_command) + "\n")
         args.command_log.flush()
         child_before = child_cpu_ns()
         benchmark_server_before = servers.cpu_ns()
@@ -1246,6 +1296,7 @@ def run_one(
                     stdout=stdout_file,
                     stderr=stderr_file,
                     start_new_session=True,
+                    env=process_environment,
                 )
                 if variant == "direct":
                     target_pid = process.pid
@@ -1555,6 +1606,11 @@ def run_one(
         "scenario": scenario["name"],
         "mode": scenario["mode"],
         "variant": variant,
+        "data_mover": data_mover,
+        "stream_bytes_per_flow": (
+            scenario["value"] if scenario["mode"] == "stream" else None
+        ),
+        "stream_direction": scenario.get("direction"),
         "measurement_kind": measurement_kind,
         "repetition": repetition,
         "ok": ok,
@@ -1613,7 +1669,7 @@ def run_one(
         "bytes": workload_summary.get("bytes", 0),
         "parse_error": parse_error,
         "stderr": completed.stderr[-2000:],
-        "command": command,
+        "command": logged_command,
         "metrics_file": str(metrics_path) if metrics_path is not None else None,
         "metric_summary": metric_summary,
         "metric_parse_errors": metric_parse_errors,
@@ -1624,6 +1680,7 @@ def run_one(
             **record,
             "scenario": scenario["name"],
             "variant": variant,
+            "data_mover": data_mover,
             "measurement_kind": measurement_kind,
             "repetition": repetition,
         }
@@ -1652,15 +1709,22 @@ def scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
         for flows in args.idle_flows
     ]
     if args.stream_flows > 0:
+        stream_sizes = args.stream_byte_sizes or [args.stream_bytes]
+        multiple_stream_sizes = len(stream_sizes) > 1
         result += [
             {
-                "name": f"stream-{direction}-{args.stream_flows}-flows",
+                "name": (
+                    f"stream-{direction}-{args.stream_flows}-flows-{stream_bytes}-bytes"
+                    if multiple_stream_sizes
+                    else f"stream-{direction}-{args.stream_flows}-flows"
+                ),
                 "mode": "stream",
                 "flows": args.stream_flows,
-                "value": args.stream_bytes,
+                "value": stream_bytes,
                 "direction": direction,
                 "rate": 0,
             }
+            for stream_bytes in stream_sizes
             for direction in args.stream_directions
         ]
     if args.slow_flows > 0:
@@ -1725,23 +1789,26 @@ def summarize(
     rows: list[dict[str, Any]] = []
     keys = sorted(
         {
-            (run["scenario"], run["variant"])
+            (run["scenario"], run["variant"], run.get("data_mover") or "")
             for run in runs
             if run["measurement_kind"] == "measurement"
         }
     )
-    for scenario, variant in keys:
+    for scenario, variant, mover_key in keys:
+        data_mover = mover_key or None
         selected_runs = [
             run
             for run in runs
             if run["scenario"] == scenario
             and run["variant"] == variant
+            and run.get("data_mover") == data_mover
             and run["measurement_kind"] == "measurement"
         ]
         valid_run_keys = {
             (
                 run["scenario"],
                 run["variant"],
+                run.get("data_mover"),
                 run["repetition"],
                 run["measurement_kind"],
             )
@@ -1753,11 +1820,13 @@ def summarize(
             for flow in flow_samples
             if flow["scenario"] == scenario
             and flow["variant"] == variant
+            and flow.get("data_mover") == data_mover
             and flow["measurement_kind"] == "measurement"
             and flow.get("ok")
             and (
                 flow["scenario"],
                 flow["variant"],
+                flow.get("data_mover"),
                 flow["repetition"],
                 flow["measurement_kind"],
             )
@@ -1785,10 +1854,12 @@ def summarize(
             if sample.get("event") == "sample"
             and sample["scenario"] == scenario
             and sample["variant"] == variant
+            and sample.get("data_mover") == data_mover
             and sample["measurement_kind"] == "measurement"
             and (
                 sample["scenario"],
                 sample["variant"],
+                sample.get("data_mover"),
                 sample["repetition"],
                 sample["measurement_kind"],
             )
@@ -1821,6 +1892,7 @@ def summarize(
             {
                 "scenario": scenario,
                 "variant": variant,
+                "data_mover": data_mover,
                 "valid_runs": sum(run["ok"] for run in selected_runs),
                 "total_runs": len(selected_runs),
                 "valid_flows": len(selected_flows),
@@ -1898,6 +1970,163 @@ def summarize(
     return rows
 
 
+def distribution(values: list[float]) -> dict[str, float | int | None]:
+    return {
+        "count": len(values),
+        "mean": statistics.mean(values) if values else None,
+        "sample_stdev": statistics.stdev(values) if len(values) > 1 else None,
+        "median": statistics.median(values) if values else None,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+    }
+
+
+def paired_mover_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    measurement_runs = [
+        run
+        for run in runs
+        if run["measurement_kind"] == "measurement"
+        and run["variant"] == "stable"
+        and run.get("data_mover") in ("buffered", "splice")
+    ]
+    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for run in measurement_runs:
+        grouped.setdefault((run["scenario"], run["repetition"]), {})[
+            run["data_mover"]
+        ] = run
+
+    pairs: list[dict[str, Any]] = []
+    for (scenario, repetition), movers in sorted(grouped.items()):
+        buffered = movers.get("buffered")
+        splice = movers.get("splice")
+        pair_ok = buffered is not None and splice is not None
+        pair_ok = bool(pair_ok and buffered["ok"] and splice["ok"])
+        goodput_delta: float | None = None
+        cpu_delta: float | None = None
+        if pair_ok:
+            assert buffered is not None and splice is not None
+            buffered_bytes = buffered.get("bytes") or 0
+            splice_bytes = splice.get("bytes") or 0
+            if buffered_bytes > 0 and buffered_bytes == splice_bytes:
+                buffered_goodput = buffered_bytes / buffered["wall_ns"]
+                splice_goodput = splice_bytes / splice["wall_ns"]
+                goodput_delta = 100.0 * (splice_goodput / buffered_goodput - 1.0)
+                buffered_cpu = buffered.get("child_cpu_ns")
+                splice_cpu = splice.get("child_cpu_ns")
+                if buffered_cpu and splice_cpu is not None:
+                    cpu_delta = 100.0 * (splice_cpu / buffered_cpu - 1.0)
+        representative = buffered or splice or {}
+        pairs.append(
+            {
+                "scenario": scenario,
+                "mode": representative.get("mode"),
+                "stream_direction": representative.get("stream_direction"),
+                "stream_bytes_per_flow": representative.get("stream_bytes_per_flow"),
+                "repetition": repetition,
+                "pair_ok": pair_ok,
+                "buffered_ok": buffered["ok"] if buffered is not None else None,
+                "splice_ok": splice["ok"] if splice is not None else None,
+                "buffered_wall_ns": buffered["wall_ns"] if buffered is not None else None,
+                "splice_wall_ns": splice["wall_ns"] if splice is not None else None,
+                "goodput_delta_percent": goodput_delta,
+                "child_cpu_per_byte_delta_percent": cpu_delta,
+            }
+        )
+
+    summaries: list[dict[str, Any]] = []
+    for scenario in sorted({pair["scenario"] for pair in pairs}):
+        selected = [pair for pair in pairs if pair["scenario"] == scenario]
+        goodput = [
+            pair["goodput_delta_percent"]
+            for pair in selected
+            if pair["pair_ok"] and pair["goodput_delta_percent"] is not None
+        ]
+        cpu = [
+            pair["child_cpu_per_byte_delta_percent"]
+            for pair in selected
+            if pair["pair_ok"] and pair["child_cpu_per_byte_delta_percent"] is not None
+        ]
+        representative = selected[0]
+        summaries.append(
+            {
+                "scenario": scenario,
+                "mode": representative["mode"],
+                "stream_direction": representative["stream_direction"],
+                "stream_bytes_per_flow": representative["stream_bytes_per_flow"],
+                "total_pairs": len(selected),
+                "valid_pairs": sum(pair["pair_ok"] for pair in selected),
+                "splice_wins": sum((value or 0) > 0 for value in goodput),
+                "goodput_delta_percent": distribution(goodput),
+                "child_cpu_per_byte_delta_percent": distribution(cpu),
+            }
+        )
+    return {"pairs": pairs, "summaries": summaries}
+
+
+def splice_readiness_gate(comparisons: dict[str, Any]) -> dict[str, Any]:
+    summaries = comparisons["summaries"]
+    checks: list[dict[str, Any]] = []
+    for stream_bytes, stage in (
+        (SPLICE_RAMP_BYTES, "ramp"),
+        (SPLICE_STEADY_BYTES, "steady"),
+    ):
+        for direction in STREAM_DIRECTION_CODES:
+            candidates = [
+                summary
+                for summary in summaries
+                if summary["mode"] == "stream"
+                and summary["stream_bytes_per_flow"] == stream_bytes
+                and summary["stream_direction"] == direction
+            ]
+            summary = candidates[0] if len(candidates) == 1 else None
+            valid_pairs = summary["valid_pairs"] if summary is not None else 0
+            reasons: list[str] = []
+            if summary is None:
+                reasons.append("missing comparison")
+            if valid_pairs < 10:
+                reasons.append(f"requires 10 valid pairs, got {valid_pairs}")
+            if stage == "steady" and summary is not None:
+                goodput_mean = summary["goodput_delta_percent"]["mean"]
+                cpu_mean = summary["child_cpu_per_byte_delta_percent"]["mean"]
+                if (
+                    goodput_mean is None
+                    or goodput_mean < SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT
+                ):
+                    reasons.append(
+                        "mean goodput delta is below "
+                        f"{SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT:.1f}%"
+                    )
+                if cpu_mean is None or cpu_mean > SPLICE_STEADY_MAX_CPU_DELTA_PERCENT:
+                    reasons.append(
+                        "mean CPU/byte reduction is below "
+                        f"{-SPLICE_STEADY_MAX_CPU_DELTA_PERCENT:.1f}%"
+                    )
+            checks.append(
+                {
+                    "stage": stage,
+                    "stream_direction": direction,
+                    "stream_bytes_per_flow": stream_bytes,
+                    "passed": not reasons,
+                    "reasons": reasons,
+                    "comparison": summary,
+                }
+            )
+    return {
+        "passed": all(check["passed"] for check in checks),
+        "checks": checks,
+        "thresholds": {
+            "minimum_valid_pairs": 10,
+            "steady_min_goodput_delta_percent": (
+                SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT
+            ),
+            "steady_max_cpu_per_byte_delta_percent": (
+                SPLICE_STEADY_MAX_CPU_DELTA_PERCENT
+            ),
+            "ramp_performance_is_report_only": True,
+        },
+    }
+
+
 def command_output(command: list[str], cwd: Path | None = None) -> str | None:
     try:
         return subprocess.run(
@@ -1961,8 +2190,10 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "connections": args.connections,
         "payload_sizes": args.payload_sizes,
         "idle_flows": args.idle_flows,
+        "stable_data_movers": args.stable_data_movers,
         "stream_flows": args.stream_flows,
         "stream_bytes": args.stream_bytes,
+        "stream_byte_sizes": args.stream_byte_sizes,
         "stream_directions": args.stream_directions,
         "slow_flows": args.slow_flows,
         "slow_bytes": args.slow_bytes,
@@ -1977,6 +2208,7 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "stalled_flows": args.stalled_flows,
         "stalled_bytes": args.stalled_bytes,
         "stalled_hold_ms": args.stalled_hold_ms,
+        "splice_readiness_gate": args.splice_readiness_gate,
         "random_seed": args.seed,
         "estimated_fd_limit": args.estimated_fd_limit,
         "resource_sampling": {
@@ -2002,6 +2234,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--addfd-commit", type=git_commit)
     parser.add_argument("--addfd-build-command")
     parser.add_argument("--variants", type=comma_variants, default="direct,addfd,stable")
+    parser.add_argument(
+        "--stable-data-movers",
+        type=comma_data_movers,
+        default="inherited",
+        help="stable mover(s) to run; explicit pairs are compared per repetition",
+    )
     parser.add_argument("--connections", type=int, default=1000)
     parser.add_argument(
         "--payload-sizes",
@@ -2012,6 +2250,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-hold-ms", type=int, default=100)
     parser.add_argument("--stream-flows", type=int, default=32)
     parser.add_argument("--stream-bytes", type=int, default=4 * 1024 * 1024)
+    parser.add_argument(
+        "--stream-byte-sizes",
+        type=comma_sizes,
+        help="optional comma-separated stream sizes to run in one suite",
+    )
     parser.add_argument(
         "--stream-directions",
         type=comma_directions,
@@ -2048,9 +2291,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workload", type=Path, default=DEFAULT_WORKLOAD)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--skip-diagnostics", action="store_true")
+    parser.add_argument("--splice-readiness-gate", action="store_true")
     args = parser.parse_args()
     if isinstance(args.variants, str):
         args.variants = comma_variants(args.variants)
+    if isinstance(args.stable_data_movers, str):
+        args.stable_data_movers = comma_data_movers(args.stable_data_movers)
     if "stable" in args.variants:
         try:
             args.yatht = executable(args.yatht)
@@ -2064,6 +2310,8 @@ def parse_args() -> argparse.Namespace:
     else:
         args.yatht = None
         args.yatht_commit = None
+        if args.stable_data_movers != ["inherited"]:
+            parser.error("explicit stable data movers require the stable variant")
     if "addfd" in args.variants:
         if (
             args.addfd_yatht is None
@@ -2084,7 +2332,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("idle flow counts must be positive")
     if args.idle_hold_ms < 0 or args.stalled_hold_ms < 0:
         parser.error("hold times must be nonnegative")
-    if args.stream_flows < 0 or (args.stream_flows > 0 and args.stream_bytes <= 0):
+    stream_sizes = args.stream_byte_sizes or [args.stream_bytes]
+    if args.stream_flows < 0 or (
+        args.stream_flows > 0 and any(stream_bytes <= 0 for stream_bytes in stream_sizes)
+    ):
         parser.error("stream flows must be nonnegative and stream bytes positive")
     if args.stream_flows > 0 and not args.stream_directions:
         parser.error("stream flows require at least one direction")
@@ -2116,6 +2367,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
+    if args.splice_readiness_gate:
+        if args.variants != ["stable"]:
+            parser.error("splice readiness gate requires --variants stable")
+        if set(args.stable_data_movers) != {"buffered", "splice"}:
+            parser.error(
+                "splice readiness gate requires --stable-data-movers buffered,splice"
+            )
+        if not {SPLICE_RAMP_BYTES, SPLICE_STEADY_BYTES}.issubset(stream_sizes):
+            parser.error("splice readiness gate requires 4 MiB and 32 MiB stream sizes")
+        if set(args.stream_directions) != set(STREAM_DIRECTION_CODES):
+            parser.error("splice readiness gate requires up, down, and bidi streams")
+        if args.repetitions < 10:
+            parser.error("splice readiness gate requires at least 10 repetitions")
     if (
         not args.payload_sizes
         and not args.idle_flows
@@ -2165,11 +2429,10 @@ def main() -> None:
             args.command_log = command_log
             for scenario in scenarios(args):
                 for warmup in range(args.warmups):
-                    order = list(args.variants)
-                    rng.shuffle(order)
-                    for variant in order:
+                    for variant, data_mover in randomized_execution_order(args, rng):
                         warmup_run, warmup_flows = run_one(
                             variant,
+                            data_mover,
                             args,
                             servers,
                             scenario,
@@ -2209,15 +2472,15 @@ def main() -> None:
                                 )
                             }
                             raise RuntimeError(
-                                f"warmup failed for {scenario['name']}/{variant}: "
+                                "warmup failed for "
+                                f"{scenario['name']}/{variant}/{data_mover}: "
                                 f"{json.dumps(failure, sort_keys=True)}"
                             )
                 for repetition in range(args.repetitions):
-                    order = list(args.variants)
-                    rng.shuffle(order)
-                    for variant in order:
+                    for variant, data_mover in randomized_execution_order(args, rng):
                         run, flows = run_one(
                             variant,
+                            data_mover,
                             args,
                             servers,
                             scenario,
@@ -2233,7 +2496,8 @@ def main() -> None:
                         run_file.flush()
                         flow_file.flush()
                         print(
-                            f"{scenario['name']} {variant} {repetition + 1}/{args.repetitions}: "
+                            f"{scenario['name']} {variant}/{data_mover} "
+                            f"{repetition + 1}/{args.repetitions}: "
                             f"{'ok' if run['ok'] else 'FAILED'}",
                             flush=True,
                         )
@@ -2247,25 +2511,29 @@ def main() -> None:
                         require_stalled_server_quiescence(run)
                         require_stream_server_quiescence(run)
                 if "stable" in args.variants and not args.skip_diagnostics:
-                    metrics_path = metrics_dir / f"{scenario['name']}.jsonl"
-                    run, flows = run_one(
-                        "stable",
-                        args,
-                        servers,
-                        scenario,
-                        0,
-                        "diagnostic",
-                        metrics_path,
-                    )
-                    runs.append(run)
-                    flow_samples.extend(flows)
-                    run_file.write(json.dumps(run, sort_keys=True) + "\n")
-                    for flow in flows:
-                        flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
-                    run_file.flush()
-                    flow_file.flush()
-                    require_stalled_server_quiescence(run)
-                    require_stream_server_quiescence(run)
+                    for data_mover in args.stable_data_movers:
+                        metrics_path = metrics_dir / (
+                            f"{scenario['name']}-{data_mover}.jsonl"
+                        )
+                        run, flows = run_one(
+                            "stable",
+                            data_mover,
+                            args,
+                            servers,
+                            scenario,
+                            0,
+                            "diagnostic",
+                            metrics_path,
+                        )
+                        runs.append(run)
+                        flow_samples.extend(flows)
+                        run_file.write(json.dumps(run, sort_keys=True) + "\n")
+                        for flow in flows:
+                            flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
+                        run_file.flush()
+                        flow_file.flush()
+                        require_stalled_server_quiescence(run)
+                        require_stream_server_quiescence(run)
     except BaseException as error:
         execution_error = error
     finally:
@@ -2287,6 +2555,27 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(summary)
 
+    comparisons = paired_mover_comparisons(runs)
+    (output_dir / "comparisons.json").write_text(
+        json.dumps(comparisons, indent=2, sort_keys=True) + "\n"
+    )
+    comparison_pairs = comparisons["pairs"]
+    with (output_dir / "comparisons.csv").open("w", newline="") as comparison_file:
+        writer = csv.DictWriter(
+            comparison_file,
+            fieldnames=list(comparison_pairs[0]) if comparison_pairs else [],
+        )
+        if comparison_pairs:
+            writer.writeheader()
+            writer.writerows(comparison_pairs)
+
+    gate: dict[str, Any] | None = None
+    if args.splice_readiness_gate:
+        gate = splice_readiness_gate(comparisons)
+        (output_dir / "gate.json").write_text(
+            json.dumps(gate, indent=2, sort_keys=True) + "\n"
+        )
+
     failed = [
         run
         for run in runs
@@ -2300,6 +2589,9 @@ def main() -> None:
         raise execution_error
     if failed:
         print(f"failed runs: {len(failed)}", file=sys.stderr)
+        raise SystemExit(1)
+    if gate is not None and not gate["passed"]:
+        print("splice readiness gate failed", file=sys.stderr)
         raise SystemExit(1)
 
 
