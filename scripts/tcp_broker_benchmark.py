@@ -41,10 +41,19 @@ DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
 DEFAULT_OUTPUT_ROOT = ROOT / "bench-results" / "tcp-broker"
 VARIANT_ORDER = ("direct", "addfd", "stable")
 STABLE_DATA_MOVERS = ("inherited", "buffered", "splice")
+PROXY_SESSION_SOURCES = ("inherited", "cold", "warm-one-shot")
 SPLICE_RAMP_BYTES = 4 * 1024 * 1024
 SPLICE_STEADY_BYTES = 32 * 1024 * 1024
 SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT = -5.0
 SPLICE_STEADY_MAX_CPU_DELTA_PERCENT = -15.0
+# Pre-registered M4A warm readiness thresholds (TCP_BROKER_ROADMAP.md M4A):
+# pass needs one request point with a +20% connections/s or a -30% connect
+# p99 mean, no request point may regress connect p99 by more than 5%, and the
+# warm diagnostic must show bounded staleness with zero replenish failures.
+WARM_MIN_CONNS_PER_SEC_DELTA_PERCENT = 20.0
+WARM_MAX_CONNECT_P99_DELTA_PERCENT = -30.0
+WARM_CONNECT_P99_REGRESSION_LIMIT_PERCENT = 5.0
+WARM_MAX_STALE_PER_HIT = 0.05
 METRICS_SCHEMA_VERSION = 6
 SAMPLE_INTERVAL_SECONDS = 0.005
 SOAK_SAMPLE_INTERVAL_SECONDS = 1.0
@@ -70,7 +79,11 @@ STREAM_RESULT_WAIT_SECONDS = 2.0
 
 
 class BenchmarkServers:
-    def __init__(self, safety_timeout: float) -> None:
+    def __init__(self, safety_timeout: float, proxy_rtt_seconds: float = 0.0) -> None:
+        # Injected before each SOCKS5 reply to model a real proxy's network
+        # round trips; the TCP connect itself stays at loopback speed, so a
+        # nonzero setting understates the warm pool's real-world benefit.
+        self.proxy_rtt_seconds = proxy_rtt_seconds
         self.loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: asyncio.Event | None = None
         self.destination_port = 0
@@ -418,6 +431,8 @@ class BenchmarkServers:
             if greeting[0] != 5:
                 return
             await reader.readexactly(greeting[1])
+            if self.proxy_rtt_seconds > 0:
+                await asyncio.sleep(self.proxy_rtt_seconds)
             writer.write(b"\x05\x00")
             await writer.drain()
 
@@ -434,6 +449,8 @@ class BenchmarkServers:
             else:
                 return
             port = int.from_bytes(await reader.readexactly(2), "big")
+            if self.proxy_rtt_seconds > 0:
+                await asyncio.sleep(self.proxy_rtt_seconds)
             upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
             writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
             await writer.drain()
@@ -828,27 +845,52 @@ def comma_data_movers(raw: str) -> list[str]:
     return values
 
 
+def comma_proxy_sessions(raw: str) -> list[str]:
+    values = raw.split(",")
+    if not raw or any(not value for value in values):
+        raise argparse.ArgumentTypeError("proxy session sources must not be empty")
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("proxy session sources must not contain duplicates")
+    unknown = sorted(set(values) - set(PROXY_SESSION_SOURCES))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown proxy session sources: {', '.join(unknown)}")
+    if "inherited" in values and len(values) > 1:
+        raise argparse.ArgumentTypeError(
+            "inherited proxy session source cannot be combined with explicit sources"
+        )
+    return values
+
+
 def randomized_execution_order(
     args: argparse.Namespace, rng: random.Random
-) -> list[tuple[str, str | None]]:
-    groups: list[list[tuple[str, str | None]]] = []
+) -> list[tuple[str, str | None, str | None]]:
+    groups: list[list[tuple[str, str | None, str | None]]] = []
     for variant in args.variants:
         if variant == "stable":
-            group = [(variant, mover) for mover in args.stable_data_movers]
+            group = [
+                (variant, mover, session)
+                for mover in args.stable_data_movers
+                for session in args.proxy_session_sources
+            ]
             rng.shuffle(group)
             groups.append(group)
         else:
-            groups.append([(variant, None)])
+            groups.append([(variant, None, None)])
     rng.shuffle(groups)
     return [target for group in groups for target in group]
 
 
 def variant_environment(
-    variant: str, data_mover: str | None, base: dict[str, str] | None = None
+    variant: str,
+    data_mover: str | None,
+    proxy_session: str | None = None,
+    base: dict[str, str] | None = None,
 ) -> dict[str, str]:
     environment = dict(os.environ if base is None else base)
     if variant == "stable" and data_mover in ("buffered", "splice"):
         environment["SUP_TCP_DATA_MOVER"] = data_mover
+    if variant == "stable" and proxy_session in ("cold", "warm-one-shot"):
+        environment["SUP_TCP_PROXY_SESSION"] = proxy_session
     return environment
 
 
@@ -1436,6 +1478,7 @@ def variant_command(
 def run_one(
     variant: str,
     data_mover: str | None,
+    proxy_session: str | None,
     args: argparse.Namespace,
     servers: BenchmarkServers,
     scenario: dict[str, Any],
@@ -1467,10 +1510,13 @@ def run_one(
             soak_progress_path if scenario["mode"] == "soak" else None,
             soak_ack_path if scenario["mode"] == "soak" else None,
         )
-        process_environment = variant_environment(variant, data_mover)
-        logged_command = command
+        process_environment = variant_environment(variant, data_mover, proxy_session)
+        env_prefix = []
         if variant == "stable" and data_mover in ("buffered", "splice"):
-            logged_command = ["env", f"SUP_TCP_DATA_MOVER={data_mover}", *command]
+            env_prefix.append(f"SUP_TCP_DATA_MOVER={data_mover}")
+        if variant == "stable" and proxy_session in ("cold", "warm-one-shot"):
+            env_prefix.append(f"SUP_TCP_PROXY_SESSION={proxy_session}")
+        logged_command = ["env", *env_prefix, *command] if env_prefix else command
         args.command_log.write(shlex.join(logged_command) + "\n")
         args.command_log.flush()
         child_before = child_cpu_ns()
@@ -1922,6 +1968,7 @@ def run_one(
         "mode": scenario["mode"],
         "variant": variant,
         "data_mover": data_mover,
+        "proxy_session_source": proxy_session,
         "stream_bytes_per_flow": (
             scenario["value"] if scenario["mode"] == "stream" else None
         ),
@@ -2017,6 +2064,7 @@ def run_one(
             "scenario": scenario["name"],
             "variant": variant,
             "data_mover": data_mover,
+            "proxy_session_source": proxy_session,
             "measurement_kind": measurement_kind,
             "repetition": repetition,
         }
@@ -2135,19 +2183,26 @@ def summarize(
     rows: list[dict[str, Any]] = []
     keys = sorted(
         {
-            (run["scenario"], run["variant"], run.get("data_mover") or "")
+            (
+                run["scenario"],
+                run["variant"],
+                run.get("data_mover") or "",
+                run.get("proxy_session_source") or "",
+            )
             for run in runs
             if run["measurement_kind"] == "measurement"
         }
     )
-    for scenario, variant, mover_key in keys:
+    for scenario, variant, mover_key, session_key in keys:
         data_mover = mover_key or None
+        proxy_session = session_key or None
         selected_runs = [
             run
             for run in runs
             if run["scenario"] == scenario
             and run["variant"] == variant
             and run.get("data_mover") == data_mover
+            and run.get("proxy_session_source") == proxy_session
             and run["measurement_kind"] == "measurement"
         ]
         valid_run_keys = {
@@ -2155,6 +2210,7 @@ def summarize(
                 run["scenario"],
                 run["variant"],
                 run.get("data_mover"),
+                run.get("proxy_session_source"),
                 run["repetition"],
                 run["measurement_kind"],
             )
@@ -2167,12 +2223,14 @@ def summarize(
             if flow["scenario"] == scenario
             and flow["variant"] == variant
             and flow.get("data_mover") == data_mover
+            and flow.get("proxy_session_source") == proxy_session
             and flow["measurement_kind"] == "measurement"
             and flow.get("ok")
             and (
                 flow["scenario"],
                 flow["variant"],
                 flow.get("data_mover"),
+                flow.get("proxy_session_source"),
                 flow["repetition"],
                 flow["measurement_kind"],
             )
@@ -2204,11 +2262,13 @@ def summarize(
             and sample["scenario"] == scenario
             and sample["variant"] == variant
             and sample.get("data_mover") == data_mover
+            and sample.get("proxy_session_source") == proxy_session
             and sample["measurement_kind"] == "measurement"
             and (
                 sample["scenario"],
                 sample["variant"],
                 sample.get("data_mover"),
+                sample.get("proxy_session_source"),
                 sample["repetition"],
                 sample["measurement_kind"],
             )
@@ -2242,6 +2302,7 @@ def summarize(
                 "scenario": scenario,
                 "variant": variant,
                 "data_mover": data_mover,
+                "proxy_session_source": proxy_session,
                 "valid_runs": sum(run["ok"] for run in selected_runs),
                 "total_runs": len(selected_runs),
                 "valid_flows": successful if compact_soak else len(selected_flows),
@@ -2340,14 +2401,16 @@ def paired_mover_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
         and run["variant"] == "stable"
         and run.get("data_mover") in ("buffered", "splice")
     ]
-    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str | None, int], dict[str, dict[str, Any]]] = {}
     for run in measurement_runs:
-        grouped.setdefault((run["scenario"], run["repetition"]), {})[
-            run["data_mover"]
-        ] = run
+        grouped.setdefault(
+            (run["scenario"], run.get("proxy_session_source"), run["repetition"]), {}
+        )[run["data_mover"]] = run
 
     pairs: list[dict[str, Any]] = []
-    for (scenario, repetition), movers in sorted(grouped.items()):
+    for (scenario, _session, repetition), movers in sorted(
+        grouped.items(), key=lambda item: (item[0][0], item[0][1] or "", item[0][2])
+    ):
         buffered = movers.get("buffered")
         splice = movers.get("splice")
         pair_ok = buffered is not None and splice is not None
@@ -2412,6 +2475,259 @@ def paired_mover_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
             }
         )
     return {"pairs": pairs, "summaries": summaries}
+
+
+def flow_connect_percentiles(
+    flow_samples: list[dict[str, Any]],
+) -> dict[tuple[str, str, int], list[int]]:
+    """Groups measurement flow connect times by (scenario, session, repetition)."""
+    grouped: dict[tuple[str, str, int], list[int]] = {}
+    for flow in flow_samples:
+        if (
+            flow.get("measurement_kind") != "measurement"
+            or flow.get("variant") != "stable"
+            or flow.get("proxy_session_source") not in ("cold", "warm-one-shot")
+            or not flow.get("ok")
+            or "connect_ns" not in flow
+        ):
+            continue
+        key = (flow["scenario"], flow["proxy_session_source"], flow["repetition"])
+        grouped.setdefault(key, []).append(flow["connect_ns"])
+    return grouped
+
+
+def paired_session_comparisons(
+    runs: list[dict[str, Any]],
+    flow_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Adjacent-pair statistics for cold versus warm-one-shot proxy sessions.
+
+    Mirrors the data-mover machinery: only pair-local deltas are recorded, a
+    pair with either side failed stays out of the statistics, and the suite
+    still fails on any failed run.
+    """
+    measurement_runs = [
+        run
+        for run in runs
+        if run["measurement_kind"] == "measurement"
+        and run["variant"] == "stable"
+        and run.get("proxy_session_source") in ("cold", "warm-one-shot")
+    ]
+    connect_groups = flow_connect_percentiles(flow_samples)
+    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for run in measurement_runs:
+        grouped.setdefault((run["scenario"], run["repetition"]), {})[
+            run["proxy_session_source"]
+        ] = run
+
+    pairs: list[dict[str, Any]] = []
+    for (scenario, repetition), sessions in sorted(grouped.items()):
+        cold = sessions.get("cold")
+        warm = sessions.get("warm-one-shot")
+        pair_ok = cold is not None and warm is not None
+        pair_ok = bool(pair_ok and cold["ok"] and warm["ok"])
+        conns_delta: float | None = None
+        connect_p50_delta: float | None = None
+        connect_p99_delta: float | None = None
+        goodput_delta: float | None = None
+        cpu_delta: float | None = None
+        if pair_ok:
+            assert cold is not None and warm is not None
+            cold_flows = cold.get("successful_flows") or 0
+            warm_flows = warm.get("successful_flows") or 0
+            if cold_flows > 0 and cold_flows == warm_flows:
+                cold_rate = cold_flows / cold["wall_ns"]
+                warm_rate = warm_flows / warm["wall_ns"]
+                conns_delta = 100.0 * (warm_rate / cold_rate - 1.0)
+            cold_connect = connect_groups.get((scenario, "cold", repetition), [])
+            warm_connect = connect_groups.get(
+                (scenario, "warm-one-shot", repetition), []
+            )
+            if cold_connect and warm_connect:
+                cold_p50 = percentile(cold_connect, 0.50)
+                warm_p50 = percentile(warm_connect, 0.50)
+                cold_p99 = percentile(cold_connect, 0.99)
+                warm_p99 = percentile(warm_connect, 0.99)
+                if cold_p50 > 0:
+                    connect_p50_delta = 100.0 * (warm_p50 / cold_p50 - 1.0)
+                if cold_p99 > 0:
+                    connect_p99_delta = 100.0 * (warm_p99 / cold_p99 - 1.0)
+            cold_bytes = cold.get("bytes") or 0
+            warm_bytes = warm.get("bytes") or 0
+            if cold_bytes > 0 and cold_bytes == warm_bytes:
+                goodput_delta = 100.0 * (
+                    (warm_bytes / warm["wall_ns"]) / (cold_bytes / cold["wall_ns"]) - 1.0
+                )
+                cold_cpu = cold.get("child_cpu_ns")
+                warm_cpu = warm.get("child_cpu_ns")
+                if cold_cpu and warm_cpu is not None:
+                    cpu_delta = 100.0 * (warm_cpu / cold_cpu - 1.0)
+        representative = cold or warm or {}
+        pairs.append(
+            {
+                "scenario": scenario,
+                "mode": representative.get("mode"),
+                "stream_direction": representative.get("stream_direction"),
+                "stream_bytes_per_flow": representative.get("stream_bytes_per_flow"),
+                "repetition": repetition,
+                "pair_ok": pair_ok,
+                "cold_ok": cold["ok"] if cold is not None else None,
+                "warm_ok": warm["ok"] if warm is not None else None,
+                "cold_wall_ns": cold["wall_ns"] if cold is not None else None,
+                "warm_wall_ns": warm["wall_ns"] if warm is not None else None,
+                "connections_per_second_delta_percent": conns_delta,
+                "connect_p50_delta_percent": connect_p50_delta,
+                "connect_p99_delta_percent": connect_p99_delta,
+                "goodput_delta_percent": goodput_delta,
+                "child_cpu_per_byte_delta_percent": cpu_delta,
+            }
+        )
+
+    summaries: list[dict[str, Any]] = []
+    for scenario in sorted({pair["scenario"] for pair in pairs}):
+        selected = [pair for pair in pairs if pair["scenario"] == scenario]
+        valid = [pair for pair in selected if pair["pair_ok"]]
+
+        def collect(field: str) -> list[float]:
+            return [
+                pair[field] for pair in valid if pair[field] is not None
+            ]
+
+        conns = collect("connections_per_second_delta_percent")
+        representative = selected[0]
+        summaries.append(
+            {
+                "scenario": scenario,
+                "mode": representative["mode"],
+                "stream_direction": representative["stream_direction"],
+                "stream_bytes_per_flow": representative["stream_bytes_per_flow"],
+                "total_pairs": len(selected),
+                "valid_pairs": len(valid),
+                "warm_wins": sum(value > 0 for value in conns),
+                "connections_per_second_delta_percent": distribution(conns),
+                "connect_p50_delta_percent": distribution(
+                    collect("connect_p50_delta_percent")
+                ),
+                "connect_p99_delta_percent": distribution(
+                    collect("connect_p99_delta_percent")
+                ),
+                "goodput_delta_percent": distribution(
+                    collect("goodput_delta_percent")
+                ),
+                "child_cpu_per_byte_delta_percent": distribution(
+                    collect("child_cpu_per_byte_delta_percent")
+                ),
+            }
+        )
+    return {"pairs": pairs, "summaries": summaries}
+
+
+def warm_pool_health(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregates warm pool counters from warm-session diagnostic runs."""
+    summaries = [
+        run["metric_summary"]
+        for run in runs
+        if run["measurement_kind"] == "diagnostic"
+        and run.get("proxy_session_source") == "warm-one-shot"
+        and run.get("metric_summary") is not None
+    ]
+    hits = sum(summary.get("tcp_warm_sessions_hit", 0) for summary in summaries)
+    stale = sum(summary.get("tcp_warm_sessions_stale", 0) for summary in summaries)
+    return {
+        "diagnostic_runs": len(summaries),
+        "hits": hits,
+        "misses": sum(summary.get("tcp_warm_sessions_miss", 0) for summary in summaries),
+        "stale": stale,
+        "expired": sum(
+            summary.get("tcp_warm_sessions_expired", 0) for summary in summaries
+        ),
+        "replenish_failures": sum(
+            summary.get("tcp_warm_replenish_failures", 0) for summary in summaries
+        ),
+        "stale_per_hit": (stale / hits) if hits > 0 else None,
+    }
+
+
+def warm_readiness_gate(
+    session_comparisons: dict[str, Any],
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    request_summaries = [
+        summary
+        for summary in session_comparisons["summaries"]
+        if summary["mode"] == "request"
+    ]
+    checks: list[dict[str, Any]] = []
+    improvements = 0
+    for summary in request_summaries:
+        reasons: list[str] = []
+        valid_pairs = summary["valid_pairs"]
+        if valid_pairs < 10:
+            reasons.append(f"requires 10 valid pairs, got {valid_pairs}")
+        conns_mean = summary["connections_per_second_delta_percent"]["mean"]
+        p99_mean = summary["connect_p99_delta_percent"]["mean"]
+        improved = bool(
+            (
+                conns_mean is not None
+                and conns_mean >= WARM_MIN_CONNS_PER_SEC_DELTA_PERCENT
+            )
+            or (
+                p99_mean is not None
+                and p99_mean <= WARM_MAX_CONNECT_P99_DELTA_PERCENT
+            )
+        )
+        improvements += improved
+        if p99_mean is None:
+            reasons.append("missing connect p99 delta")
+        elif p99_mean > WARM_CONNECT_P99_REGRESSION_LIMIT_PERCENT:
+            reasons.append(
+                "mean connect p99 regression exceeds "
+                f"{WARM_CONNECT_P99_REGRESSION_LIMIT_PERCENT:.1f}%"
+            )
+        checks.append(
+            {
+                "scenario": summary["scenario"],
+                "valid_pairs": valid_pairs,
+                "improved": improved,
+                "passed": not reasons,
+                "reasons": reasons,
+                "comparison": summary,
+            }
+        )
+    health = warm_pool_health(runs)
+    health_reasons: list[str] = []
+    if health["diagnostic_runs"] == 0:
+        health_reasons.append("no warm diagnostic run with metrics")
+    if health["replenish_failures"] != 0:
+        health_reasons.append("replenish failures are nonzero")
+    if health["stale_per_hit"] is not None and health["stale_per_hit"] > WARM_MAX_STALE_PER_HIT:
+        health_reasons.append(
+            f"stale-per-hit ratio exceeds {WARM_MAX_STALE_PER_HIT:.2f}"
+        )
+    passed = bool(
+        request_summaries
+        and improvements > 0
+        and all(check["passed"] for check in checks)
+        and not health_reasons
+    )
+    return {
+        "gate": "warm-readiness",
+        "passed": passed,
+        "improvements": improvements,
+        "checks": checks,
+        "warm_pool_health": {**health, "reasons": health_reasons},
+        "thresholds": {
+            "minimum_valid_pairs": 10,
+            "min_connections_per_second_delta_percent": (
+                WARM_MIN_CONNS_PER_SEC_DELTA_PERCENT
+            ),
+            "max_connect_p99_delta_percent": WARM_MAX_CONNECT_P99_DELTA_PERCENT,
+            "connect_p99_regression_limit_percent": (
+                WARM_CONNECT_P99_REGRESSION_LIMIT_PERCENT
+            ),
+            "max_stale_per_hit": WARM_MAX_STALE_PER_HIT,
+        },
+    }
 
 
 def splice_readiness_gate(comparisons: dict[str, Any]) -> dict[str, Any]:
@@ -2542,6 +2858,8 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         "payload_sizes": args.payload_sizes,
         "idle_flows": args.idle_flows,
         "stable_data_movers": args.stable_data_movers,
+        "proxy_session_sources": args.proxy_session_sources,
+        "proxy_rtt_ms": args.proxy_rtt_ms,
         "stream_flows": args.stream_flows,
         "stream_bytes": args.stream_bytes,
         "stream_byte_sizes": args.stream_byte_sizes,
@@ -2592,6 +2910,18 @@ def parse_args() -> argparse.Namespace:
         type=comma_data_movers,
         default="inherited",
         help="stable mover(s) to run; explicit pairs are compared per repetition",
+    )
+    parser.add_argument(
+        "--proxy-session-sources",
+        type=comma_proxy_sessions,
+        default="inherited",
+        help="proxy session source(s) to run; explicit pairs are compared per repetition",
+    )
+    parser.add_argument(
+        "--proxy-rtt-ms",
+        type=float,
+        default=0.0,
+        help="artificial delay before each SOCKS5 reply to model proxy RTT",
     )
     parser.add_argument("--connections", type=int, default=1000)
     parser.add_argument(
@@ -2647,11 +2977,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--skip-diagnostics", action="store_true")
     parser.add_argument("--splice-readiness-gate", action="store_true")
+    parser.add_argument("--warm-readiness-gate", action="store_true")
     args = parser.parse_args()
     if isinstance(args.variants, str):
         args.variants = comma_variants(args.variants)
     if isinstance(args.stable_data_movers, str):
         args.stable_data_movers = comma_data_movers(args.stable_data_movers)
+    if isinstance(args.proxy_session_sources, str):
+        args.proxy_session_sources = comma_proxy_sessions(args.proxy_session_sources)
     if "stable" in args.variants:
         try:
             args.yatht = executable(args.yatht)
@@ -2667,6 +3000,8 @@ def parse_args() -> argparse.Namespace:
         args.yatht_commit = None
         if args.stable_data_movers != ["inherited"]:
             parser.error("explicit stable data movers require the stable variant")
+        if args.proxy_session_sources != ["inherited"]:
+            parser.error("explicit proxy session sources require the stable variant")
     if "addfd" in args.variants:
         if (
             args.addfd_yatht is None
@@ -2722,6 +3057,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("stalled flows must be nonnegative and stalled bytes positive")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
+    if args.proxy_rtt_ms < 0:
+        parser.error("proxy RTT must be nonnegative")
+    if len(args.stable_data_movers) > 1 and len(args.proxy_session_sources) > 1:
+        parser.error(
+            "only one paired dimension per suite: use multiple data movers "
+            "or multiple proxy session sources, not both"
+        )
     if args.soak_seconds < 0:
         parser.error("soak seconds must be nonnegative")
     if args.soak_seconds > 0:
@@ -2729,6 +3071,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("soak requires --variants stable")
         if len(args.stable_data_movers) != 1 or args.stable_data_movers == ["inherited"]:
             parser.error("soak requires exactly one explicit stable data mover")
+        if len(args.proxy_session_sources) != 1:
+            parser.error("soak requires exactly one proxy session source")
         if args.warmups != 0 or args.repetitions != 1:
             parser.error("soak requires --warmups 0 --repetitions 1")
         if args.timeout <= args.soak_seconds:
@@ -2740,12 +3084,33 @@ def parse_args() -> argparse.Namespace:
             parser.error(
                 "splice readiness gate requires --stable-data-movers buffered,splice"
             )
+        if len(args.proxy_session_sources) != 1:
+            parser.error("splice readiness gate requires one proxy session source")
         if not {SPLICE_RAMP_BYTES, SPLICE_STEADY_BYTES}.issubset(stream_sizes):
             parser.error("splice readiness gate requires 4 MiB and 32 MiB stream sizes")
         if set(args.stream_directions) != set(STREAM_DIRECTION_CODES):
             parser.error("splice readiness gate requires up, down, and bidi streams")
         if args.repetitions < 10:
             parser.error("splice readiness gate requires at least 10 repetitions")
+    if args.warm_readiness_gate:
+        if args.splice_readiness_gate:
+            parser.error("run one readiness gate per suite")
+        if args.variants != ["stable"]:
+            parser.error("warm readiness gate requires --variants stable")
+        if set(args.proxy_session_sources) != {"cold", "warm-one-shot"}:
+            parser.error(
+                "warm readiness gate requires --proxy-session-sources cold,warm-one-shot"
+            )
+        if len(args.stable_data_movers) != 1:
+            parser.error("warm readiness gate requires exactly one stable data mover")
+        if not args.payload_sizes:
+            parser.error("warm readiness gate requires request scenarios")
+        if args.repetitions < 10:
+            parser.error("warm readiness gate requires at least 10 repetitions")
+        if args.skip_diagnostics:
+            parser.error(
+                "warm readiness gate needs diagnostics for warm pool health"
+            )
     if (
         not args.payload_sizes
         and not args.idle_flows
@@ -2780,7 +3145,7 @@ def main() -> None:
     if args.soak_seconds > 0:
         resource_samples_path.write_text("")
 
-    servers = BenchmarkServers(args.timeout + 30)
+    servers = BenchmarkServers(args.timeout + 30, args.proxy_rtt_ms / 1000.0)
     rng = random.Random(args.seed)
     runs: list[dict[str, Any]] = []
     flow_samples: list[dict[str, Any]] = []
@@ -2798,10 +3163,13 @@ def main() -> None:
             args.command_log = command_log
             for scenario in scenarios(args):
                 for warmup in range(args.warmups):
-                    for variant, data_mover in randomized_execution_order(args, rng):
+                    for variant, data_mover, proxy_session in randomized_execution_order(
+                        args, rng
+                    ):
                         warmup_run, warmup_flows = run_one(
                             variant,
                             data_mover,
+                            proxy_session,
                             args,
                             servers,
                             scenario,
@@ -2842,19 +3210,24 @@ def main() -> None:
                             }
                             raise RuntimeError(
                                 "warmup failed for "
-                                f"{scenario['name']}/{variant}/{data_mover}: "
+                                f"{scenario['name']}/{variant}/{data_mover}/"
+                                f"{proxy_session}: "
                                 f"{json.dumps(failure, sort_keys=True)}"
                             )
                 for repetition in range(args.repetitions):
-                    for variant, data_mover in randomized_execution_order(args, rng):
+                    for variant, data_mover, proxy_session in randomized_execution_order(
+                        args, rng
+                    ):
                         measurement_metrics_path = (
-                            metrics_dir / f"{scenario['name']}-{data_mover}.jsonl"
+                            metrics_dir
+                            / f"{scenario['name']}-{data_mover}-{proxy_session}.jsonl"
                             if scenario["mode"] == "soak"
                             else None
                         )
                         run, flows = run_one(
                             variant,
                             data_mover,
+                            proxy_session,
                             args,
                             servers,
                             scenario,
@@ -2873,7 +3246,7 @@ def main() -> None:
                         run_file.flush()
                         flow_file.flush()
                         print(
-                            f"{scenario['name']} {variant}/{data_mover} "
+                            f"{scenario['name']} {variant}/{data_mover}/{proxy_session} "
                             f"{repetition + 1}/{args.repetitions}: "
                             f"{'ok' if run['ok'] else 'FAILED'}",
                             flush=True,
@@ -2893,28 +3266,30 @@ def main() -> None:
                     and scenario["mode"] != "soak"
                 ):
                     for data_mover in args.stable_data_movers:
-                        metrics_path = metrics_dir / (
-                            f"{scenario['name']}-{data_mover}.jsonl"
-                        )
-                        run, flows = run_one(
-                            "stable",
-                            data_mover,
-                            args,
-                            servers,
-                            scenario,
-                            0,
-                            "diagnostic",
-                            metrics_path,
-                        )
-                        runs.append(run)
-                        flow_samples.extend(flows)
-                        run_file.write(json.dumps(run, sort_keys=True) + "\n")
-                        for flow in flows:
-                            flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
-                        run_file.flush()
-                        flow_file.flush()
-                        require_stalled_server_quiescence(run)
-                        require_stream_server_quiescence(run)
+                        for proxy_session in args.proxy_session_sources:
+                            metrics_path = metrics_dir / (
+                                f"{scenario['name']}-{data_mover}-{proxy_session}.jsonl"
+                            )
+                            run, flows = run_one(
+                                "stable",
+                                data_mover,
+                                proxy_session,
+                                args,
+                                servers,
+                                scenario,
+                                0,
+                                "diagnostic",
+                                metrics_path,
+                            )
+                            runs.append(run)
+                            flow_samples.extend(flows)
+                            run_file.write(json.dumps(run, sort_keys=True) + "\n")
+                            for flow in flows:
+                                flow_file.write(json.dumps(flow, sort_keys=True) + "\n")
+                            run_file.flush()
+                            flow_file.flush()
+                            require_stalled_server_quiescence(run)
+                            require_stream_server_quiescence(run)
     except BaseException as error:
         execution_error = error
     finally:
@@ -2937,8 +3312,18 @@ def main() -> None:
             writer.writerows(summary)
 
     comparisons = paired_mover_comparisons(runs)
+    session_comparisons = paired_session_comparisons(runs, flow_samples)
     (output_dir / "comparisons.json").write_text(
-        json.dumps(comparisons, indent=2, sort_keys=True) + "\n"
+        json.dumps(
+            {
+                **comparisons,
+                "session_pairs": session_comparisons["pairs"],
+                "session_summaries": session_comparisons["summaries"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
     )
     comparison_pairs = comparisons["pairs"]
     with (output_dir / "comparisons.csv").open("w", newline="") as comparison_file:
@@ -2949,10 +3334,23 @@ def main() -> None:
         if comparison_pairs:
             writer.writeheader()
             writer.writerows(comparison_pairs)
+    session_pairs = session_comparisons["pairs"]
+    if session_pairs:
+        with (output_dir / "session_comparisons.csv").open(
+            "w", newline=""
+        ) as session_file:
+            writer = csv.DictWriter(session_file, fieldnames=list(session_pairs[0]))
+            writer.writeheader()
+            writer.writerows(session_pairs)
 
     gate: dict[str, Any] | None = None
     if args.splice_readiness_gate:
         gate = splice_readiness_gate(comparisons)
+        (output_dir / "gate.json").write_text(
+            json.dumps(gate, indent=2, sort_keys=True) + "\n"
+        )
+    if args.warm_readiness_gate:
+        gate = warm_readiness_gate(session_comparisons, runs)
         (output_dir / "gate.json").write_text(
             json.dumps(gate, indent=2, sort_keys=True) + "\n"
         )
@@ -2972,7 +3370,10 @@ def main() -> None:
         print(f"failed runs: {len(failed)}", file=sys.stderr)
         raise SystemExit(1)
     if gate is not None and not gate["passed"]:
-        print("splice readiness gate failed", file=sys.stderr)
+        print(
+            f"{gate.get('gate', 'splice-readiness')} gate failed",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
 
 

@@ -191,6 +191,7 @@ class BenchmarkTests(unittest.TestCase):
         args = benchmark.argparse.Namespace(
             variants=["direct", "stable", "addfd"],
             stable_data_movers=["buffered", "splice"],
+            proxy_session_sources=["inherited"],
         )
 
         order = benchmark.randomized_execution_order(
@@ -198,24 +199,70 @@ class BenchmarkTests(unittest.TestCase):
         )
 
         stable_indexes = [
-            index for index, (variant, _mover) in enumerate(order) if variant == "stable"
+            index
+            for index, (variant, _mover, _session) in enumerate(order)
+            if variant == "stable"
         ]
         self.assertEqual(stable_indexes[1] - stable_indexes[0], 1)
         self.assertEqual(
             {order[index][1] for index in stable_indexes}, {"buffered", "splice"}
         )
 
+    def test_proxy_session_parser_rejects_inherited_comparisons(self) -> None:
+        self.assertEqual(
+            benchmark.comma_proxy_sessions("cold,warm-one-shot"),
+            ["cold", "warm-one-shot"],
+        )
+        with self.assertRaises(benchmark.argparse.ArgumentTypeError):
+            benchmark.comma_proxy_sessions("inherited,cold")
+        with self.assertRaises(benchmark.argparse.ArgumentTypeError):
+            benchmark.comma_proxy_sessions("warm")
+
+    def test_execution_order_keeps_proxy_sessions_adjacent(self) -> None:
+        args = benchmark.argparse.Namespace(
+            variants=["direct", "stable"],
+            stable_data_movers=["buffered"],
+            proxy_session_sources=["cold", "warm-one-shot"],
+        )
+
+        order = benchmark.randomized_execution_order(
+            args, benchmark.random.Random(20260726)
+        )
+
+        stable_indexes = [
+            index
+            for index, (variant, _mover, _session) in enumerate(order)
+            if variant == "stable"
+        ]
+        self.assertEqual(stable_indexes[1] - stable_indexes[0], 1)
+        self.assertEqual(
+            {order[index][2] for index in stable_indexes},
+            {"cold", "warm-one-shot"},
+        )
+
     def test_variant_environment_overrides_only_explicit_stable_movers(self) -> None:
         base = {"SUP_TCP_DATA_MOVER": "splice", "MARKER": "kept"}
 
-        buffered = benchmark.variant_environment("stable", "buffered", base)
-        inherited = benchmark.variant_environment("stable", "inherited", base)
-        direct = benchmark.variant_environment("direct", None, base)
+        buffered = benchmark.variant_environment("stable", "buffered", base=base)
+        inherited = benchmark.variant_environment("stable", "inherited", base=base)
+        direct = benchmark.variant_environment("direct", None, base=base)
 
         self.assertEqual(buffered["SUP_TCP_DATA_MOVER"], "buffered")
         self.assertEqual(inherited["SUP_TCP_DATA_MOVER"], "splice")
         self.assertEqual(direct["SUP_TCP_DATA_MOVER"], "splice")
         self.assertEqual(buffered["MARKER"], "kept")
+
+    def test_variant_environment_overrides_only_explicit_proxy_sessions(self) -> None:
+        base = {"SUP_TCP_PROXY_SESSION": "warm-one-shot", "MARKER": "kept"}
+
+        cold = benchmark.variant_environment("stable", None, "cold", base=base)
+        inherited = benchmark.variant_environment("stable", None, "inherited", base=base)
+        direct = benchmark.variant_environment("direct", None, None, base=base)
+
+        self.assertEqual(cold["SUP_TCP_PROXY_SESSION"], "cold")
+        self.assertEqual(inherited["SUP_TCP_PROXY_SESSION"], "warm-one-shot")
+        self.assertEqual(direct["SUP_TCP_PROXY_SESSION"], "warm-one-shot")
+        self.assertEqual(cold["MARKER"], "kept")
 
     def test_scenarios_expand_multiple_stream_sizes(self) -> None:
         args = benchmark.argparse.Namespace(
@@ -287,6 +334,217 @@ class BenchmarkTests(unittest.TestCase):
             summary["child_cpu_per_byte_delta_percent"]["mean"], -50.0
         )
         self.assertIsNone(summary["goodput_delta_percent"]["sample_stdev"])
+
+    def test_paired_session_comparison_uses_pair_local_effects(self) -> None:
+        def run(session: str, repetition: int, wall_ns: int, ok: bool = True) -> dict:
+            return {
+                "scenario": "request-1024",
+                "mode": "request",
+                "variant": "stable",
+                "data_mover": "buffered",
+                "proxy_session_source": session,
+                "measurement_kind": "measurement",
+                "repetition": repetition,
+                "ok": ok,
+                "stream_direction": None,
+                "stream_bytes_per_flow": None,
+                "successful_flows": 100,
+                "wall_ns": wall_ns,
+                "bytes": None,
+                "child_cpu_ns": None,
+            }
+
+        def flow(session: str, repetition: int, connect_ns: int) -> dict:
+            return {
+                "scenario": "request-1024",
+                "variant": "stable",
+                "data_mover": "buffered",
+                "proxy_session_source": session,
+                "measurement_kind": "measurement",
+                "repetition": repetition,
+                "ok": True,
+                "connect_ns": connect_ns,
+            }
+
+        comparisons = benchmark.paired_session_comparisons(
+            [
+                run("cold", 0, 200),
+                run("warm-one-shot", 0, 100),
+                run("cold", 1, 200),
+                run("warm-one-shot", 1, 300, ok=False),
+            ],
+            [
+                flow("cold", 0, 1000),
+                flow("warm-one-shot", 0, 500),
+            ],
+        )
+
+        summary = comparisons["summaries"][0]
+        self.assertEqual(summary["total_pairs"], 2)
+        self.assertEqual(summary["valid_pairs"], 1)
+        self.assertEqual(summary["warm_wins"], 1)
+        self.assertAlmostEqual(
+            summary["connections_per_second_delta_percent"]["mean"], 100.0
+        )
+        self.assertAlmostEqual(summary["connect_p50_delta_percent"]["mean"], -50.0)
+        self.assertAlmostEqual(summary["connect_p99_delta_percent"]["mean"], -50.0)
+        broken_pair = [
+            pair for pair in comparisons["pairs"] if pair["repetition"] == 1
+        ][0]
+        self.assertFalse(broken_pair["pair_ok"])
+
+    @staticmethod
+    def warm_gate_summary(
+        scenario: str,
+        conns_mean: float | None,
+        p99_mean: float | None,
+        valid_pairs: int = 10,
+    ) -> dict:
+        def dist(mean: float | None) -> dict:
+            return {
+                "count": valid_pairs if mean is not None else 0,
+                "mean": mean,
+                "sample_stdev": None,
+                "median": mean,
+                "min": mean,
+                "max": mean,
+            }
+
+        return {
+            "scenario": scenario,
+            "mode": "request",
+            "stream_direction": None,
+            "stream_bytes_per_flow": None,
+            "total_pairs": valid_pairs,
+            "valid_pairs": valid_pairs,
+            "warm_wins": valid_pairs // 2,
+            "connections_per_second_delta_percent": dist(conns_mean),
+            "connect_p50_delta_percent": dist(None),
+            "connect_p99_delta_percent": dist(p99_mean),
+            "goodput_delta_percent": dist(None),
+            "child_cpu_per_byte_delta_percent": dist(None),
+        }
+
+    @staticmethod
+    def warm_diagnostic_run(
+        hits: int = 100, stale: int = 0, replenish_failures: int = 0
+    ) -> dict:
+        return {
+            "measurement_kind": "diagnostic",
+            "proxy_session_source": "warm-one-shot",
+            "metric_summary": {
+                "tcp_warm_sessions_hit": hits,
+                "tcp_warm_sessions_miss": 5,
+                "tcp_warm_sessions_stale": stale,
+                "tcp_warm_sessions_expired": 0,
+                "tcp_warm_replenish_failures": replenish_failures,
+            },
+        }
+
+    def test_warm_readiness_gate_passes_on_improvement_with_healthy_pool(self) -> None:
+        gate = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 25.0, -10.0)]},
+            [self.warm_diagnostic_run()],
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["improvements"], 1)
+        self.assertEqual(gate["warm_pool_health"]["reasons"], [])
+
+    def test_warm_readiness_gate_requires_an_improvement_point(self) -> None:
+        gate = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 5.0, -10.0)]},
+            [self.warm_diagnostic_run()],
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["improvements"], 0)
+
+    def test_warm_readiness_gate_rejects_connect_p99_regression(self) -> None:
+        gate = benchmark.warm_readiness_gate(
+            {
+                "summaries": [
+                    self.warm_gate_summary("request-0", 25.0, -35.0),
+                    self.warm_gate_summary("request-65536", 25.0, 9.0),
+                ]
+            },
+            [self.warm_diagnostic_run()],
+        )
+
+        self.assertFalse(gate["passed"])
+        regressed = [
+            check for check in gate["checks"] if check["scenario"] == "request-65536"
+        ][0]
+        self.assertFalse(regressed["passed"])
+
+    def test_warm_readiness_gate_rejects_unhealthy_pool(self) -> None:
+        stale = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 25.0, -35.0)]},
+            [self.warm_diagnostic_run(hits=100, stale=10)],
+        )
+        failing = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 25.0, -35.0)]},
+            [self.warm_diagnostic_run(replenish_failures=1)],
+        )
+        missing = benchmark.warm_readiness_gate(
+            {"summaries": [self.warm_gate_summary("request-1024", 25.0, -35.0)]},
+            [],
+        )
+
+        self.assertFalse(stale["passed"])
+        self.assertFalse(failing["passed"])
+        self.assertFalse(missing["passed"])
+
+    def test_warm_readiness_gate_requires_ten_valid_pairs(self) -> None:
+        gate = benchmark.warm_readiness_gate(
+            {
+                "summaries": [
+                    self.warm_gate_summary("request-1024", 25.0, -35.0, valid_pairs=9)
+                ]
+            },
+            [self.warm_diagnostic_run()],
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn(
+            "requires 10 valid pairs, got 9", gate["checks"][0]["reasons"]
+        )
+
+    def test_proxy_rtt_injection_delays_socks5_replies(self) -> None:
+        servers = benchmark.BenchmarkServers(safety_timeout=5, proxy_rtt_seconds=0.05)
+        servers.start()
+        try:
+            started = time.monotonic()
+            with socket.create_connection(
+                ("127.0.0.1", servers.proxy_port)
+            ) as connection:
+                connection.settimeout(5)
+                connection.sendall(b"\x05\x01\x00")
+                reply = self.recv_exact(connection, 2)
+                self.assertEqual(reply, b"\x05\x00")
+                greeting_elapsed = time.monotonic() - started
+                request = (
+                    b"\x05\x01\x00\x01\x7f\x00\x00\x01"
+                    + servers.destination_port.to_bytes(2, "big")
+                )
+                connection.sendall(request)
+                self.assertEqual(len(self.recv_exact(connection, 10)), 10)
+                total_elapsed = time.monotonic() - started
+        finally:
+            servers.stop()
+
+        self.assertGreaterEqual(greeting_elapsed, 0.04)
+        self.assertGreaterEqual(total_elapsed, 0.09)
+
+    @staticmethod
+    def recv_exact(connection: socket.socket, count: int) -> bytes:
+        data = b""
+        while len(data) < count:
+            chunk = connection.recv(count - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
 
     def test_splice_readiness_gate_reports_ramp_without_thresholding_it(self) -> None:
         summaries = []
