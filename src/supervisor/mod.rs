@@ -1536,19 +1536,18 @@ fn handle_connect(
         &mut setup,
     ) {
         Ok(stream) => stream,
-        Err(err) => {
+        Err(failure) => {
             setup.set_proxy_timings(dial_timings.connect, dial_timings.handshake);
             disconnect_tcp_socket(target.as_raw_fd());
             if cfg.debug {
-                eprintln!("yatht: proxy dial {} failed: {err:#}", dest.authority());
+                eprintln!(
+                    "yatht: proxy dial {} failed: {:#}",
+                    dest.authority(),
+                    failure.error
+                );
             }
             seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
-            let stage = if dial_timings.handshake.is_some() {
-                "proxy_handshake"
-            } else {
-                "proxy_connect"
-            };
-            setup.failed(stage, format!("{err:#}"));
+            setup.failed(failure.stage, format!("{:#}", failure.error));
             return;
         }
     };
@@ -1600,6 +1599,23 @@ fn handle_connect(
     setup.completed();
 }
 
+/// A failed proxy dial with the setup stage it should be attributed to.
+struct ProxyDialFailure {
+    error: anyhow::Error,
+    stage: &'static str,
+}
+
+fn cold_dial_failure(timings: &proxy::DialTimings, error: anyhow::Error) -> ProxyDialFailure {
+    ProxyDialFailure {
+        error,
+        stage: if timings.handshake.is_some() {
+            "proxy_handshake"
+        } else {
+            "proxy_connect"
+        },
+    }
+}
+
 /// Obtains the proxy-side connection for one flow: a warm lease when the
 /// pool is enabled and can serve one, otherwise a cold dial. All warm-path
 /// fallbacks stay inside the flow's original connect budget.
@@ -1610,10 +1626,11 @@ fn dial_proxy_session(
     handler_started: Instant,
     timings: &mut proxy::DialTimings,
     setup: &mut TcpSetupTrace,
-) -> Result<TcpStream> {
+) -> std::result::Result<TcpStream, ProxyDialFailure> {
     let Some(pool) = warm_pool else {
         setup.set_proxy_session("cold", None);
-        return proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, timings);
+        return proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, timings)
+            .map_err(|err| cold_dial_failure(timings, err));
     };
     let lease_started = Instant::now();
     let leased = pool.lease();
@@ -1625,7 +1642,8 @@ fn dial_proxy_session(
             dest,
             remaining_connect_budget(cfg, handler_started),
             timings,
-        );
+        )
+        .map_err(|err| cold_dial_failure(timings, err));
     };
     setup.set_proxy_session("warm_hit", Some(lease_elapsed));
     match proxy::warm::complete_warm_lease(
@@ -1636,10 +1654,15 @@ fn dial_proxy_session(
         timings,
     ) {
         Ok(stream) => Ok(stream),
-        Err(WarmCompletionError::NothingSent(_)) => {
+        Err(WarmCompletionError::NothingSent(err)) => {
             // No request byte reached the kernel, so the proxy cannot have
             // observed a request; one cold retry inside the original budget.
-            // The dead lease still counts as a miss for the flow.
+            // The lease turned out dead: reclassify it so pool counters
+            // stay consistent with the flow's warm_miss label.
+            if cfg.debug {
+                eprintln!("yatht: warm session dead before request, retrying cold: {err:#}");
+            }
+            pool.reclassify_dead_lease();
             setup.set_proxy_session("warm_miss", Some(lease_elapsed));
             proxy::dial_with_timings(
                 &cfg.proxy,
@@ -1647,8 +1670,19 @@ fn dial_proxy_session(
                 remaining_connect_budget(cfg, handler_started),
                 timings,
             )
+            .map_err(|err| cold_dial_failure(timings, err))
         }
-        Err(err) => Err(err.into_error()),
+        Err(WarmCompletionError::SessionDied(err)) => Err(ProxyDialFailure {
+            error: err,
+            // Bytes may have reached the proxy, so the pre-registered rule
+            // forbids a retry; attribute the loss to the warm session
+            // instead of a generic handshake failure.
+            stage: "warm_session_died",
+        }),
+        Err(WarmCompletionError::Rejected(err)) => Err(ProxyDialFailure {
+            error: err,
+            stage: "proxy_handshake",
+        }),
     }
 }
 

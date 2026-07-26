@@ -239,6 +239,22 @@ impl WarmSessionPool {
         }
     }
 
+    /// Moves one lease from hit accounting to miss/stale after tunnel
+    /// completion proved the leased session was already dead with no request
+    /// byte sent. Keeps the pool counters consistent with the per-flow
+    /// warm_hit/warm_miss labels and stops dead sessions from deflating the
+    /// stale-per-hit ratio.
+    pub fn reclassify_dead_lease(&self) {
+        let stats = &self.inner.stats;
+        let _ = stats
+            .hits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hits| {
+                hits.checked_sub(1)
+            });
+        stats.misses.fetch_add(1, Ordering::Relaxed);
+        stats.stale.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> WarmPoolSnapshot {
         let stats = &self.inner.stats;
         WarmPoolSnapshot {
@@ -298,17 +314,27 @@ fn session_is_live(stream: &TcpStream) -> bool {
 ///
 /// `NothingSent` proves no request byte was handed to the kernel, so the
 /// proxy cannot have observed a request and a cold retry is safe. Any other
-/// failure must not be retried on another connection (RESEARCH 3.5).
+/// failure must not be retried on another connection (RESEARCH 3.5):
+/// `SessionDied` is a transport-level death after bytes may have been sent
+/// (the lease-time liveness check races the proxy closing an idle session),
+/// while `Rejected` means the proxy answered and refused the tunnel.
+#[derive(Debug)]
 pub enum WarmCompletionError {
     NothingSent(anyhow::Error),
-    Fatal(anyhow::Error),
+    SessionDied(anyhow::Error),
+    Rejected(anyhow::Error),
 }
 
-impl WarmCompletionError {
-    pub fn into_error(self) -> anyhow::Error {
-        match self {
-            Self::NothingSent(err) | Self::Fatal(err) => err,
-        }
+/// A reply failure whose chain bottoms out in an I/O error is the transport
+/// dying under us; anything else is the proxy speaking and refusing.
+fn classify_reply_failure(err: anyhow::Error) -> WarmCompletionError {
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<io::Error>().is_some())
+    {
+        WarmCompletionError::SessionDied(err)
+    } else {
+        WarmCompletionError::Rejected(err)
     }
 }
 
@@ -328,11 +354,11 @@ pub fn complete_warm_lease(
         stream
             .set_read_timeout(Some(timeout))
             .context("set warm session read timeout")
-            .map_err(WarmCompletionError::Fatal)?;
+            .map_err(WarmCompletionError::SessionDied)?;
         stream
             .set_write_timeout(Some(timeout))
             .context("set warm session write timeout")
-            .map_err(WarmCompletionError::Fatal)?;
+            .map_err(WarmCompletionError::SessionDied)?;
         let frame = match proxy {
             ProxyConfig::Socks5 { .. } => socks5_connect_request_frame(dest),
             ProxyConfig::Http { .. } => http_connect_frame(dest).into_bytes(),
@@ -340,15 +366,15 @@ pub fn complete_warm_lease(
         write_all_tracked(&mut stream, &frame)?;
         match proxy {
             ProxyConfig::Socks5 { .. } => {
-                let _ = read_socks5_reply_addr(&mut stream).map_err(WarmCompletionError::Fatal)?;
+                let _ = read_socks5_reply_addr(&mut stream).map_err(classify_reply_failure)?;
             }
             ProxyConfig::Http { .. } => {
-                http_connect_read_reply(&mut stream).map_err(WarmCompletionError::Fatal)?;
+                http_connect_read_reply(&mut stream).map_err(classify_reply_failure)?;
             }
         }
         clear_handshake_timeouts(&stream)
             .context("clear warm session handshake timeouts")
-            .map_err(WarmCompletionError::Fatal)?;
+            .map_err(WarmCompletionError::SessionDied)?;
         Ok(())
     })();
     timings.handshake = Some(handshake_started.elapsed());
@@ -367,7 +393,7 @@ fn write_all_tracked(
                 return Err(if sent == 0 {
                     WarmCompletionError::NothingSent(err)
                 } else {
-                    WarmCompletionError::Fatal(err)
+                    WarmCompletionError::SessionDied(err)
                 });
             }
             Ok(n) => sent += n,
@@ -378,7 +404,7 @@ fn write_all_tracked(
                 return Err(if sent == 0 {
                     WarmCompletionError::NothingSent(err)
                 } else {
-                    WarmCompletionError::Fatal(err)
+                    WarmCompletionError::SessionDied(err)
                 });
             }
         }
@@ -985,7 +1011,7 @@ mod tests {
             Duration::from_secs(2),
             &mut timings,
         )
-        .unwrap_or_else(|err| panic!("warm completion failed: {:#}", err.into_error()));
+        .unwrap_or_else(|err| panic!("warm completion failed: {err:?}"));
         assert!(timings.connect.is_none());
         assert!(timings.handshake.is_some());
         let mut payload = [0_u8; 2];
@@ -1056,7 +1082,7 @@ mod tests {
             Duration::from_secs(2),
             &mut timings,
         )
-        .unwrap_or_else(|err| panic!("warm HTTP completion failed: {:#}", err.into_error()));
+        .unwrap_or_else(|err| panic!("warm HTTP completion failed: {err:?}"));
         assert!(timings.connect.is_none());
         responder.join().unwrap();
         drop(stream);
@@ -1175,10 +1201,114 @@ mod tests {
         );
         match result {
             Err(WarmCompletionError::NothingSent(_)) => {}
-            Err(WarmCompletionError::Fatal(err)) => {
-                panic!("expected NothingSent, got Fatal: {err:#}")
+            Err(WarmCompletionError::SessionDied(err)) => {
+                panic!("expected NothingSent, got SessionDied: {err:#}")
+            }
+            Err(WarmCompletionError::Rejected(err)) => {
+                panic!("expected NothingSent, got Rejected: {err:#}")
             }
             Ok(_) => panic!("expected NothingSent, got success"),
         }
+    }
+
+    #[test]
+    fn completion_classifies_transport_death_as_session_died() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let responder = thread::spawn(move || {
+            // Read the request, then close without any reply: the client's
+            // reply read hits EOF, an I/O-level death.
+            let mut server = server;
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 10];
+            server.read_exact(&mut request).unwrap();
+        });
+
+        let mut timings = DialTimings::default();
+        let result = complete_warm_lease(
+            &socks5_config(&addr, false),
+            client,
+            TEST_DEST,
+            Duration::from_secs(1),
+            &mut timings,
+        );
+        responder.join().unwrap();
+        match result {
+            Err(WarmCompletionError::SessionDied(_)) => {}
+            Err(WarmCompletionError::NothingSent(err)) => {
+                panic!("expected SessionDied, got NothingSent: {err:#}")
+            }
+            Err(WarmCompletionError::Rejected(err)) => {
+                panic!("expected SessionDied, got Rejected: {err:#}")
+            }
+            Ok(_) => panic!("expected SessionDied, got success"),
+        }
+    }
+
+    #[test]
+    fn completion_classifies_proxy_refusal_as_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let responder = thread::spawn(move || {
+            let mut server = server;
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 10];
+            server.read_exact(&mut request).unwrap();
+            // A well-formed SOCKS5 reply with a nonzero code: the proxy
+            // answered and refused, which must not read as a dead session.
+            server.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        let mut timings = DialTimings::default();
+        let result = complete_warm_lease(
+            &socks5_config(&addr, false),
+            client,
+            TEST_DEST,
+            Duration::from_secs(1),
+            &mut timings,
+        );
+        responder.join().unwrap();
+        match result {
+            Err(WarmCompletionError::Rejected(_)) => {}
+            Err(WarmCompletionError::NothingSent(err)) => {
+                panic!("expected Rejected, got NothingSent: {err:#}")
+            }
+            Err(WarmCompletionError::SessionDied(err)) => {
+                panic!("expected Rejected, got SessionDied: {err:#}")
+            }
+            Ok(_) => panic!("expected Rejected, got success"),
+        }
+    }
+
+    #[test]
+    fn reclassify_dead_lease_moves_hit_to_miss_and_stale() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_socks5_greeter(listener, 1, false);
+        let pool =
+            WarmSessionPool::start(socks5_config(&addr, false), Duration::from_secs(2)).unwrap();
+
+        let leased = lease_first_warm_session(&pool).expect("warm session");
+        drop(server.recv_timeout(Duration::from_secs(2)).unwrap());
+        drop(leased);
+        let before = pool.snapshot();
+        assert_eq!(before.hits, 1);
+        assert_eq!(before.stale, 0);
+
+        pool.reclassify_dead_lease();
+
+        let after = pool.snapshot();
+        assert_eq!(after.hits, 0);
+        assert_eq!(after.misses, before.misses + 1);
+        assert_eq!(after.stale, 1);
+        pool.shutdown();
     }
 }
