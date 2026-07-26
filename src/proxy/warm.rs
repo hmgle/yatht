@@ -1250,6 +1250,51 @@ mod tests {
     }
 
     #[test]
+    fn completion_classifies_http_clean_close_as_session_died() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let responder = thread::spawn(move || {
+            // Read the CONNECT header, then close without any reply: the
+            // client's reply read hits a clean EOF, the typical shape of an
+            // idle-timeout proxy reaping a warm session.
+            let mut server = server;
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                server.read_exact(&mut byte).unwrap();
+                buf.push(byte[0]);
+            }
+        });
+
+        let mut timings = DialTimings::default();
+        let result = complete_warm_lease(
+            &ProxyConfig::Http {
+                addr: addr.to_string(),
+            },
+            client,
+            TEST_DEST,
+            Duration::from_secs(1),
+            &mut timings,
+        );
+        responder.join().unwrap();
+        match result {
+            Err(WarmCompletionError::SessionDied(_)) => {}
+            Err(WarmCompletionError::NothingSent(err)) => {
+                panic!("expected SessionDied, got NothingSent: {err:#}")
+            }
+            Err(WarmCompletionError::Rejected(err)) => {
+                panic!("expected SessionDied, got Rejected: {err:#}")
+            }
+            Ok(_) => panic!("expected SessionDied, got success"),
+        }
+    }
+
+    #[test]
     fn completion_classifies_proxy_refusal_as_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

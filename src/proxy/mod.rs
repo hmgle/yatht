@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
@@ -408,7 +408,13 @@ fn http_connect_read_reply(stream: &mut TcpStream) -> Result<()> {
         }
         let n = stream.read(&mut byte)?;
         if n == 0 {
-            bail!("HTTP proxy closed before completing CONNECT response");
+            // An I/O error so warm-lease completion classifies the clean
+            // close as a transport death, not a proxy refusal.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "HTTP proxy closed before completing CONNECT response",
+            )
+            .into());
         }
         buf.push(byte[0]);
     }
