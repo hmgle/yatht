@@ -4135,11 +4135,28 @@ mod tests {
         let adopted = direct_child_pids(std::process::id())
             .unwrap()
             .contains(&descendant_pid);
-        let descendant_pgid = unsafe { libc::getpgid(descendant_pid as libc::pid_t) };
+        // The shell reports the descendant pid before that process execs
+        // setsid(1), so poll for the new session instead of sampling the
+        // process group once.
+        let session_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pgid = unsafe { libc::getpgid(descendant_pid as libc::pid_t) };
+            assert!(
+                pgid >= 0,
+                "descendant {descendant_pid} exited before setsid"
+            );
+            if pgid == descendant_pid as libc::pid_t {
+                break;
+            }
+            assert!(
+                Instant::now() < session_deadline,
+                "descendant {descendant_pid} never became a session leader"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         let result = terminate_adopted_descendants();
 
         assert!(adopted, "descendant {descendant_pid} was not adopted");
-        assert_eq!(descendant_pgid, descendant_pid as libc::pid_t);
         result.unwrap();
         assert_eq!(unsafe { libc::kill(descendant_pid as libc::pid_t, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
