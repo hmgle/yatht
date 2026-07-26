@@ -159,23 +159,7 @@ fn dial_socks5_with_timings(
     let handshake_started = Instant::now();
     let result: Result<()> = (|| {
         socks5_greet(&mut stream, username, password)?;
-
-        let mut req = vec![0x05, 0x01, 0x00];
-        match dest.ip {
-            IpAddr::V4(ip) => {
-                req.push(0x01);
-                req.extend_from_slice(&ip.octets());
-            }
-            IpAddr::V6(ip) => {
-                req.push(0x04);
-                req.extend_from_slice(&ip.octets());
-            }
-        }
-        req.extend_from_slice(&dest.port.to_be_bytes());
-        stream.write_all(&req)?;
-
-        let _ = read_socks5_reply_addr(&mut stream)?;
-
+        socks5_request(&mut stream, dest)?;
         clear_handshake_timeouts(&stream)?;
         Ok(())
     })();
@@ -184,47 +168,100 @@ fn dial_socks5_with_timings(
     Ok(stream)
 }
 
+// Frame builders and reply parsers below are pure so the blocking dial path
+// and any nonblocking session establishment share one protocol definition.
+
+const SOCKS5_METHOD_NO_AUTH: u8 = 0x00;
+const SOCKS5_METHOD_USER_PASS: u8 = 0x02;
+
+fn socks5_greeting_frame(with_auth: bool) -> [u8; 3] {
+    let method = if with_auth {
+        SOCKS5_METHOD_USER_PASS
+    } else {
+        SOCKS5_METHOD_NO_AUTH
+    };
+    [0x05, 0x01, method]
+}
+
+/// Returns the proxy-selected method byte after validating the reply.
+fn parse_socks5_method_reply(reply: [u8; 2]) -> Result<u8> {
+    if reply[0] != 0x05 {
+        bail!("bad SOCKS5 method response version {}", reply[0]);
+    }
+    match reply[1] {
+        method @ (SOCKS5_METHOD_NO_AUTH | SOCKS5_METHOD_USER_PASS) => Ok(method),
+        0xff => bail!("SOCKS5 proxy rejected all authentication methods"),
+        method => bail!("SOCKS5 proxy selected unsupported method {method:#x}"),
+    }
+}
+
+fn socks5_auth_frame(username: &str, password: &str) -> Result<Vec<u8>> {
+    if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
+        bail!("SOCKS5 username/password must be <= 255 bytes");
+    }
+    let mut frame = Vec::with_capacity(3 + username.len() + password.len());
+    frame.push(0x01);
+    frame.push(username.len() as u8);
+    frame.extend_from_slice(username.as_bytes());
+    frame.push(password.len() as u8);
+    frame.extend_from_slice(password.as_bytes());
+    Ok(frame)
+}
+
+fn parse_socks5_auth_reply(reply: [u8; 2]) -> Result<()> {
+    if reply != [0x01, 0x00] {
+        bail!("SOCKS5 username/password authentication failed");
+    }
+    Ok(())
+}
+
+fn socks5_connect_request_frame(dest: Destination) -> Vec<u8> {
+    let mut req = Vec::with_capacity(22);
+    req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    match dest.ip {
+        IpAddr::V4(ip) => {
+            req.push(0x01);
+            req.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            req.push(0x04);
+            req.extend_from_slice(&ip.octets());
+        }
+    }
+    req.extend_from_slice(&dest.port.to_be_bytes());
+    req
+}
+
 fn socks5_greet(
     stream: &mut TcpStream,
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<()> {
-    let methods: &[u8] = if username.is_some() || password.is_some() {
-        &[0x02]
-    } else {
-        &[0x00]
-    };
-    stream.write_all(&[0x05, methods.len() as u8])?;
-    stream.write_all(methods)?;
+    let with_auth = username.is_some() || password.is_some();
+    stream.write_all(&socks5_greeting_frame(with_auth))?;
 
     let mut method_resp = [0_u8; 2];
     stream.read_exact(&mut method_resp)?;
-    if method_resp[0] != 0x05 {
-        bail!("bad SOCKS5 method response version {}", method_resp[0]);
-    }
-    match method_resp[1] {
-        0x00 => {}
-        0x02 => authenticate_socks5(stream, username.unwrap_or(""), password.unwrap_or(""))?,
-        0xff => bail!("SOCKS5 proxy rejected all authentication methods"),
-        method => bail!("SOCKS5 proxy selected unsupported method {method:#x}"),
+    if parse_socks5_method_reply(method_resp)? == SOCKS5_METHOD_USER_PASS {
+        authenticate_socks5(stream, username.unwrap_or(""), password.unwrap_or(""))?;
     }
     Ok(())
 }
 
 fn authenticate_socks5(stream: &mut TcpStream, username: &str, password: &str) -> Result<()> {
-    if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
-        bail!("SOCKS5 username/password must be <= 255 bytes");
-    }
-    stream.write_all(&[0x01, username.len() as u8])?;
-    stream.write_all(username.as_bytes())?;
-    stream.write_all(&[password.len() as u8])?;
-    stream.write_all(password.as_bytes())?;
+    stream.write_all(&socks5_auth_frame(username, password)?)?;
 
     let mut resp = [0_u8; 2];
     stream.read_exact(&mut resp)?;
-    if resp != [0x01, 0x00] {
-        bail!("SOCKS5 username/password authentication failed");
-    }
+    parse_socks5_auth_reply(resp)
+}
+
+/// Sends the CONNECT request on a stream whose greeting/auth already
+/// completed and consumes the proxy reply. Shared by the cold dial path and
+/// warm-session lease completion.
+fn socks5_request(stream: &mut TcpStream, dest: Destination) -> Result<()> {
+    stream.write_all(&socks5_connect_request_frame(dest))?;
+    let _ = read_socks5_reply_addr(stream)?;
     Ok(())
 }
 
@@ -336,46 +373,53 @@ fn dial_http_connect_with_timings(
 
     let handshake_started = Instant::now();
     let result: Result<()> = (|| {
-        let authority = dest.authority();
-        let req = format!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
-        );
-        stream.write_all(req.as_bytes())?;
-
-        let mut buf = Vec::with_capacity(1024);
-        let mut byte = [0_u8; 1];
-        while !buf.ends_with(b"\r\n\r\n") {
-            if buf.len() >= 8192 {
-                bail!("HTTP proxy response header too large");
-            }
-            let n = stream.read(&mut byte)?;
-            if n == 0 {
-                bail!("HTTP proxy closed before completing CONNECT response");
-            }
-            buf.push(byte[0]);
-        }
-
-        let header = String::from_utf8_lossy(&buf);
-        let status = header
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow!("empty HTTP proxy response"))?;
-        let mut parts = status.split_whitespace();
-        let _version = parts.next();
-        let code = parts
-            .next()
-            .ok_or_else(|| anyhow!("HTTP proxy response missing status code"))?;
-        if code != "200" {
-            let _ = stream.shutdown(Shutdown::Both);
-            bail!("HTTP CONNECT failed: {status}");
-        }
-
+        http_connect_request(&mut stream, dest)?;
         clear_handshake_timeouts(&stream)?;
         Ok(())
     })();
     timings.handshake = Some(handshake_started.elapsed());
     result?;
     Ok(stream)
+}
+
+/// Sends the CONNECT request on an established HTTP proxy connection and
+/// consumes the response header. Shared by the cold dial path and
+/// warm-session lease completion.
+fn http_connect_request(stream: &mut TcpStream, dest: Destination) -> Result<()> {
+    let authority = dest.authority();
+    let req = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes())?;
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0_u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        if buf.len() >= 8192 {
+            bail!("HTTP proxy response header too large");
+        }
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            bail!("HTTP proxy closed before completing CONNECT response");
+        }
+        buf.push(byte[0]);
+    }
+
+    let header = String::from_utf8_lossy(&buf);
+    let status = header
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("empty HTTP proxy response"))?;
+    let mut parts = status.split_whitespace();
+    let _version = parts.next();
+    let code = parts
+        .next()
+        .ok_or_else(|| anyhow!("HTTP proxy response missing status code"))?;
+    if code != "200" {
+        let _ = stream.shutdown(Shutdown::Both);
+        bail!("HTTP CONNECT failed: {status}");
+    }
+    Ok(())
 }
 
 fn clear_handshake_timeouts(stream: &TcpStream) -> Result<()> {
@@ -495,5 +539,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decode_socks5_udp_payload(&packet).unwrap(), payload);
+    }
+
+    #[test]
+    fn greeting_frame_selects_method_by_auth_presence() {
+        assert_eq!(socks5_greeting_frame(false), [0x05, 0x01, 0x00]);
+        assert_eq!(socks5_greeting_frame(true), [0x05, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn method_reply_accepts_supported_methods_only() {
+        assert_eq!(parse_socks5_method_reply([0x05, 0x00]).unwrap(), 0x00);
+        assert_eq!(parse_socks5_method_reply([0x05, 0x02]).unwrap(), 0x02);
+        assert!(parse_socks5_method_reply([0x04, 0x00]).is_err());
+        assert!(parse_socks5_method_reply([0x05, 0xff]).is_err());
+        assert!(parse_socks5_method_reply([0x05, 0x01]).is_err());
+    }
+
+    #[test]
+    fn auth_frame_encodes_username_password() {
+        let frame = socks5_auth_frame("user", "pass").unwrap();
+        assert_eq!(frame, b"\x01\x04user\x04pass");
+        assert!(socks5_auth_frame(&"x".repeat(256), "").is_err());
+    }
+
+    #[test]
+    fn auth_reply_requires_success_status() {
+        assert!(parse_socks5_auth_reply([0x01, 0x00]).is_ok());
+        assert!(parse_socks5_auth_reply([0x01, 0x01]).is_err());
+        assert!(parse_socks5_auth_reply([0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn connect_request_frame_encodes_v4_and_v6() {
+        let v4 = socks5_connect_request_frame(Destination {
+            ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            port: 443,
+        });
+        assert_eq!(v4, [0x05, 0x01, 0x00, 0x01, 203, 0, 113, 1, 0x01, 0xbb]);
+
+        let v6 = socks5_connect_request_frame(Destination {
+            ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 80,
+        });
+        assert_eq!(v6[..4], [0x05, 0x01, 0x00, 0x04]);
+        assert_eq!(v6[4..20], Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(v6[20..], [0x00, 0x50]);
     }
 }
