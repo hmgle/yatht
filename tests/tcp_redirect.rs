@@ -118,6 +118,136 @@ fn redirects_local_tcp_connect_through_socks5() {
 }
 
 #[test]
+fn warm_one_shot_session_pool_serves_repeat_connects() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let Some(curl) = find_in_path("curl") else {
+        return;
+    };
+
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().unwrap();
+            let mut req = [0_u8; 1024];
+            let _ = stream.read(&mut req).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        }
+    });
+
+    // Prewarmed sessions greet immediately but may never send a CONNECT
+    // request (pool shutdown closes surplus sessions), so every connection
+    // is served by a thread that tolerates an early close. The listener
+    // keeps accepting until the workload is done so a cold fallback can
+    // never hang on an unaccepted connection.
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let socks_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let socks_stop_flag = std::sync::Arc::clone(&socks_stop);
+    socks.set_nonblocking(true).unwrap();
+    let socks_thread = thread::spawn(move || {
+        let mut handlers = Vec::new();
+        while !socks_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+            match socks.accept() {
+                Ok((mut client, _)) => {
+                    handlers.push(thread::spawn(move || {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        handle_socks5_connect_tolerant(&mut client);
+                    }));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        handlers
+    });
+
+    let metrics_dir = tempfile::tempdir().unwrap();
+    let metrics_path = metrics_dir.path().join("warm-setup.jsonl");
+
+    let bin = env!("CARGO_BIN_EXE_yatht");
+    let url = format!("http://127.0.0.1:{}/", target_addr.port());
+    let output = Command::new(bin)
+        .env("SUP_TCP_PROXY_SESSION", "warm-one-shot")
+        .arg("--proxy")
+        .arg(format!("socks5://{socks_addr}"))
+        .arg("--proxy-local")
+        .arg("--metrics-file")
+        .arg(&metrics_path)
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        // The pause lets the replenisher warm a session between the two
+        // connects, so the second one exercises the warm-hit path.
+        .arg(format!(
+            "{curl} -fsS {url} && sleep 0.5 && {curl} -fsS {url}"
+        ))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "okok");
+
+    target_thread.join().unwrap();
+    socks_stop.store(true, std::sync::atomic::Ordering::Release);
+    for handler in socks_thread.join().unwrap() {
+        let _ = handler.join();
+    }
+
+    let events = fs::read_to_string(metrics_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let setups = events
+        .iter()
+        .filter(|event| event["event"] == "tcp_setup")
+        .collect::<Vec<_>>();
+    assert_eq!(setups.len(), 2);
+    assert!(setups.iter().all(|setup| setup["outcome"] == "completed"
+        && matches!(
+            setup["proxy_session"].as_str(),
+            Some("warm_hit" | "warm_miss")
+        )));
+    let warm_hit = setups
+        .iter()
+        .find(|setup| setup["proxy_session"] == "warm_hit")
+        .expect("no warm hit among repeat connects");
+    assert!(warm_hit["warm_lease_ns"].as_u64().is_some());
+    assert!(warm_hit["proxy_connect_ns"].is_null());
+    assert!(warm_hit["proxy_handshake_ns"].as_u64().is_some());
+
+    let summary = events.last().unwrap();
+    assert_eq!(summary["event"], "run_summary");
+    assert_eq!(summary["tcp_setup_completed"], 2);
+    assert_eq!(summary["tcp_proxy_session_source"], "warm-one-shot");
+    assert!(summary["tcp_warm_sessions_hit"].as_u64().unwrap() >= 1);
+    assert!(summary["tcp_warm_sessions_miss"].as_u64().unwrap() >= 1);
+    assert_eq!(summary["tcp_warm_replenish_failures"], 0);
+    assert!(summary["tcp_warm_pool_size_peak"].as_u64().unwrap() >= 1);
+    assert_eq!(summary["tcp_active_flows"], 0);
+    assert_eq!(summary["dropped_metric_events"], 0);
+}
+
+#[test]
 fn broker_initialization_failure_does_not_exec_target() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -450,6 +580,71 @@ fn tcp_inherited_socket_writer() {
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
+}
+
+/// Serves one SOCKS5 CONNECT like `handle_socks5_connect`, but returns
+/// quietly when the peer disappears at any stage: a prewarmed session may be
+/// closed by pool shutdown without ever sending a tunnel request.
+fn handle_socks5_connect_tolerant(client: &mut TcpStream) {
+    let mut greeting = [0_u8; 2];
+    if client.read_exact(&mut greeting).is_err() {
+        return;
+    }
+    assert_eq!(greeting[0], 5);
+    let mut methods = vec![0_u8; greeting[1] as usize];
+    if client.read_exact(&mut methods).is_err() {
+        return;
+    }
+    assert!(methods.contains(&0));
+    if client.write_all(&[5, 0]).is_err() {
+        return;
+    }
+
+    let mut head = [0_u8; 4];
+    if client.read_exact(&mut head).is_err() {
+        return;
+    }
+    assert_eq!(&head[..3], &[5, 1, 0]);
+    assert_eq!(head[3], 1);
+    let mut ip = [0_u8; 4];
+    let mut port = [0_u8; 2];
+    if client.read_exact(&mut ip).is_err() || client.read_exact(&mut port).is_err() {
+        return;
+    }
+    let dest = SocketAddr::from((Ipv4Addr::from(ip), u16::from_be_bytes(port)));
+    let Ok(mut upstream) = TcpStream::connect(dest) else {
+        return;
+    };
+    if client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).is_err() {
+        return;
+    }
+
+    let mut request = Vec::new();
+    let mut buf = [0_u8; 1024];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    if upstream.write_all(&request).is_err() {
+        return;
+    }
+    loop {
+        match upstream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if client.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn handle_socks5_connect(client: &mut TcpStream, dest_tx: mpsc::Sender<SocketAddr>) {

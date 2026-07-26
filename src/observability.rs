@@ -11,7 +11,7 @@ use crossbeam_channel as channel;
 use serde::Serialize;
 
 const METRIC_QUEUE_CAPACITY: usize = 4096;
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Default)]
 pub struct Observability {
@@ -73,6 +73,13 @@ struct ObservabilityInner {
     tcp_relay_init_rejections: AtomicU64,
     tcp_reactor_stopped_rejections: AtomicU64,
     tcp_reactor_failures: AtomicU64,
+    tcp_proxy_session_warm: AtomicU64,
+    tcp_warm_sessions_hit: AtomicU64,
+    tcp_warm_sessions_miss: AtomicU64,
+    tcp_warm_sessions_stale: AtomicU64,
+    tcp_warm_sessions_expired: AtomicU64,
+    tcp_warm_replenish_failures: AtomicU64,
+    tcp_warm_pool_size_peak: AtomicU64,
     started: Instant,
 }
 
@@ -128,6 +135,13 @@ impl ObservabilityInner {
             tcp_relay_init_rejections: AtomicU64::new(0),
             tcp_reactor_stopped_rejections: AtomicU64::new(0),
             tcp_reactor_failures: AtomicU64::new(0),
+            tcp_proxy_session_warm: AtomicU64::new(0),
+            tcp_warm_sessions_hit: AtomicU64::new(0),
+            tcp_warm_sessions_miss: AtomicU64::new(0),
+            tcp_warm_sessions_stale: AtomicU64::new(0),
+            tcp_warm_sessions_expired: AtomicU64::new(0),
+            tcp_warm_replenish_failures: AtomicU64::new(0),
+            tcp_warm_pool_size_peak: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -177,6 +191,8 @@ struct TcpSetupEvent {
     queue_wait_ns: u64,
     handler_ns: u64,
     fd_inspection_ns: Option<u64>,
+    proxy_session: &'static str,
+    warm_lease_ns: Option<u64>,
     proxy_connect_ns: Option<u64>,
     proxy_handshake_ns: Option<u64>,
     loopback_connect_accept_ns: Option<u64>,
@@ -237,6 +253,13 @@ struct RunSummary {
     tcp_relay_init_rejections: u64,
     tcp_reactor_stopped_rejections: u64,
     tcp_reactor_failures: u64,
+    tcp_proxy_session_source: &'static str,
+    tcp_warm_sessions_hit: u64,
+    tcp_warm_sessions_miss: u64,
+    tcp_warm_sessions_stale: u64,
+    tcp_warm_sessions_expired: u64,
+    tcp_warm_replenish_failures: u64,
+    tcp_warm_pool_size_peak: u64,
     tcp_cpu_ns_per_byte: Option<f64>,
     dropped_metric_events: u64,
 }
@@ -250,6 +273,8 @@ pub struct TcpSetupTrace {
     started: Instant,
     queue_wait_ns: u64,
     fd_inspection_ns: Option<u64>,
+    proxy_session: &'static str,
+    warm_lease_ns: Option<u64>,
     proxy_connect_ns: Option<u64>,
     proxy_handshake_ns: Option<u64>,
     loopback_connect_accept_ns: Option<u64>,
@@ -374,6 +399,17 @@ impl ObservabilityRuntime {
                 .tcp_reactor_stopped_rejections
                 .load(Ordering::Relaxed),
             tcp_reactor_failures: inner.tcp_reactor_failures.load(Ordering::Relaxed),
+            tcp_proxy_session_source: if inner.tcp_proxy_session_warm.load(Ordering::Relaxed) != 0 {
+                "warm-one-shot"
+            } else {
+                "cold"
+            },
+            tcp_warm_sessions_hit: inner.tcp_warm_sessions_hit.load(Ordering::Relaxed),
+            tcp_warm_sessions_miss: inner.tcp_warm_sessions_miss.load(Ordering::Relaxed),
+            tcp_warm_sessions_stale: inner.tcp_warm_sessions_stale.load(Ordering::Relaxed),
+            tcp_warm_sessions_expired: inner.tcp_warm_sessions_expired.load(Ordering::Relaxed),
+            tcp_warm_replenish_failures: inner.tcp_warm_replenish_failures.load(Ordering::Relaxed),
+            tcp_warm_pool_size_peak: inner.tcp_warm_pool_size_peak.load(Ordering::Relaxed),
             tcp_cpu_ns_per_byte: (total_bytes != 0)
                 .then_some(total_cpu_ns as f64 / total_bytes as f64),
             dropped_metric_events: inner.dropped_events.load(Ordering::Relaxed),
@@ -466,6 +502,8 @@ impl Observability {
             started,
             queue_wait_ns: duration_ns(queue_wait),
             fd_inspection_ns: None,
+            proxy_session: "cold",
+            warm_lease_ns: None,
             proxy_connect_ns: None,
             proxy_handshake_ns: None,
             loopback_connect_accept_ns: None,
@@ -753,6 +791,46 @@ impl Observability {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_proxy_session_source(&self, warm: bool) {
+        if let Some(inner) = &self.inner {
+            inner
+                .tcp_proxy_session_warm
+                .store(warm as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Folds the warm pool's lifetime counters into the run summary; called
+    /// once at supervisor teardown after the pool has shut down.
+    pub fn record_warm_pool_stats(
+        &self,
+        hits: u64,
+        misses: u64,
+        stale: u64,
+        expired: u64,
+        replenish_failures: u64,
+        pool_size_peak: u64,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.tcp_warm_sessions_hit.store(hits, Ordering::Relaxed);
+        inner
+            .tcp_warm_sessions_miss
+            .store(misses, Ordering::Relaxed);
+        inner
+            .tcp_warm_sessions_stale
+            .store(stale, Ordering::Relaxed);
+        inner
+            .tcp_warm_sessions_expired
+            .store(expired, Ordering::Relaxed);
+        inner
+            .tcp_warm_replenish_failures
+            .store(replenish_failures, Ordering::Relaxed);
+        inner
+            .tcp_warm_pool_size_peak
+            .store(pool_size_peak, Ordering::Relaxed);
+    }
+
     fn try_record(&self, event: MetricEvent) {
         let Some(inner) = &self.inner else {
             return;
@@ -767,6 +845,11 @@ impl TcpSetupTrace {
     pub fn set_fd_inspection(&mut self, elapsed: Duration, target_cookie: Option<u64>) {
         self.fd_inspection_ns = Some(duration_ns(elapsed));
         self.target_cookie = target_cookie;
+    }
+
+    pub fn set_proxy_session(&mut self, session: &'static str, lease: Option<Duration>) {
+        self.proxy_session = session;
+        self.warm_lease_ns = lease.map(duration_ns);
     }
 
     pub fn set_proxy_timings(&mut self, connect: Option<Duration>, handshake: Option<Duration>) {
@@ -826,6 +909,8 @@ impl TcpSetupTrace {
             queue_wait_ns: self.queue_wait_ns,
             handler_ns: duration_ns(self.started.elapsed()),
             fd_inspection_ns: self.fd_inspection_ns,
+            proxy_session: self.proxy_session,
+            warm_lease_ns: self.warm_lease_ns,
             proxy_connect_ns: self.proxy_connect_ns,
             proxy_handshake_ns: self.proxy_handshake_ns,
             loopback_connect_accept_ns: self.loopback_connect_accept_ns,
@@ -923,6 +1008,7 @@ mod tests {
             Duration::from_micros(5),
         );
         setup.set_fd_inspection(Duration::from_micros(2), Some(11));
+        setup.set_proxy_session("warm_hit", Some(Duration::from_micros(1)));
         setup.set_proxy_timings(
             Some(Duration::from_micros(3)),
             Some(Duration::from_micros(4)),
@@ -930,6 +1016,8 @@ mod tests {
         setup.set_proxy_cookie(Some(12));
         setup.completed();
         metrics.tcp_flow_cancelled();
+        metrics.record_proxy_session_source(true);
+        metrics.record_warm_pool_stats(3, 2, 1, 1, 0, 4);
         runtime.finish().unwrap();
 
         let events = fs::read_to_string(path)
@@ -939,11 +1027,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0]["event"], "run_start");
+        assert_eq!(events[0]["schema_version"], 6);
         assert_eq!(events[1]["event"], "tcp_setup");
         assert_eq!(events[1]["target_cookie"], 11);
+        assert_eq!(events[1]["proxy_session"], "warm_hit");
+        assert_eq!(events[1]["warm_lease_ns"], 1_000);
         assert_eq!(events[2]["event"], "run_summary");
         assert_eq!(events[2]["tcp_setup_completed"], 1);
         assert_eq!(events[2]["tcp_flows_cancelled"], 1);
+        assert_eq!(events[2]["tcp_proxy_session_source"], "warm-one-shot");
+        assert_eq!(events[2]["tcp_warm_sessions_hit"], 3);
+        assert_eq!(events[2]["tcp_warm_sessions_miss"], 2);
+        assert_eq!(events[2]["tcp_warm_sessions_stale"], 1);
+        assert_eq!(events[2]["tcp_warm_sessions_expired"], 1);
+        assert_eq!(events[2]["tcp_warm_replenish_failures"], 0);
+        assert_eq!(events[2]["tcp_warm_pool_size_peak"], 4);
+    }
+
+    #[test]
+    fn setup_events_default_to_cold_sessions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let runtime = ObservabilityRuntime::start(Some(&path)).unwrap();
+        let metrics = runtime.observability();
+        let setup = metrics.begin_tcp_setup(
+            42,
+            7,
+            "203.0.113.1:443".to_string(),
+            Instant::now(),
+            Duration::from_micros(5),
+        );
+        setup.completed();
+        runtime.finish().unwrap();
+
+        let events = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events[1]["proxy_session"], "cold");
+        assert_eq!(events[1]["warm_lease_ns"], serde_json::Value::Null);
+        assert_eq!(events[2]["tcp_proxy_session_source"], "cold");
+        assert_eq!(events[2]["tcp_warm_sessions_hit"], 0);
     }
 
     #[test]

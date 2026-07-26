@@ -17,7 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel as channel;
 
 use crate::config::{EffectiveConfig, Route};
-use crate::observability::{Observability, ObservabilityRuntime};
+use crate::observability::{Observability, ObservabilityRuntime, TcpSetupTrace};
 use crate::proxy;
 use crate::proxy::warm::{
     ProxySessionSource, WarmCompletionError, WarmSessionPool, WARM_POOL_MAX_SESSIONS,
@@ -261,6 +261,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     } else {
         None
     };
+    observability.record_proxy_session_source(session_source == ProxySessionSource::WarmOneShot);
     if let Err(err) = write_all_fd(parent_sock, b"G") {
         close_fd(parent_sock);
         return Err(err).context("ack child stage");
@@ -300,7 +301,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     let loop_relays = Arc::clone(&relays);
     let loop_failure = Arc::clone(&failure);
     let loop_state = Arc::clone(&failure);
-    let loop_observability = observability;
+    let loop_observability = observability.clone();
     let worker_tcp_broker = tcp_broker.clone();
     let loop_warm_pool = warm_pool.clone();
     let notification_thread = thread::spawn(move || {
@@ -346,6 +347,15 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     // Workers are joined, so no lease can race the pool teardown.
     if let Some(pool) = &warm_pool {
         pool.shutdown();
+        let stats = pool.snapshot();
+        observability.record_warm_pool_stats(
+            stats.hits,
+            stats.misses,
+            stats.stale,
+            stats.expired,
+            stats.replenish_failures,
+            stats.pool_size_peak,
+        );
     }
     let shutdown_result = tcp_broker.shutdown();
     let reactor_join_result = reactor_thread
@@ -1523,6 +1533,7 @@ fn handle_connect(
         dest,
         handler_started,
         &mut dial_timings,
+        &mut setup,
     ) {
         Ok(stream) => stream,
         Err(err) => {
@@ -1598,11 +1609,17 @@ fn dial_proxy_session(
     dest: Destination,
     handler_started: Instant,
     timings: &mut proxy::DialTimings,
+    setup: &mut TcpSetupTrace,
 ) -> Result<TcpStream> {
     let Some(pool) = warm_pool else {
+        setup.set_proxy_session("cold", None);
         return proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, timings);
     };
-    let Some(warm) = pool.lease() else {
+    let lease_started = Instant::now();
+    let leased = pool.lease();
+    let lease_elapsed = lease_started.elapsed();
+    let Some(warm) = leased else {
+        setup.set_proxy_session("warm_miss", Some(lease_elapsed));
         return proxy::dial_with_timings(
             &cfg.proxy,
             dest,
@@ -1610,6 +1627,7 @@ fn dial_proxy_session(
             timings,
         );
     };
+    setup.set_proxy_session("warm_hit", Some(lease_elapsed));
     match proxy::warm::complete_warm_lease(
         &cfg.proxy,
         warm,
@@ -1621,6 +1639,8 @@ fn dial_proxy_session(
         Err(WarmCompletionError::NothingSent(_)) => {
             // No request byte reached the kernel, so the proxy cannot have
             // observed a request; one cold retry inside the original budget.
+            // The dead lease still counts as a miss for the flow.
+            setup.set_proxy_session("warm_miss", Some(lease_elapsed));
             proxy::dial_with_timings(
                 &cfg.proxy,
                 dest,

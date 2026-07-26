@@ -100,9 +100,6 @@ struct WarmPoolStats {
     pool_size_peak: AtomicU64,
 }
 
-// The snapshot is consumed by unit tests now and by the metrics run summary
-// once schema v6 lands; the binary target alone does not read it yet.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WarmPoolSnapshot {
     pub hits: u64,
@@ -242,9 +239,6 @@ impl WarmSessionPool {
         }
     }
 
-    // Consumed by unit tests now and by the metrics run summary once schema
-    // v6 lands; the binary target alone does not read it yet.
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> WarmPoolSnapshot {
         let stats = &self.inner.stats;
         WarmPoolSnapshot {

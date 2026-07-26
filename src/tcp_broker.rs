@@ -2803,7 +2803,7 @@ mod tests {
     #[test]
     fn spliced_dribble_flow_records_quickacks_in_run_summary() {
         let summary = spliced_echo_run_summary(true);
-        assert_eq!(summary["schema_version"], 5);
+        assert_eq!(summary["schema_version"], 6);
         assert!(summary["tcp_splice_in_syscalls"].as_u64().unwrap() > 0);
         // Each sub-dribble consuming round drains its socket, so the forced
         // ACK fires at least once per direction.
