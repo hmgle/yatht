@@ -146,6 +146,8 @@ Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
 multiple responses, ancillary data, pre-existing epoll registrations, or fd
 aliases created with `dup(2)` or inherited across `fork(2)`.
+Active UDP relays are capped at 128, with a bounded 16-datagram input queue per
+relay. New relay setup fails closed when the global limit is reached.
 
 UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.

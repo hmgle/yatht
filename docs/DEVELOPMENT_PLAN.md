@@ -138,8 +138,10 @@ is `socks5://127.0.0.1:1080`.
   a concurrent descriptor change cannot cross the injection window. Closing
   calls also remove matching relays so long-running targets do not retain relay
   threads after closing UDP sockets.
-- Each UDP relay has a bounded job queue. Blocking sends apply backpressure;
-  nonblocking sends return `EAGAIN` when the queue is full.
+- UDP relay admission is globally capped at 128. Each relay uses two fallible
+  workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
+  sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
+  full, and relay setup fails closed when the global limit is reached.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.

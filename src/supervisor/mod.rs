@@ -35,9 +35,11 @@ const MAX_UDP_PAYLOAD: usize = 65_535;
 // memory when the target stops reading and keeps the source queue from growing
 // without limit; once full, further responses are dropped rather than enqueued.
 const MAX_PENDING_SOURCES: usize = 1_024;
+const MAX_UDP_RELAYS: usize = 128;
+const UDP_RELAY_THREAD_STACK_SIZE: usize = 512 * 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
-const UDP_JOB_QUEUE_CAPACITY: usize = 64;
+const UDP_JOB_QUEUE_CAPACITY: usize = 16;
 const TGID_CACHE_MAX_ENTRIES: usize = 256;
 const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
 const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
@@ -2366,6 +2368,7 @@ impl UdpRelayRegistry {
                     }
                     // Free to claim: publish the marker and build below.
                     _ => {
+                        ensure_udp_relay_capacity(&relays)?;
                         relays.insert(key, RelayState::Creating);
                         break;
                     }
@@ -2411,10 +2414,14 @@ impl UdpRelayRegistry {
         {
             bail!("UDP target fd changed before relay injection");
         }
-        seccomp::notif_addfd(listener_fd, &mut addfd).context("inject UDP relay fd")?;
+        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity)
+            .context("start bounded UDP relay workers")?;
+        if let Err(err) = seccomp::notif_addfd(listener_fd, &mut addfd) {
+            handle.shutdown();
+            return Err(err).context("inject UDP relay fd");
+        }
         drop(target_fd);
 
-        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
         // Publish the ready relay and hand the marker off to Ready in one
         // critical section so waiters wake to a usable handle.
         guard.commit(RelayState::Ready(handle.clone()));
@@ -2573,6 +2580,13 @@ impl UdpRelayRegistry {
     }
 }
 
+fn ensure_udp_relay_capacity(relays: &HashMap<RelayKey, RelayState>) -> Result<()> {
+    if relays.len() >= MAX_UDP_RELAYS {
+        bail!("active UDP relay limit of {MAX_UDP_RELAYS} reached");
+    }
+    Ok(())
+}
+
 fn fd_in_close_range(fd: RawFd, first: u32, last: u32) -> bool {
     u32::try_from(fd)
         .map(|fd| (first..=last).contains(&fd))
@@ -2682,7 +2696,7 @@ fn start_udp_relay(
     relay_socket: OwnedFd,
     default_dest: Option<(Destination, UdpRouteKind)>,
     target_identity: FdIdentity,
-) -> UdpRelayHandle {
+) -> io::Result<UdpRelayHandle> {
     let relay_fd = Arc::new(relay_socket);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
@@ -2693,87 +2707,101 @@ fn start_udp_relay(
     let read_tx = tx.clone();
     let read_default_dest = Arc::clone(&default_dest);
     let read_shutdown = Arc::clone(&shutdown);
-    thread::spawn(move || {
-        let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
-        loop {
-            let n = match recv_relay_socket(read_fd.as_raw_fd(), &mut buf) {
-                Ok(n) => n,
-                // A signal can interrupt the blocking recv; retry rather than
-                // terminating the reader, which would silently break the
-                // connected-UDP return path (target recvfrom would hang).
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            if read_shutdown.load(Ordering::SeqCst) {
-                break;
+    let reader = thread::Builder::new()
+        .name("yatht-udp-relay-read".to_string())
+        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
+            loop {
+                let n = match recv_relay_socket(read_fd.as_raw_fd(), &mut buf) {
+                    Ok(n) => n,
+                    // A signal can interrupt the blocking recv; retry rather than
+                    // terminating the reader, which would silently break the
+                    // connected-UDP return path (target recvfrom would hang).
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if read_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some((dest, route)) = *read_default_dest.lock().unwrap() else {
+                    continue;
+                };
+                let payload = buf[..n].to_vec();
+                if read_tx
+                    .send(UdpJob {
+                        dest,
+                        payload,
+                        route,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let Some((dest, route)) = *read_default_dest.lock().unwrap() else {
-                continue;
-            };
-            let payload = buf[..n].to_vec();
-            if read_tx
-                .send(UdpJob {
-                    dest,
-                    payload,
-                    route,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+        })?;
 
     let write_pending_sources = Arc::clone(&pending_sources);
     let write_fd = Arc::clone(&relay_fd);
     let write_shutdown = Arc::clone(&shutdown);
-    thread::spawn(move || {
-        let mut dns_tcp = None;
-        let mut socks_udp = None;
-        let mut direct_udp = None;
-        for job in rx {
-            if write_shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            let source = job.dest;
-            match forward_udp_job(&cfg, &mut dns_tcp, &mut socks_udp, &mut direct_udp, job) {
-                Ok(Some(response)) => {
-                    let mut pending = write_pending_sources.lock().unwrap();
-                    // Drop the response if the target is not draining fast
-                    // enough. The socketpair send below uses MSG_DONTWAIT, so a
-                    // successful send means the datagram is actually queued.
-                    if pending.len() >= MAX_PENDING_SOURCES {
+    let writer = thread::Builder::new()
+        .name("yatht-udp-relay-write".to_string())
+        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut dns_tcp = None;
+            let mut socks_udp = None;
+            let mut direct_udp = None;
+            for job in rx {
+                if write_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let source = job.dest;
+                match forward_udp_job(&cfg, &mut dns_tcp, &mut socks_udp, &mut direct_udp, job) {
+                    Ok(Some(response)) => {
+                        let mut pending = write_pending_sources.lock().unwrap();
+                        // Drop the response if the target is not draining fast
+                        // enough. The socketpair send below uses MSG_DONTWAIT, so a
+                        // successful send means the datagram is actually queued.
+                        if pending.len() >= MAX_PENDING_SOURCES {
+                            if cfg.debug {
+                                eprintln!("yatht: UDP relay pending queue full, dropping response");
+                            }
+                            continue;
+                        }
+                        pending.push_back(source);
+                        if !send_relay_response(write_fd.as_raw_fd(), &response) {
+                            let _ = pending.pop_back();
+                            if write_shutdown.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
                         if cfg.debug {
-                            eprintln!("yatht: UDP relay pending queue full, dropping response");
+                            eprintln!("yatht: UDP relay forward failed: {err:#}");
                         }
-                        continue;
-                    }
-                    pending.push_back(source);
-                    if !send_relay_response(write_fd.as_raw_fd(), &response) {
-                        let _ = pending.pop_back();
-                        if write_shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    if cfg.debug {
-                        eprintln!("yatht: UDP relay forward failed: {err:#}");
                     }
                 }
             }
-        }
-    });
+        });
+    if let Err(err) = writer {
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = unsafe { libc::shutdown(relay_fd.as_raw_fd(), libc::SHUT_RDWR) };
+        drop(reader);
+        return Err(err);
+    }
+    drop(reader);
+    drop(writer);
 
-    UdpRelayHandle {
+    Ok(UdpRelayHandle {
         tx,
         default_dest,
         pending_sources,
         relay_fd,
         target_identity,
         shutdown,
-    }
+    })
 }
 
 fn recv_relay_socket(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
@@ -4145,6 +4173,29 @@ mod tests {
             registry.lookup(std::process::id(), 9, false),
             RelayLookup::Creating
         ));
+    }
+
+    #[test]
+    fn udp_relay_capacity_is_globally_bounded() {
+        let mut relays = HashMap::new();
+        for fd in 0..MAX_UDP_RELAYS {
+            relays.insert(
+                RelayKey {
+                    tgid: 1,
+                    fd: fd as RawFd,
+                },
+                RelayState::Creating,
+            );
+        }
+
+        let err = ensure_udp_relay_capacity(&relays).unwrap_err().to_string();
+        assert!(err.contains("active UDP relay limit"), "{err}");
+
+        relays.remove(&RelayKey {
+            tgid: 1,
+            fd: (MAX_UDP_RELAYS - 1) as RawFd,
+        });
+        ensure_udp_relay_capacity(&relays).unwrap();
     }
 
     #[test]
