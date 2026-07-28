@@ -1631,9 +1631,10 @@ fn dial_proxy_session(
     timings: &mut proxy::DialTimings,
     setup: &mut TcpSetupTrace,
 ) -> std::result::Result<TcpStream, ProxyDialFailure> {
+    let deadline = proxy::Deadline::from_start(handler_started, cfg.connect_timeout);
     let Some(pool) = warm_pool else {
         setup.set_proxy_session("cold", None);
-        return proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, timings)
+        return proxy::dial_with_deadline(&cfg.proxy, dest, deadline, timings)
             .map_err(|err| cold_dial_failure(timings, err));
     };
     let lease_started = Instant::now();
@@ -1641,22 +1642,11 @@ fn dial_proxy_session(
     let lease_elapsed = lease_started.elapsed();
     let Some(warm) = leased else {
         setup.set_proxy_session("warm_miss", Some(lease_elapsed));
-        return proxy::dial_with_timings(
-            &cfg.proxy,
-            dest,
-            remaining_connect_budget(cfg, handler_started),
-            timings,
-        )
-        .map_err(|err| cold_dial_failure(timings, err));
+        return proxy::dial_with_deadline(&cfg.proxy, dest, deadline, timings)
+            .map_err(|err| cold_dial_failure(timings, err));
     };
     setup.set_proxy_session("warm_hit", Some(lease_elapsed));
-    match proxy::warm::complete_warm_lease(
-        &cfg.proxy,
-        warm,
-        dest,
-        remaining_connect_budget(cfg, handler_started),
-        timings,
-    ) {
+    match proxy::warm::complete_warm_lease(&cfg.proxy, warm, dest, deadline, timings) {
         Ok(stream) => Ok(stream),
         Err(WarmCompletionError::NothingSent(err)) => {
             // No request byte reached the kernel, so the proxy cannot have
@@ -1668,13 +1658,8 @@ fn dial_proxy_session(
             }
             pool.reclassify_dead_lease();
             setup.set_proxy_session("warm_miss", Some(lease_elapsed));
-            proxy::dial_with_timings(
-                &cfg.proxy,
-                dest,
-                remaining_connect_budget(cfg, handler_started),
-                timings,
-            )
-            .map_err(|err| cold_dial_failure(timings, err))
+            proxy::dial_with_deadline(&cfg.proxy, dest, deadline, timings)
+                .map_err(|err| cold_dial_failure(timings, err))
         }
         Err(WarmCompletionError::SessionDied(err)) => Err(ProxyDialFailure {
             error: err,
@@ -1688,14 +1673,6 @@ fn dial_proxy_session(
             stage: "proxy_handshake",
         }),
     }
-}
-
-fn remaining_connect_budget(cfg: &EffectiveConfig, handler_started: Instant) -> Duration {
-    // Keep at least a token budget: timeout setters reject zero, and an
-    // exhausted deadline should fail fast inside the dial instead.
-    cfg.connect_timeout
-        .saturating_sub(handler_started.elapsed())
-        .max(Duration::from_millis(1))
 }
 
 fn handle_sendto(
@@ -2840,22 +2817,20 @@ fn forward_udp_job(
     direct_udp: &mut Option<DirectUdpSocket>,
     job: UdpJob,
 ) -> Result<Option<Vec<u8>>> {
+    let deadline = proxy::Deadline::after(cfg.timeout);
     // The route was decided by the notification handler, which has the full
     // routing table. Honour it verbatim so a datagram bound for a direct route
     // is never accidentally tunnelled through the proxy (and vice versa).
     match job.route {
-        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload).map(Some),
+        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(Some),
         UdpRouteKind::Generic => {
             if socks_udp.is_none() {
-                *socks_udp = Some(proxy::Socks5UdpAssociation::connect(
-                    &cfg.proxy,
-                    cfg.timeout,
-                )?);
+                *socks_udp = Some(proxy::Socks5UdpAssociation::connect(&cfg.proxy, deadline)?);
             }
             socks_udp
                 .as_mut()
                 .expect("SOCKS5 UDP association initialized")
-                .send_datagram(job.dest, &job.payload)
+                .send_datagram(job.dest, &job.payload, deadline)
         }
         UdpRouteKind::Direct => forward_direct_udp(direct_udp, job.dest, &job.payload, cfg.timeout),
     }
@@ -2865,27 +2840,27 @@ fn forward_dns_tcp(
     cfg: &UdpRelayConfig,
     dns_tcp: &mut Option<proxy::DnsTcpConnection>,
     payload: &[u8],
+    deadline: proxy::Deadline,
 ) -> Result<Vec<u8>> {
     if dns_tcp.is_none() {
         *dns_tcp = Some(proxy::DnsTcpConnection::connect(
             &cfg.proxy,
             cfg.dns_server,
-            cfg.timeout,
+            deadline,
         )?);
     }
 
     match dns_tcp
         .as_mut()
         .expect("DNS-over-TCP connection initialized")
-        .query(payload)
+        .query(payload, deadline)
     {
         Ok(response) => Ok(response),
         Err(first_err) => {
             *dns_tcp = None;
-            let mut fresh =
-                proxy::DnsTcpConnection::connect(&cfg.proxy, cfg.dns_server, cfg.timeout)
-                    .with_context(|| format!("reconnect DNS-over-TCP after {first_err:#}"))?;
-            let response = fresh.query(payload)?;
+            let mut fresh = proxy::DnsTcpConnection::connect(&cfg.proxy, cfg.dns_server, deadline)
+                .with_context(|| format!("reconnect DNS-over-TCP after {first_err:#}"))?;
+            let response = fresh.query(payload, deadline)?;
             *dns_tcp = Some(fresh);
             Ok(response)
         }
@@ -4525,7 +4500,7 @@ mod tests {
     fn test_config(enable_dns: bool) -> EffectiveConfig {
         EffectiveConfig {
             proxy: crate::config::ProxyConfig::Socks5 {
-                addr: "127.0.0.1:1080".to_string(),
+                endpoint: crate::config::ProxyEndpoint::new("127.0.0.1:1080".to_string()),
                 username: None,
                 password: None,
             },

@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -75,13 +77,19 @@ pub struct EffectiveConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProxyConfig {
     Socks5 {
-        addr: String,
+        endpoint: ProxyEndpoint,
         username: Option<String>,
         password: Option<String>,
     },
     Http {
-        addr: String,
+        endpoint: ProxyEndpoint,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyEndpoint {
+    authority: String,
+    addrs: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,17 +125,21 @@ impl EffectiveConfig {
             None => FileConfig::default(),
         };
 
-        let proxy_raw = cli
-            .proxy
-            .or(file_cfg.proxy)
-            .unwrap_or_else(|| "socks5://127.0.0.1:1080".to_string());
-        let proxy = ProxyConfig::parse(&proxy_raw)?;
-
         let connect_timeout = match cli.connect_timeout.or(file_cfg.connect_timeout) {
             Some(s) => humantime::parse_duration(&s)
                 .with_context(|| format!("parse connect timeout {s:?}"))?,
             None => Duration::from_secs(10),
         };
+        if connect_timeout.is_zero() {
+            bail!("connect timeout must be greater than zero");
+        }
+
+        let proxy_raw = cli
+            .proxy
+            .or(file_cfg.proxy)
+            .unwrap_or_else(|| "socks5://127.0.0.1:1080".to_string());
+        let mut proxy = ProxyConfig::parse(&proxy_raw)?;
+        proxy.resolve(connect_timeout)?;
 
         let mut bypass_cidrs = file_cfg.bypass_cidrs.unwrap_or_default();
         bypass_cidrs.extend(cli.bypass_cidrs);
@@ -210,7 +222,7 @@ impl ProxyConfig {
         if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
             bail!("proxy URL must not contain a path, query, or fragment");
         }
-        let addr = format_host_port(host, port);
+        let endpoint = ProxyEndpoint::new(format_host_port(host, port));
 
         match url.scheme() {
             "socks5" | "socks5h" => {
@@ -221,7 +233,7 @@ impl ProxyConfig {
                 };
                 let password = url.password().map(ToOwned::to_owned);
                 Ok(Self::Socks5 {
-                    addr,
+                    endpoint,
                     username,
                     password,
                 })
@@ -230,10 +242,72 @@ impl ProxyConfig {
                 if !url.username().is_empty() || url.password().is_some() {
                     bail!("HTTP proxy authentication is not implemented in the first release");
                 }
-                Ok(Self::Http { addr })
+                Ok(Self::Http { endpoint })
             }
             other => bail!("unsupported proxy scheme {other:?}; use socks5:// or http://"),
         }
+    }
+
+    pub fn endpoint(&self) -> &ProxyEndpoint {
+        match self {
+            Self::Socks5 { endpoint, .. } | Self::Http { endpoint } => endpoint,
+        }
+    }
+
+    fn resolve(&mut self, timeout: Duration) -> Result<()> {
+        let endpoint = match self {
+            Self::Socks5 { endpoint, .. } | Self::Http { endpoint } => endpoint,
+        };
+        endpoint.resolve(timeout)
+    }
+}
+
+impl ProxyEndpoint {
+    pub(crate) fn new(authority: String) -> Self {
+        let addrs = authority.parse().into_iter().collect();
+        Self { authority, addrs }
+    }
+
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
+
+    fn resolve(&mut self, timeout: Duration) -> Result<()> {
+        if !self.addrs.is_empty() {
+            return Ok(());
+        }
+
+        let authority = self.authority.clone();
+        let resolver_authority = authority.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("yatht-proxy-resolver".to_string())
+            .spawn(move || {
+                let result = resolver_authority
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.collect::<Vec<_>>());
+                let _ = tx.send(result);
+            })
+            .context("spawn proxy resolver")?;
+
+        let addrs = match rx.recv_timeout(timeout) {
+            Ok(result) => result.with_context(|| format!("resolve proxy {authority}"))?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("resolving proxy {authority:?} exceeded {timeout:?}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("proxy resolver stopped before resolving {authority:?}")
+            }
+        };
+        if addrs.is_empty() {
+            bail!("proxy {authority:?} resolved to no addresses");
+        }
+        self.addrs = addrs;
+        Ok(())
     }
 }
 
@@ -286,7 +360,7 @@ mod tests {
         assert_eq!(
             got,
             ProxyConfig::Socks5 {
-                addr: "127.0.0.1:1080".to_string(),
+                endpoint: ProxyEndpoint::new("127.0.0.1:1080".to_string()),
                 username: Some("user".to_string()),
                 password: Some("pass".to_string()),
             }
@@ -326,6 +400,17 @@ mod tests {
 
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("greater than zero"), "{err}");
+    }
+
+    #[test]
+    fn resolves_and_caches_proxy_hostname_addresses() {
+        let mut endpoint = ProxyEndpoint::new("localhost:1080".to_string());
+        assert!(endpoint.addrs().is_empty());
+
+        endpoint.resolve(Duration::from_secs(2)).unwrap();
+
+        assert!(!endpoint.addrs().is_empty());
+        assert!(endpoint.addrs().iter().all(|addr| addr.port() == 1080));
     }
 
     #[test]

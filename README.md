@@ -79,7 +79,9 @@ Important options:
 - `--bypass-cidr <CIDR>`: direct-route matching destinations; repeatable.
 - `--proxy-cidr <CIDR>`: proxy only matching destinations; repeatable.
 - `--proxy-local`: proxy local/private/link-local destinations too.
-- `--connect-timeout <duration>`: proxy connection timeout, default `10s`.
+- `--connect-timeout <duration>`: absolute proxy setup deadline covering each
+  flow's address attempts and protocol handshake, default `10s`. Proxy DNS is
+  resolved once at startup under the same bounded duration.
 - `--enable-dns`: redirect UDP/53 through DNS-over-TCP.
 - `--enable-udp`: redirect generic UDP through SOCKS5 UDP ASSOCIATE.
 - `--dns-server <addr>`: DNS-over-TCP upstream for `--enable-dns`.

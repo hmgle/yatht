@@ -28,7 +28,7 @@ Options:
   --bypass-cidr <CIDR>            CIDR that bypasses the proxy; repeatable
   --proxy-cidr <CIDR>             CIDR allow-list for proxying; repeatable
   --proxy-local                   Proxy local/private destinations too
-  --connect-timeout <duration>    Proxy connection timeout, default 10s
+  --connect-timeout <duration>    Absolute proxy setup deadline, default 10s
   --enable-dns                    Redirect UDP/53 through DNS-over-TCP
   --enable-udp                    Redirect generic UDP through SOCKS5 UDP ASSOCIATE
   --dns-server <addr>             DNS-over-TCP upstream, default 1.1.1.1:53
@@ -103,6 +103,10 @@ is `socks5://127.0.0.1:1080`.
   demand-driven pool of at most 16 pre-established proxy sessions with a 30 s
   idle timeout; each warm session serves one flow and misses fall back to
   cold dials.
+- Proxy endpoint DNS is resolved once during configuration loading under the
+  configured timeout and reused by cold and warm paths. Each flow has one
+  absolute setup deadline across all candidate-address connection attempts,
+  proxy protocol reads/writes, warm completion, and any safe cold fallback.
 - Before proxy setup, the broker reserves an active-flow permit. The default
   ceiling is 16,384 flows and is reduced from `RLIMIT_NOFILE` after preserving
   the larger of 20% or 256 fds, plus setup-worker headroom. Registration has a

@@ -2,18 +2,16 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, ProxyEndpoint};
 use crate::supervisor::Destination;
 
 pub mod warm;
-
-pub fn dial(proxy: &ProxyConfig, dest: Destination, timeout: Duration) -> Result<TcpStream> {
-    dial_with_timings(proxy, dest, timeout, &mut DialTimings::default())
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DialTimings {
@@ -21,26 +19,62 @@ pub struct DialTimings {
     pub handshake: Option<Duration>,
 }
 
-pub fn dial_with_timings(
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl Deadline {
+    pub fn after(timeout: Duration) -> Self {
+        Self::from_start(Instant::now(), timeout)
+    }
+
+    pub fn from_start(start: Instant, timeout: Duration) -> Self {
+        Self {
+            started: start,
+            timeout,
+        }
+    }
+
+    fn remaining(self) -> io::Result<Duration> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "proxy deadline exceeded"))
+    }
+
+    pub(crate) fn set_read_timeout(self, stream: &TcpStream) -> io::Result<()> {
+        stream.set_read_timeout(Some(self.remaining()?))
+    }
+
+    pub(crate) fn set_write_timeout(self, stream: &TcpStream) -> io::Result<()> {
+        stream.set_write_timeout(Some(self.remaining()?))
+    }
+}
+
+pub fn dial_with_deadline(
     proxy: &ProxyConfig,
     dest: Destination,
-    timeout: Duration,
+    deadline: Deadline,
     timings: &mut DialTimings,
 ) -> Result<TcpStream> {
     match proxy {
         ProxyConfig::Socks5 {
-            addr,
+            endpoint,
             username,
             password,
         } => dial_socks5_with_timings(
-            addr,
+            endpoint,
             username.as_deref(),
             password.as_deref(),
             dest,
-            timeout,
+            deadline,
             timings,
         ),
-        ProxyConfig::Http { addr } => dial_http_connect_with_timings(addr, dest, timeout, timings),
+        ProxyConfig::Http { endpoint } => {
+            dial_http_connect_with_timings(endpoint, dest, deadline, timings)
+        }
     }
 }
 
@@ -52,32 +86,34 @@ impl DnsTcpConnection {
     pub fn connect(
         proxy: &ProxyConfig,
         dns_server: Destination,
-        timeout: Duration,
+        deadline: Deadline,
     ) -> Result<Self> {
-        let stream = dial(proxy, dns_server, timeout)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
+        let stream = dial_with_deadline(proxy, dns_server, deadline, &mut DialTimings::default())?;
         Ok(Self { stream })
     }
 
-    pub fn query(&mut self, query: &[u8]) -> Result<Vec<u8>> {
-        dns_query_over_stream(&mut self.stream, query)
+    pub fn query(&mut self, query: &[u8], deadline: Deadline) -> Result<Vec<u8>> {
+        dns_query_over_stream(&mut self.stream, query, deadline)
     }
 }
 
-fn dns_query_over_stream(stream: &mut TcpStream, query: &[u8]) -> Result<Vec<u8>> {
+fn dns_query_over_stream(
+    stream: &mut TcpStream,
+    query: &[u8],
+    deadline: Deadline,
+) -> Result<Vec<u8>> {
     if query.len() > u16::MAX as usize {
         bail!("DNS query is too large");
     }
 
-    stream.write_all(&(query.len() as u16).to_be_bytes())?;
-    stream.write_all(query)?;
+    write_all_with_deadline(stream, &(query.len() as u16).to_be_bytes(), deadline)?;
+    write_all_with_deadline(stream, query, deadline)?;
 
     let mut len_buf = [0_u8; 2];
-    stream.read_exact(&mut len_buf)?;
+    read_exact_with_deadline(stream, &mut len_buf, deadline)?;
     let response_len = u16::from_be_bytes(len_buf) as usize;
     let mut response = vec![0_u8; response_len];
-    stream.read_exact(&mut response)?;
+    read_exact_with_deadline(stream, &mut response, deadline)?;
     Ok(response)
 }
 
@@ -88,9 +124,9 @@ pub struct Socks5UdpAssociation {
 }
 
 impl Socks5UdpAssociation {
-    pub fn connect(proxy: &ProxyConfig, timeout: Duration) -> Result<Self> {
+    pub fn connect(proxy: &ProxyConfig, deadline: Deadline) -> Result<Self> {
         let ProxyConfig::Socks5 {
-            addr,
+            endpoint,
             username,
             password,
         } = proxy
@@ -98,14 +134,21 @@ impl Socks5UdpAssociation {
             bail!("generic UDP redirection requires a SOCKS5 proxy");
         };
 
-        let mut control = connect_with_timeout(addr, timeout)
-            .with_context(|| format!("connect SOCKS5 proxy {addr}"))?;
-        control.set_read_timeout(Some(timeout))?;
-        control.set_write_timeout(Some(timeout))?;
-        socks5_greet(&mut control, username.as_deref(), password.as_deref())?;
+        let mut control = connect_with_deadline(endpoint, deadline)
+            .with_context(|| format!("connect SOCKS5 proxy {}", endpoint.authority()))?;
+        socks5_greet(
+            &mut control,
+            username.as_deref(),
+            password.as_deref(),
+            deadline,
+        )?;
 
-        control.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
-        let relay = read_socks5_reply_addr(&mut control)?;
+        write_all_with_deadline(
+            &mut control,
+            &[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0],
+            deadline,
+        )?;
+        let relay = read_socks5_reply_addr(&mut control, deadline)?;
         let relay = normalize_relay_addr(relay, control.peer_addr()?);
         let bind = if relay.is_ipv4() {
             "0.0.0.0:0"
@@ -114,8 +157,6 @@ impl Socks5UdpAssociation {
         };
         let udp = UdpSocket::bind(bind)?;
         udp.connect(relay)?;
-        udp.set_read_timeout(Some(timeout))?;
-        udp.set_write_timeout(Some(timeout))?;
 
         Ok(Self {
             _control: control,
@@ -124,10 +165,17 @@ impl Socks5UdpAssociation {
         })
     }
 
-    pub fn send_datagram(&mut self, dest: Destination, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn send_datagram(
+        &mut self,
+        dest: Destination,
+        payload: &[u8],
+        deadline: Deadline,
+    ) -> Result<Option<Vec<u8>>> {
         let packet = encode_socks5_udp(dest, payload)?;
+        self.udp.set_write_timeout(Some(deadline.remaining()?))?;
         self.udp.send(&packet)?;
 
+        self.udp.set_read_timeout(Some(deadline.remaining()?))?;
         match self.udp.recv(&mut self.recv_buf) {
             Ok(n) => Ok(Some(
                 decode_socks5_udp_payload(&self.recv_buf[..n])?.to_vec(),
@@ -144,24 +192,23 @@ impl Socks5UdpAssociation {
 }
 
 fn dial_socks5_with_timings(
-    proxy_addr: &str,
+    endpoint: &ProxyEndpoint,
     username: Option<&str>,
     password: Option<&str>,
     dest: Destination,
-    timeout: Duration,
+    deadline: Deadline,
     timings: &mut DialTimings,
 ) -> Result<TcpStream> {
     let connect_started = Instant::now();
-    let connected = connect_with_timeout(proxy_addr, timeout);
+    let connected = connect_with_deadline(endpoint, deadline);
     timings.connect = Some(connect_started.elapsed());
-    let mut stream = connected.with_context(|| format!("connect SOCKS5 proxy {proxy_addr}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let mut stream =
+        connected.with_context(|| format!("connect SOCKS5 proxy {}", endpoint.authority()))?;
 
     let handshake_started = Instant::now();
     let result: Result<()> = (|| {
-        socks5_greet(&mut stream, username, password)?;
-        socks5_request(&mut stream, dest)?;
+        socks5_greet(&mut stream, username, password, deadline)?;
+        socks5_request(&mut stream, dest, deadline)?;
         clear_handshake_timeouts(&stream)?;
         Ok(())
     })();
@@ -238,38 +285,52 @@ fn socks5_greet(
     stream: &mut TcpStream,
     username: Option<&str>,
     password: Option<&str>,
+    deadline: Deadline,
 ) -> Result<()> {
     let with_auth = username.is_some() || password.is_some();
-    stream.write_all(&socks5_greeting_frame(with_auth))?;
+    write_all_with_deadline(stream, &socks5_greeting_frame(with_auth), deadline)?;
 
     let mut method_resp = [0_u8; 2];
-    stream.read_exact(&mut method_resp)?;
+    read_exact_with_deadline(stream, &mut method_resp, deadline)?;
     if parse_socks5_method_reply(method_resp)? == SOCKS5_METHOD_USER_PASS {
-        authenticate_socks5(stream, username.unwrap_or(""), password.unwrap_or(""))?;
+        authenticate_socks5(
+            stream,
+            username.unwrap_or(""),
+            password.unwrap_or(""),
+            deadline,
+        )?;
     }
     Ok(())
 }
 
-fn authenticate_socks5(stream: &mut TcpStream, username: &str, password: &str) -> Result<()> {
-    stream.write_all(&socks5_auth_frame(username, password)?)?;
+fn authenticate_socks5(
+    stream: &mut TcpStream,
+    username: &str,
+    password: &str,
+    deadline: Deadline,
+) -> Result<()> {
+    write_all_with_deadline(stream, &socks5_auth_frame(username, password)?, deadline)?;
 
     let mut resp = [0_u8; 2];
-    stream.read_exact(&mut resp)?;
+    read_exact_with_deadline(stream, &mut resp, deadline)?;
     parse_socks5_auth_reply(resp)
 }
 
 /// Sends the CONNECT request on a stream whose greeting/auth already
 /// completed and consumes the proxy reply. Shared by the cold dial path and
 /// warm-session lease completion.
-fn socks5_request(stream: &mut TcpStream, dest: Destination) -> Result<()> {
-    stream.write_all(&socks5_connect_request_frame(dest))?;
-    let _ = read_socks5_reply_addr(stream)?;
+fn socks5_request(stream: &mut TcpStream, dest: Destination, deadline: Deadline) -> Result<()> {
+    write_all_with_deadline(stream, &socks5_connect_request_frame(dest), deadline)?;
+    let _ = read_socks5_reply_addr(stream, deadline)?;
     Ok(())
 }
 
-fn read_socks5_reply_addr(stream: &mut TcpStream) -> Result<SocketAddr> {
+pub(crate) fn read_socks5_reply_addr(
+    stream: &mut TcpStream,
+    deadline: Deadline,
+) -> Result<SocketAddr> {
     let mut head = [0_u8; 4];
-    stream.read_exact(&mut head)?;
+    read_exact_with_deadline(stream, &mut head, deadline)?;
     if head[0] != 0x05 {
         bail!("bad SOCKS5 response version {}", head[0]);
     }
@@ -280,32 +341,29 @@ fn read_socks5_reply_addr(stream: &mut TcpStream) -> Result<SocketAddr> {
     let ip = match head[3] {
         0x01 => {
             let mut octets = [0_u8; 4];
-            stream.read_exact(&mut octets)?;
+            read_exact_with_deadline(stream, &mut octets, deadline)?;
             IpAddr::V4(Ipv4Addr::from(octets))
         }
         0x03 => {
             let mut len = [0_u8; 1];
-            stream.read_exact(&mut len)?;
+            read_exact_with_deadline(stream, &mut len, deadline)?;
             let mut name = vec![0_u8; len[0] as usize];
-            stream.read_exact(&mut name)?;
+            read_exact_with_deadline(stream, &mut name, deadline)?;
             let host = String::from_utf8(name).context("SOCKS5 relay domain is not UTF-8")?;
             let mut port_buf = [0_u8; 2];
-            stream.read_exact(&mut port_buf)?;
+            read_exact_with_deadline(stream, &mut port_buf, deadline)?;
             let port = u16::from_be_bytes(port_buf);
-            return (host.as_str(), port)
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| anyhow!("SOCKS5 relay domain resolved to no addresses"));
+            return resolve_one_with_deadline(format_host_port(&host, port), deadline);
         }
         0x04 => {
             let mut octets = [0_u8; 16];
-            stream.read_exact(&mut octets)?;
+            read_exact_with_deadline(stream, &mut octets, deadline)?;
             IpAddr::V6(Ipv6Addr::from(octets))
         }
         atyp => bail!("bad SOCKS5 bind address type {atyp:#x}"),
     };
     let mut port = [0_u8; 2];
-    stream.read_exact(&mut port)?;
+    read_exact_with_deadline(stream, &mut port, deadline)?;
     Ok(SocketAddr::new(ip, u16::from_be_bytes(port)))
 }
 
@@ -361,21 +419,20 @@ fn decode_socks5_udp_payload(packet: &[u8]) -> Result<&[u8]> {
 }
 
 fn dial_http_connect_with_timings(
-    proxy_addr: &str,
+    endpoint: &ProxyEndpoint,
     dest: Destination,
-    timeout: Duration,
+    deadline: Deadline,
     timings: &mut DialTimings,
 ) -> Result<TcpStream> {
     let connect_started = Instant::now();
-    let connected = connect_with_timeout(proxy_addr, timeout);
+    let connected = connect_with_deadline(endpoint, deadline);
     timings.connect = Some(connect_started.elapsed());
-    let mut stream = connected.with_context(|| format!("connect HTTP proxy {proxy_addr}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let mut stream =
+        connected.with_context(|| format!("connect HTTP proxy {}", endpoint.authority()))?;
 
     let handshake_started = Instant::now();
     let result: Result<()> = (|| {
-        http_connect_request(&mut stream, dest)?;
+        http_connect_request(&mut stream, dest, deadline)?;
         clear_handshake_timeouts(&stream)?;
         Ok(())
     })();
@@ -387,9 +444,13 @@ fn dial_http_connect_with_timings(
 /// Sends the CONNECT request on an established HTTP proxy connection and
 /// consumes the response header. Shared by the cold dial path and
 /// warm-session lease completion.
-fn http_connect_request(stream: &mut TcpStream, dest: Destination) -> Result<()> {
-    stream.write_all(http_connect_frame(dest).as_bytes())?;
-    http_connect_read_reply(stream)
+fn http_connect_request(
+    stream: &mut TcpStream,
+    dest: Destination,
+    deadline: Deadline,
+) -> Result<()> {
+    write_all_with_deadline(stream, http_connect_frame(dest).as_bytes(), deadline)?;
+    http_connect_read_reply(stream, deadline)
 }
 
 fn http_connect_frame(dest: Destination) -> String {
@@ -399,24 +460,39 @@ fn http_connect_frame(dest: Destination) -> String {
     )
 }
 
-fn http_connect_read_reply(stream: &mut TcpStream) -> Result<()> {
+pub(crate) fn http_connect_read_reply(stream: &mut TcpStream, deadline: Deadline) -> Result<()> {
     let mut buf = Vec::with_capacity(1024);
-    let mut byte = [0_u8; 1];
-    while !buf.ends_with(b"\r\n\r\n") {
-        if buf.len() >= 8192 {
-            bail!("HTTP proxy response header too large");
-        }
-        let n = stream.read(&mut byte)?;
+    let mut peeked = [0_u8; 8192];
+    loop {
+        deadline.set_read_timeout(stream)?;
+        let n = stream.peek(&mut peeked[..8192 - buf.len()])?;
         if n == 0 {
-            // An I/O error so warm-lease completion classifies the clean
-            // close as a transport death, not a proxy refusal.
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "HTTP proxy closed before completing CONNECT response",
             )
             .into());
         }
-        buf.push(byte[0]);
+
+        let boundary_start = buf.len().saturating_sub(3);
+        let mut boundary = Vec::with_capacity(buf.len() - boundary_start + n);
+        boundary.extend_from_slice(&buf[boundary_start..]);
+        boundary.extend_from_slice(&peeked[..n]);
+        if let Some(offset) = find_bytes(&boundary, b"\r\n\r\n") {
+            let header_end = boundary_start + offset + 4;
+            let old_len = buf.len();
+            buf.resize(header_end, 0);
+            read_exact_with_deadline(stream, &mut buf[old_len..], deadline)?;
+            break;
+        }
+
+        if buf.len() + n >= 8192 {
+            bail!("HTTP proxy response header too large");
+        }
+
+        let old_len = buf.len();
+        buf.resize(old_len + n, 0);
+        read_exact_with_deadline(stream, &mut buf[old_len..], deadline)?;
     }
 
     let header = String::from_utf8_lossy(&buf);
@@ -442,24 +518,90 @@ fn clear_handshake_timeouts(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
-fn connect_with_timeout(addr: &str, timeout: Duration) -> Result<TcpStream> {
-    if let Ok(sockaddr) = addr.parse::<SocketAddr>() {
-        return TcpStream::connect_timeout(&sockaddr, timeout).map_err(Into::into);
-    }
-
-    let addrs = addr
-        .to_socket_addrs()
-        .with_context(|| format!("resolve {addr}"))?;
+fn connect_with_deadline(endpoint: &ProxyEndpoint, deadline: Deadline) -> Result<TcpStream> {
     let mut last_err = None;
-    for sockaddr in addrs {
-        match TcpStream::connect_timeout(&sockaddr, timeout) {
+    for sockaddr in endpoint.addrs() {
+        match TcpStream::connect_timeout(sockaddr, deadline.remaining()?) {
             Ok(stream) => return Ok(stream),
             Err(err) => last_err = Some(err),
         }
     }
     Err(last_err
         .map(Into::into)
-        .unwrap_or_else(|| anyhow!("no socket addresses resolved for {addr}")))
+        .unwrap_or_else(|| anyhow!("no socket addresses resolved for {}", endpoint.authority())))
+}
+
+fn read_exact_with_deadline(
+    stream: &mut TcpStream,
+    mut buf: &mut [u8],
+    deadline: Deadline,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        deadline.set_read_timeout(stream)?;
+        match stream.read(buf) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) => buf = &mut buf[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_all_with_deadline(
+    stream: &mut TcpStream,
+    mut buf: &[u8],
+    deadline: Deadline,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        deadline.set_write_timeout(stream)?;
+        match stream.write(buf) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => buf = &buf[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn resolve_one_with_deadline(authority: String, deadline: Deadline) -> Result<SocketAddr> {
+    let resolver_authority = authority.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("yatht-socks-relay-resolver".to_string())
+        .spawn(move || {
+            let result = resolver_authority
+                .to_socket_addrs()
+                .map(|mut addrs| addrs.next());
+            let _ = tx.send(result);
+        })
+        .context("spawn SOCKS5 relay resolver")?;
+    match rx.recv_timeout(deadline.remaining()?) {
+        Ok(Ok(Some(addr))) => Ok(addr),
+        Ok(Ok(None)) => bail!("SOCKS5 relay domain resolved to no addresses"),
+        Ok(Err(err)) => Err(err).context("resolve SOCKS5 relay domain"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "proxy deadline exceeded").into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("SOCKS5 relay resolver stopped before producing a result")
+        }
+    }
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -480,18 +622,19 @@ mod tests {
             let mut first = String::new();
             reader.read_line(&mut first).unwrap();
             assert_eq!(first.trim_end(), "CONNECT 203.0.113.1:443 HTTP/1.1");
-            conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\ntunnel")
                 .unwrap();
         });
 
         let mut timings = DialTimings::default();
-        let stream = dial_http_connect_with_timings(
-            &addr.to_string(),
+        let endpoint = ProxyEndpoint::new(addr.to_string());
+        let mut stream = dial_http_connect_with_timings(
+            &endpoint,
             Destination {
                 ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
                 port: 443,
             },
-            Duration::from_secs(2),
+            Deadline::after(Duration::from_secs(2)),
             &mut timings,
         )
         .unwrap();
@@ -499,7 +642,50 @@ mod tests {
         assert!(timings.handshake.is_some());
         assert_eq!(stream.read_timeout().unwrap(), None);
         assert_eq!(stream.write_timeout().unwrap(), None);
+        let mut tunnel = [0_u8; 6];
+        stream.read_exact(&mut tunnel).unwrap();
+        assert_eq!(&tunnel, b"tunnel");
         drop(stream);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_connect_slow_drip_cannot_extend_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() != 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            for byte in b"HTTP/1.1 200" {
+                if conn.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+
+        let endpoint = ProxyEndpoint::new(addr.to_string());
+        let started = Instant::now();
+        let result = dial_http_connect_with_timings(
+            &endpoint,
+            Destination {
+                ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                port: 443,
+            },
+            Deadline::after(Duration::from_millis(120)),
+            &mut DialTimings::default(),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(350), "elapsed={elapsed:?}");
         handle.join().unwrap();
     }
 
@@ -521,15 +707,16 @@ mod tests {
         });
 
         let mut timings = DialTimings::default();
+        let endpoint = ProxyEndpoint::new(addr.to_string());
         let stream = dial_socks5_with_timings(
-            &addr.to_string(),
+            &endpoint,
             None,
             None,
             Destination {
                 ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
                 port: 443,
             },
-            Duration::from_secs(2),
+            Deadline::after(Duration::from_secs(2)),
             &mut timings,
         )
         .unwrap();

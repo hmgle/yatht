@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,8 @@ use crate::supervisor::Destination;
 use super::{
     clear_handshake_timeouts, http_connect_frame, http_connect_read_reply, parse_socks5_auth_reply,
     parse_socks5_method_reply, read_socks5_reply_addr, socks5_auth_frame,
-    socks5_connect_request_frame, socks5_greeting_frame, DialTimings, SOCKS5_METHOD_USER_PASS,
+    socks5_connect_request_frame, socks5_greeting_frame, Deadline, DialTimings,
+    SOCKS5_METHOD_USER_PASS,
 };
 
 // Internal selector for the proxy session source; cold (dial per flow) stays
@@ -339,37 +340,30 @@ fn classify_reply_failure(err: anyhow::Error) -> WarmCompletionError {
 }
 
 /// Finishes the tunnel on a leased warm session: sends the CONNECT request
-/// and consumes the proxy reply. The stream is blocking; `timeout` is the
-/// remainder of the flow's original connect deadline. `timings.connect`
+/// and consumes the proxy reply. The stream is blocking; `deadline` is the
+/// flow's original absolute connect deadline. `timings.connect`
 /// stays `None` because no proxy TCP connect happened on this flow.
 pub fn complete_warm_lease(
     proxy: &ProxyConfig,
     mut stream: TcpStream,
     dest: Destination,
-    timeout: Duration,
+    deadline: Deadline,
     timings: &mut DialTimings,
 ) -> std::result::Result<TcpStream, WarmCompletionError> {
     let handshake_started = Instant::now();
     let result = (|| {
-        stream
-            .set_read_timeout(Some(timeout))
-            .context("set warm session read timeout")
-            .map_err(WarmCompletionError::SessionDied)?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .context("set warm session write timeout")
-            .map_err(WarmCompletionError::SessionDied)?;
         let frame = match proxy {
             ProxyConfig::Socks5 { .. } => socks5_connect_request_frame(dest),
             ProxyConfig::Http { .. } => http_connect_frame(dest).into_bytes(),
         };
-        write_all_tracked(&mut stream, &frame)?;
+        write_all_tracked(&mut stream, &frame, deadline)?;
         match proxy {
             ProxyConfig::Socks5 { .. } => {
-                let _ = read_socks5_reply_addr(&mut stream).map_err(classify_reply_failure)?;
+                let _ = read_socks5_reply_addr(&mut stream, deadline)
+                    .map_err(classify_reply_failure)?;
             }
             ProxyConfig::Http { .. } => {
-                http_connect_read_reply(&mut stream).map_err(classify_reply_failure)?;
+                http_connect_read_reply(&mut stream, deadline).map_err(classify_reply_failure)?;
             }
         }
         clear_handshake_timeouts(&stream)
@@ -384,9 +378,20 @@ pub fn complete_warm_lease(
 fn write_all_tracked(
     stream: &mut TcpStream,
     frame: &[u8],
+    deadline: Deadline,
 ) -> std::result::Result<(), WarmCompletionError> {
     let mut sent = 0;
     while sent < frame.len() {
+        deadline
+            .set_write_timeout(stream)
+            .context("set warm session write deadline")
+            .map_err(|err| {
+                if sent == 0 {
+                    WarmCompletionError::NothingSent(err)
+                } else {
+                    WarmCompletionError::SessionDied(err)
+                }
+            })?;
         match stream.write(&frame[sent..]) {
             Ok(0) => {
                 let err = anyhow!("warm proxy session accepted no request bytes");
@@ -450,26 +455,35 @@ struct Warmup {
 }
 
 impl Warmup {
-    fn start(proxy: &ProxyConfig, attempt_timeout: Duration) -> io::Result<Self> {
-        let (endpoint, auth) = match proxy {
+    fn start(
+        proxy: &ProxyConfig,
+        attempt_timeout: Duration,
+        endpoint_index: usize,
+    ) -> io::Result<Self> {
+        let auth = match proxy {
             ProxyConfig::Socks5 {
-                addr,
-                username,
-                password,
+                username, password, ..
             } => {
-                let auth = if username.is_some() || password.is_some() {
+                if username.is_some() || password.is_some() {
                     Some((
                         username.clone().unwrap_or_default(),
                         password.clone().unwrap_or_default(),
                     ))
                 } else {
                     None
-                };
-                (addr, auth)
+                }
             }
-            ProxyConfig::Http { addr } => (addr, None),
+            ProxyConfig::Http { .. } => None,
         };
-        let addr = resolve_first(endpoint)?;
+        let addrs = proxy.endpoint().addrs();
+        let addr = if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "proxy endpoint resolved to no addresses",
+            ));
+        } else {
+            addrs[endpoint_index % addrs.len()]
+        };
         let stream = nonblocking_connect(addr)?;
         Ok(Self {
             stream,
@@ -629,6 +643,7 @@ impl ReplenishBackoff {
 fn replenisher_loop(inner: Arc<PoolInner>) {
     let mut inflight: Vec<Warmup> = Vec::new();
     let mut backoff = ReplenishBackoff::new();
+    let mut next_endpoint = 0;
     while !inner.shutting_down.load(Ordering::Acquire) {
         let now = Instant::now();
         sweep_expired_idle(&inner, now);
@@ -647,8 +662,11 @@ fn replenisher_loop(inner: Arc<PoolInner>) {
             && idle_len + inflight.len() < target
             && backoff.ready(now)
         {
-            match Warmup::start(&inner.proxy, inner.attempt_timeout) {
-                Ok(warmup) => inflight.push(warmup),
+            match Warmup::start(&inner.proxy, inner.attempt_timeout, next_endpoint) {
+                Ok(warmup) => {
+                    next_endpoint = next_endpoint.wrapping_add(1);
+                    inflight.push(warmup);
+                }
                 Err(_) => {
                     inner
                         .stats
@@ -746,18 +764,6 @@ fn sweep_expired_idle(inner: &PoolInner, now: Instant) {
     if dropped > 0 {
         inner.stats.expired.fetch_add(dropped, Ordering::Relaxed);
     }
-}
-
-fn resolve_first(endpoint: &str) -> io::Result<SocketAddr> {
-    if let Ok(addr) = endpoint.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    endpoint.to_socket_addrs()?.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "proxy endpoint resolved to no addresses",
-        )
-    })
 }
 
 fn nonblocking_connect(addr: SocketAddr) -> io::Result<TcpStream> {
@@ -874,7 +880,7 @@ mod tests {
 
     fn socks5_config(addr: &SocketAddr, auth: bool) -> ProxyConfig {
         ProxyConfig::Socks5 {
-            addr: addr.to_string(),
+            endpoint: crate::config::ProxyEndpoint::new(addr.to_string()),
             username: auth.then(|| "user".to_string()),
             password: auth.then(|| "pass".to_string()),
         }
@@ -1008,7 +1014,7 @@ mod tests {
             &socks5_config(&addr, false),
             leased,
             TEST_DEST,
-            Duration::from_secs(2),
+            Deadline::after(Duration::from_secs(2)),
             &mut timings,
         )
         .unwrap_or_else(|err| panic!("warm completion failed: {err:?}"));
@@ -1047,7 +1053,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let pool = WarmSessionPool::start(
             ProxyConfig::Http {
-                addr: addr.to_string(),
+                endpoint: crate::config::ProxyEndpoint::new(addr.to_string()),
             },
             Duration::from_secs(2),
         )
@@ -1075,11 +1081,11 @@ mod tests {
         let mut timings = DialTimings::default();
         let stream = complete_warm_lease(
             &ProxyConfig::Http {
-                addr: addr.to_string(),
+                endpoint: crate::config::ProxyEndpoint::new(addr.to_string()),
             },
             leased,
             TEST_DEST,
-            Duration::from_secs(2),
+            Deadline::after(Duration::from_secs(2)),
             &mut timings,
         )
         .unwrap_or_else(|err| panic!("warm HTTP completion failed: {err:?}"));
@@ -1196,7 +1202,7 @@ mod tests {
             &socks5_config(&addr, false),
             client,
             TEST_DEST,
-            Duration::from_secs(1),
+            Deadline::after(Duration::from_secs(1)),
             &mut timings,
         );
         match result {
@@ -1233,7 +1239,7 @@ mod tests {
             &socks5_config(&addr, false),
             client,
             TEST_DEST,
-            Duration::from_secs(1),
+            Deadline::after(Duration::from_secs(1)),
             &mut timings,
         );
         responder.join().unwrap();
@@ -1274,11 +1280,11 @@ mod tests {
         let mut timings = DialTimings::default();
         let result = complete_warm_lease(
             &ProxyConfig::Http {
-                addr: addr.to_string(),
+                endpoint: crate::config::ProxyEndpoint::new(addr.to_string()),
             },
             client,
             TEST_DEST,
-            Duration::from_secs(1),
+            Deadline::after(Duration::from_secs(1)),
             &mut timings,
         );
         responder.join().unwrap();
@@ -1317,7 +1323,7 @@ mod tests {
             &socks5_config(&addr, false),
             client,
             TEST_DEST,
-            Duration::from_secs(1),
+            Deadline::after(Duration::from_secs(1)),
             &mut timings,
         );
         responder.join().unwrap();
