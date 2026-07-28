@@ -160,6 +160,10 @@ pub fn is_child_stage() -> bool {
     std::env::var_os(CHILD_STAGE_ENV).is_some()
 }
 
+pub fn verify_pidfd_thread_support() -> io::Result<()> {
+    pidfd_open(std::process::id(), libc::PIDFD_THREAD).map(drop)
+}
+
 pub fn run(cfg: EffectiveConfig) -> Result<i32> {
     if cfg.command.is_empty() {
         bail!("missing command");
@@ -2264,13 +2268,7 @@ fn cached_thread_group_id(pid: u32) -> io::Result<u32> {
         }
     }
 
-    let pidfd = match pidfd_open(pid, libc::PIDFD_THREAD) {
-        Ok(pidfd) => pidfd,
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-            return thread_group_id(pid);
-        }
-        Err(_) => return thread_group_id(pid),
-    };
+    let pidfd = pidfd_open(pid, libc::PIDFD_THREAD)?;
     let tgid = thread_group_id(pid)?;
 
     let mut cache = cache.lock().unwrap();
@@ -3943,11 +3941,7 @@ fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<OwnedFd> {
 }
 
 fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
-    let pidfd = match pidfd_open(pid, libc::PIDFD_THREAD) {
-        Ok(pidfd) => pidfd,
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => pidfd_open(pid, 0)?,
-        Err(err) => return Err(err),
-    };
+    let pidfd = pidfd_open(pid, libc::PIDFD_THREAD)?;
     duplicate_remote_fd_from_pidfd(pidfd.as_raw_fd(), fd)
 }
 

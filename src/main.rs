@@ -30,6 +30,8 @@ fn run_supervisor() -> Result<i32> {
     let cli = Cli::parse();
     let cfg = config::EffectiveConfig::load(cli).context("load configuration")?;
 
+    supervisor::verify_pidfd_thread_support()
+        .context("kernel does not support thread-scoped pidfds (Linux 6.9 or newer required)")?;
     seccomp::query_notif_sizes().context("kernel does not support seccomp user notification")?;
 
     supervisor::run(cfg)

@@ -3,7 +3,7 @@
 ## Development Requirements
 
 - Linux x86_64
-- Linux kernel 5.9 or newer for runtime and integration tests
+- Linux kernel 6.9 or newer for runtime and integration tests
 - Rust toolchain
 
 ## Checks

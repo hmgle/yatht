@@ -28,7 +28,7 @@ using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 ## Requirements
 
 - Linux x86_64
-- Linux kernel 5.9 or newer
+- Linux kernel 6.9 or newer (`PIDFD_THREAD` is required)
 - Rust toolchain for building from source
 - A reachable SOCKS5 or HTTP CONNECT proxy
 

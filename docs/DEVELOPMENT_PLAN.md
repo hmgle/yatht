@@ -12,8 +12,10 @@ seccomp backend is a compatibility tool, not a complete emulation of Linux
 socket semantics or a security boundary.
 
 The implementation is from-scratch Rust and targets Linux x86_64 with kernel
-5.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
-`SECCOMP_USER_NOTIF_FLAG_CONTINUE`, and `SECCOMP_IOCTL_NOTIF_ADDFD`.
+6.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
+`SECCOMP_USER_NOTIF_FLAG_CONTINUE`, `SECCOMP_IOCTL_NOTIF_ADDFD`, and
+`PIDFD_THREAD`. Startup fails before launching the target when thread-scoped
+pidfds are unavailable.
 
 ## Public Interface
 
@@ -218,7 +220,7 @@ uv run scripts/tcp_broker_benchmark.py \
   --addfd-build-command 'cargo build --release --locked'
 ```
 
-- Manual integration check on Linux x86_64/kernel >= 5.9:
+- Manual integration check on Linux x86_64/kernel >= 6.9:
 
 ```sh
 cargo build
@@ -232,7 +234,8 @@ should bypass the proxy unless `--proxy-local` is set.
 ## Deferred Work
 
 - Additional architectures such as aarch64.
-- Optional compatibility fallback for kernels older than 5.9.
+- Optional compatibility backend for kernels older than 6.9, if a current use
+  case justifies the additional fd-table semantics and maintenance cost.
 - Strict nonblocking connect completion, logical peer query virtualization, and
   general UDP socket semantics. These require the backend decisions in
   [SOCKET_SEMANTICS_ROADMAP.md](SOCKET_SEMANTICS_ROADMAP.md), not local syscall
