@@ -577,7 +577,12 @@ impl Warmup {
                     let reply = *buf;
                     match kind {
                         ReplyKind::Method => {
-                            let method = match parse_socks5_method_reply(reply) {
+                            let offered = if self.auth.is_some() {
+                                SOCKS5_METHOD_USER_PASS
+                            } else {
+                                super::SOCKS5_METHOD_NO_AUTH
+                            };
+                            let method = match parse_socks5_method_reply(reply, offered) {
                                 Ok(method) => method,
                                 Err(err) => return StepOutcome::Failed(io::Error::other(err)),
                             };

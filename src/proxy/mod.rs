@@ -233,12 +233,17 @@ fn socks5_greeting_frame(with_auth: bool) -> [u8; 3] {
 }
 
 /// Returns the proxy-selected method byte after validating the reply.
-fn parse_socks5_method_reply(reply: [u8; 2]) -> Result<u8> {
+fn parse_socks5_method_reply(reply: [u8; 2], offered: u8) -> Result<u8> {
     if reply[0] != 0x05 {
         bail!("bad SOCKS5 method response version {}", reply[0]);
     }
     match reply[1] {
-        method @ (SOCKS5_METHOD_NO_AUTH | SOCKS5_METHOD_USER_PASS) => Ok(method),
+        method @ (SOCKS5_METHOD_NO_AUTH | SOCKS5_METHOD_USER_PASS) if method == offered => {
+            Ok(method)
+        }
+        method @ (SOCKS5_METHOD_NO_AUTH | SOCKS5_METHOD_USER_PASS) => {
+            bail!("SOCKS5 proxy selected method {method:#x} that was not offered")
+        }
         0xff => bail!("SOCKS5 proxy rejected all authentication methods"),
         method => bail!("SOCKS5 proxy selected unsupported method {method:#x}"),
     }
@@ -292,7 +297,12 @@ fn socks5_greet(
 
     let mut method_resp = [0_u8; 2];
     read_exact_with_deadline(stream, &mut method_resp, deadline)?;
-    if parse_socks5_method_reply(method_resp)? == SOCKS5_METHOD_USER_PASS {
+    let offered = if with_auth {
+        SOCKS5_METHOD_USER_PASS
+    } else {
+        SOCKS5_METHOD_NO_AUTH
+    };
+    if parse_socks5_method_reply(method_resp, offered)? == SOCKS5_METHOD_USER_PASS {
         authenticate_socks5(
             stream,
             username.unwrap_or(""),
@@ -750,11 +760,18 @@ mod tests {
 
     #[test]
     fn method_reply_accepts_supported_methods_only() {
-        assert_eq!(parse_socks5_method_reply([0x05, 0x00]).unwrap(), 0x00);
-        assert_eq!(parse_socks5_method_reply([0x05, 0x02]).unwrap(), 0x02);
-        assert!(parse_socks5_method_reply([0x04, 0x00]).is_err());
-        assert!(parse_socks5_method_reply([0x05, 0xff]).is_err());
-        assert!(parse_socks5_method_reply([0x05, 0x01]).is_err());
+        assert_eq!(
+            parse_socks5_method_reply([0x05, 0x00], SOCKS5_METHOD_NO_AUTH).unwrap(),
+            0x00
+        );
+        assert_eq!(
+            parse_socks5_method_reply([0x05, 0x02], SOCKS5_METHOD_USER_PASS).unwrap(),
+            0x02
+        );
+        assert!(parse_socks5_method_reply([0x04, 0x00], SOCKS5_METHOD_NO_AUTH).is_err());
+        assert!(parse_socks5_method_reply([0x05, 0xff], SOCKS5_METHOD_NO_AUTH).is_err());
+        assert!(parse_socks5_method_reply([0x05, 0x01], SOCKS5_METHOD_NO_AUTH).is_err());
+        assert!(parse_socks5_method_reply([0x05, 0x02], SOCKS5_METHOD_NO_AUTH).is_err());
     }
 
     #[test]

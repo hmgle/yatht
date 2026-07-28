@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use ipnet::IpNet;
+use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
 
@@ -238,9 +239,13 @@ impl ProxyConfig {
                 let username = if url.username().is_empty() {
                     None
                 } else {
-                    Some(url.username().to_string())
+                    Some(decode_proxy_userinfo(url.username(), "username")?)
                 };
-                let password = url.password().map(ToOwned::to_owned);
+                let password = url
+                    .password()
+                    .map(|password| decode_proxy_userinfo(password, "password"))
+                    .transpose()?;
+                validate_socks5_credentials(username.as_deref(), password.as_deref())?;
                 Ok(Self::Socks5 {
                     endpoint,
                     username,
@@ -269,6 +274,22 @@ impl ProxyConfig {
         };
         endpoint.resolve(timeout)
     }
+}
+
+fn decode_proxy_userinfo(raw: &str, field: &str) -> Result<String> {
+    percent_decode_str(raw)
+        .decode_utf8()
+        .with_context(|| format!("SOCKS5 proxy {field} is not valid UTF-8 after URL decoding"))
+        .map(|decoded| decoded.into_owned())
+}
+
+fn validate_socks5_credentials(username: Option<&str>, password: Option<&str>) -> Result<()> {
+    if username.is_some_and(|value| value.len() > u8::MAX as usize)
+        || password.is_some_and(|value| value.len() > u8::MAX as usize)
+    {
+        bail!("SOCKS5 username/password must be <= 255 bytes after URL decoding");
+    }
+    Ok(())
 }
 
 impl ProxyEndpoint {
@@ -387,6 +408,32 @@ mod tests {
                 password: Some("pass".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn decodes_socks5_proxy_credentials() {
+        let got = ProxyConfig::parse("socks5://us%65r:p%40ss%3Aword%2Ftwo@127.0.0.1:1080").unwrap();
+
+        assert!(matches!(
+            got,
+            ProxyConfig::Socks5 {
+                username: Some(ref username),
+                password: Some(ref password),
+                ..
+            } if username == "user" && password == "p@ss:word/two"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_decoded_credentials() {
+        let invalid = ProxyConfig::parse("socks5://user:%FF@127.0.0.1:1080")
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("not valid UTF-8"), "{invalid}");
+
+        let oversized = format!("socks5://{}:pass@127.0.0.1:1080", "x".repeat(256));
+        let oversized = ProxyConfig::parse(&oversized).unwrap_err().to_string();
+        assert!(oversized.contains("<= 255 bytes"), "{oversized}");
     }
 
     #[test]

@@ -75,6 +75,7 @@ debug = false
 Important options:
 
 - `--proxy <url>`: `socks5://[user:pass@]host:port` or `http://host:port`.
+  Percent-encode reserved characters in SOCKS5 usernames and passwords.
 - `--config <path>`: TOML configuration file.
 - `--bypass-cidr <CIDR>`: direct-route matching destinations; repeatable.
 - `--proxy-cidr <CIDR>`: proxy only matching destinations; repeatable.
