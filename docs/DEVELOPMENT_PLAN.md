@@ -83,6 +83,10 @@ is `socks5://127.0.0.1:1080`.
   original syscall run unchanged. Direct non-DNS `connect(2)` notifications use
   this fast path before socket-type inspection to avoid an extra
   `pidfd_getfd(2)`/`getsockopt(2)` round trip.
+- Thread-scoped pidfds are cached by notification TID in a bounded 256-entry
+  cache and refreshed on thread exit or TID reuse. Repeated fd inspections
+  avoid a separate `pidfd_open(2)` syscall while preserving each required
+  `pidfd_getfd(2)` identity check.
 - Proxied routes duplicate the target TCP fd with `pidfd_getfd(2)`, complete the
   SOCKS5/HTTP CONNECT handshake on a separate upstream socket, then connect the
   original target open file description to a per-flow loopback listener. A

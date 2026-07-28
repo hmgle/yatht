@@ -40,7 +40,7 @@ const UDP_RELAY_THREAD_STACK_SIZE: usize = 512 * 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
 const UDP_JOB_QUEUE_CAPACITY: usize = 16;
-const TGID_CACHE_MAX_ENTRIES: usize = 256;
+const THREAD_PIDFD_CACHE_MAX_ENTRIES: usize = 256;
 const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
 const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
 const LOCAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1502,20 +1502,19 @@ fn handle_connect(
         }
     };
 
-    let target = match duplicate_remote_fd(notif.pid, target_fd) {
-        Ok(target)
-            if socket_type_from_fd(target.as_raw_fd()) == Some(libc::SOCK_STREAM)
-                && matches!(
-                    socket_domain_from_fd(target.as_raw_fd()),
-                    Some(libc::AF_INET | libc::AF_INET6)
-                ) =>
-        {
-            target
-        }
-        Ok(_) => {
-            seccomp::send_continue(listener_fd, notif.id);
-            setup.cancelled("fd_changed");
-            return;
+    let (target, target_domain) = match duplicate_remote_fd(notif.pid, target_fd) {
+        Ok(target) => {
+            let socket_type = socket_type_from_fd(target.as_raw_fd());
+            let domain = socket_domain_from_fd(target.as_raw_fd());
+            if socket_type == Some(libc::SOCK_STREAM)
+                && matches!(domain, Some(libc::AF_INET | libc::AF_INET6))
+            {
+                (target, domain.unwrap())
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+                setup.cancelled("fd_changed");
+                return;
+            }
         }
         Err(err) => {
             if cfg.debug {
@@ -1526,7 +1525,6 @@ fn handle_connect(
             return;
         }
     };
-    let target_domain = socket_domain_from_fd(target.as_raw_fd()).unwrap();
     setup.set_fd_inspection(
         fd_inspection_started.elapsed(),
         socket_cookie(target.as_raw_fd()),
@@ -2227,35 +2225,44 @@ fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
     }
 }
 
-struct CachedTgid {
-    tgid: u32,
+struct CachedThreadPidfd {
+    tgid: Option<u32>,
     pidfd: OwnedFd,
 }
 
-static TGID_CACHE: OnceLock<Mutex<HashMap<u32, CachedTgid>>> = OnceLock::new();
+static THREAD_PIDFD_CACHE: OnceLock<Mutex<HashMap<u32, CachedThreadPidfd>>> = OnceLock::new();
 
 fn cached_thread_group_id(pid: u32) -> io::Result<u32> {
-    let cache = TGID_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let mut cache = cache.lock().unwrap();
-        match cache.get(&pid) {
-            Some(entry) if pidfd_is_alive(entry.pidfd.as_raw_fd()) => return Ok(entry.tgid),
-            Some(_) => {
-                cache.remove(&pid);
-            }
-            None => {}
-        }
-    }
-
-    let pidfd = pidfd_open(pid, libc::PIDFD_THREAD)?;
-    let tgid = thread_group_id(pid)?;
-
+    let cache = THREAD_PIDFD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().unwrap();
-    if cache.len() >= TGID_CACHE_MAX_ENTRIES {
+    if cache
+        .get(&pid)
+        .is_some_and(|entry| !pidfd_is_alive(entry.pidfd.as_raw_fd()))
+    {
+        cache.remove(&pid);
+    }
+    ensure_cached_thread_pidfd(&mut cache, pid)?;
+    if let Some(tgid) = cache.get(&pid).and_then(|entry| entry.tgid) {
+        return Ok(tgid);
+    }
+    let tgid = thread_group_id(pid)?;
+    cache.get_mut(&pid).unwrap().tgid = Some(tgid);
+    Ok(tgid)
+}
+
+fn ensure_cached_thread_pidfd(
+    cache: &mut HashMap<u32, CachedThreadPidfd>,
+    pid: u32,
+) -> io::Result<()> {
+    if cache.contains_key(&pid) {
+        return Ok(());
+    }
+    if cache.len() >= THREAD_PIDFD_CACHE_MAX_ENTRIES {
         cache.clear();
     }
-    cache.insert(pid, CachedTgid { tgid, pidfd });
-    Ok(tgid)
+    let pidfd = pidfd_open(pid, libc::PIDFD_THREAD)?;
+    cache.insert(pid, CachedThreadPidfd { tgid: None, pidfd });
+    Ok(())
 }
 
 fn pidfd_is_alive(pidfd: RawFd) -> bool {
@@ -3944,8 +3951,20 @@ fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<OwnedFd> {
 }
 
 fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
-    let pidfd = pidfd_open(pid, libc::PIDFD_THREAD)?;
-    duplicate_remote_fd_from_pidfd(pidfd.as_raw_fd(), fd)
+    let cache = THREAD_PIDFD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    ensure_cached_thread_pidfd(&mut cache, pid)?;
+    let first = duplicate_remote_fd_from_pidfd(cache[&pid].pidfd.as_raw_fd(), fd);
+    if !matches!(&first, Err(err) if err.raw_os_error() == Some(libc::ESRCH)) {
+        return first;
+    }
+
+    // A dead cached pidfd can share its numeric TID with a newly created
+    // thread. Refresh only on ESRCH; EBADF may describe the requested target
+    // fd and must be returned unchanged.
+    cache.remove(&pid);
+    ensure_cached_thread_pidfd(&mut cache, pid)?;
+    duplicate_remote_fd_from_pidfd(cache[&pid].pidfd.as_raw_fd(), fd)
 }
 
 fn duplicate_remote_fd_from_pidfd(pidfd: RawFd, fd: RawFd) -> io::Result<OwnedFd> {
@@ -4077,6 +4096,24 @@ mod tests {
 
         assert_eq!(key.tgid, std::process::id());
         assert_eq!(key.fd, 9);
+    }
+
+    #[test]
+    fn remote_fd_duplication_reuses_thread_pidfd() {
+        let pid = std::process::id();
+        let (_relay, target) = make_relay_pair().unwrap();
+        let cache = THREAD_PIDFD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        cache.lock().unwrap().remove(&pid);
+
+        let first = duplicate_remote_fd(pid, target.as_raw_fd()).unwrap();
+        let cached_pidfd = cache.lock().unwrap()[&pid].pidfd.as_raw_fd();
+        let second = duplicate_remote_fd(pid, target.as_raw_fd()).unwrap();
+
+        assert_eq!(
+            fd_identity(first.as_raw_fd()).unwrap(),
+            fd_identity(second.as_raw_fd()).unwrap()
+        );
+        assert_eq!(cache.lock().unwrap()[&pid].pidfd.as_raw_fd(), cached_pidfd);
     }
 
     #[test]
