@@ -191,10 +191,19 @@ impl EffectiveConfig {
         if self.bypass_local && is_default_bypass(ip) {
             return Route::Direct;
         }
-        if self.bypass_cidrs.iter().any(|net| net.contains(&ip)) {
+        if self
+            .bypass_cidrs
+            .iter()
+            .any(|net| route_net_contains(net, ip))
+        {
             return Route::Direct;
         }
-        if !self.proxy_cidrs.is_empty() && !self.proxy_cidrs.iter().any(|net| net.contains(&ip)) {
+        if !self.proxy_cidrs.is_empty()
+            && !self
+                .proxy_cidrs
+                .iter()
+                .any(|net| route_net_contains(net, ip))
+        {
             return Route::Direct;
         }
         Route::Proxy
@@ -330,6 +339,9 @@ fn is_default_bypass(ip: IpAddr) -> bool {
                 || ip == Ipv4Addr::BROADCAST
         }
         IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_default_bypass(IpAddr::V4(mapped));
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
@@ -337,6 +349,16 @@ fn is_default_bypass(ip: IpAddr) -> bool {
                 || is_ipv6_unicast_link_local(ip)
         }
     }
+}
+
+fn route_net_contains(net: &IpNet, ip: IpAddr) -> bool {
+    net.contains(&ip)
+        || match ip {
+            IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .is_some_and(|mapped| net.contains(&IpAddr::V4(mapped))),
+            IpAddr::V4(_) => false,
+        }
 }
 
 fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
@@ -493,6 +515,46 @@ mod tests {
         assert_eq!(
             cfg.route_for(IpAddr::from_str("198.51.100.10").unwrap()),
             Route::Proxy
+        );
+    }
+
+    #[test]
+    fn mapped_ipv4_uses_default_bypass_classification() {
+        let mut cfg = test_config();
+        cfg.bypass_local = true;
+
+        assert_eq!(
+            cfg.route_for(IpAddr::from_str("::ffff:127.0.0.1").unwrap()),
+            Route::Direct
+        );
+        assert_eq!(
+            cfg.route_for(IpAddr::from_str("::ffff:10.1.2.3").unwrap()),
+            Route::Direct
+        );
+        assert_eq!(
+            cfg.route_for(IpAddr::from_str("::ffff:203.0.113.10").unwrap()),
+            Route::Proxy
+        );
+    }
+
+    #[test]
+    fn mapped_ipv4_matches_ipv4_cidr_rules() {
+        let mut cfg = test_config();
+        cfg.bypass_cidrs = vec![IpNet::from_str("203.0.113.0/24").unwrap()];
+        assert_eq!(
+            cfg.route_for(IpAddr::from_str("::ffff:203.0.113.10").unwrap()),
+            Route::Direct
+        );
+
+        cfg.bypass_cidrs.clear();
+        cfg.proxy_cidrs = vec![IpNet::from_str("198.51.100.0/24").unwrap()];
+        assert_eq!(
+            cfg.route_for(IpAddr::from_str("::ffff:198.51.100.10").unwrap()),
+            Route::Proxy
+        );
+        assert_eq!(
+            cfg.route_for(IpAddr::from_str("::ffff:203.0.113.10").unwrap()),
+            Route::Direct
         );
     }
 

@@ -152,6 +152,8 @@ The first matching rule wins:
 
 1. Non-IPv4/IPv6 socket families are continued directly.
 2. Local/private/link-local/multicast/unspecified addresses bypass by default.
+   IPv4-mapped IPv6 destinations are also classified by their mapped IPv4
+   address and can match IPv4 CIDR rules.
 3. `--bypass-cidr` / `bypass_cidrs` matches bypass.
 4. If any `--proxy-cidr` / `proxy_cidrs` exist, only matching destinations are
    proxied.
