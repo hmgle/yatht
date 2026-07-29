@@ -81,8 +81,8 @@ enabled:
 
 1. Trap `socket(AF_INET/AF_INET6, SOCK_DGRAM, ...)` and inject the relay endpoint
    as the syscall result with `SECCOMP_ADDFD_FLAG_SEND`.
-2. Feature-detect `SECCOMP_ADDFD_FLAG_SEND`; it requires Linux 5.14, while the
-   existing project baseline is Linux 5.9.
+2. Feature-detect `SECCOMP_ADDFD_FLAG_SEND`; it requires Linux 5.14 and is
+   available on the current Linux 6.9 baseline.
 3. Key relay state by the injected socket's `SO_COOKIE`, with `(tgid, fd)` only
    as a lookup cache. This naturally follows dup and fork aliases.
 4. Relay direct and proxied destinations through the same stable endpoint once

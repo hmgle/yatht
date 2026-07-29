@@ -28,7 +28,7 @@ using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 ## Requirements
 
 - Linux x86_64
-- Linux kernel 5.9 or newer
+- Linux kernel 6.9 or newer (`PIDFD_THREAD` is required)
 - Rust toolchain for building from source
 - A reachable SOCKS5 or HTTP CONNECT proxy
 
@@ -75,11 +75,14 @@ debug = false
 Important options:
 
 - `--proxy <url>`: `socks5://[user:pass@]host:port` or `http://host:port`.
+  Percent-encode reserved characters in SOCKS5 usernames and passwords.
 - `--config <path>`: TOML configuration file.
 - `--bypass-cidr <CIDR>`: direct-route matching destinations; repeatable.
 - `--proxy-cidr <CIDR>`: proxy only matching destinations; repeatable.
 - `--proxy-local`: proxy local/private/link-local destinations too.
-- `--connect-timeout <duration>`: proxy connection timeout, default `10s`.
+- `--connect-timeout <duration>`: absolute proxy setup deadline covering each
+  flow's address attempts and protocol handshake, default `10s`. Proxy DNS is
+  resolved once at startup under the same bounded duration.
 - `--enable-dns`: redirect UDP/53 through DNS-over-TCP.
 - `--enable-udp`: redirect generic UDP through SOCKS5 UDP ASSOCIATE.
 - `--dns-server <addr>`: DNS-over-TCP upstream for `--enable-dns`.
@@ -143,6 +146,8 @@ Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
 multiple responses, ancillary data, pre-existing epoll registrations, or fd
 aliases created with `dup(2)` or inherited across `fork(2)`.
+Active UDP relays are capped at 128, with a bounded 16-datagram input queue per
+relay. New relay setup fails closed when the global limit is reached.
 
 UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.

@@ -35,10 +35,12 @@ const MAX_UDP_PAYLOAD: usize = 65_535;
 // memory when the target stops reading and keeps the source queue from growing
 // without limit; once full, further responses are dropped rather than enqueued.
 const MAX_PENDING_SOURCES: usize = 1_024;
+const MAX_UDP_RELAYS: usize = 128;
+const UDP_RELAY_THREAD_STACK_SIZE: usize = 512 * 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
-const UDP_JOB_QUEUE_CAPACITY: usize = 64;
-const TGID_CACHE_MAX_ENTRIES: usize = 256;
+const UDP_JOB_QUEUE_CAPACITY: usize = 16;
+const THREAD_PIDFD_CACHE_MAX_ENTRIES: usize = 256;
 const BLOCKING_RECV_POLL_INTERVAL_MS: libc::c_int = 100;
 const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
 const LOCAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -158,6 +160,10 @@ impl Destination {
 
 pub fn is_child_stage() -> bool {
     std::env::var_os(CHILD_STAGE_ENV).is_some()
+}
+
+pub fn verify_pidfd_thread_support() -> io::Result<()> {
+    pidfd_open(std::process::id(), libc::PIDFD_THREAD).map(drop)
 }
 
 pub fn run(cfg: EffectiveConfig) -> Result<i32> {
@@ -1496,20 +1502,19 @@ fn handle_connect(
         }
     };
 
-    let target = match duplicate_remote_fd(notif.pid, target_fd) {
-        Ok(target)
-            if socket_type_from_fd(target.as_raw_fd()) == Some(libc::SOCK_STREAM)
-                && matches!(
-                    socket_domain_from_fd(target.as_raw_fd()),
-                    Some(libc::AF_INET | libc::AF_INET6)
-                ) =>
-        {
-            target
-        }
-        Ok(_) => {
-            seccomp::send_continue(listener_fd, notif.id);
-            setup.cancelled("fd_changed");
-            return;
+    let (target, target_domain) = match duplicate_remote_fd(notif.pid, target_fd) {
+        Ok(target) => {
+            let socket_type = socket_type_from_fd(target.as_raw_fd());
+            let domain = socket_domain_from_fd(target.as_raw_fd());
+            if socket_type == Some(libc::SOCK_STREAM)
+                && matches!(domain, Some(libc::AF_INET | libc::AF_INET6))
+            {
+                (target, domain.unwrap())
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+                setup.cancelled("fd_changed");
+                return;
+            }
         }
         Err(err) => {
             if cfg.debug {
@@ -1520,7 +1525,6 @@ fn handle_connect(
             return;
         }
     };
-    let target_domain = socket_domain_from_fd(target.as_raw_fd()).unwrap();
     setup.set_fd_inspection(
         fd_inspection_started.elapsed(),
         socket_cookie(target.as_raw_fd()),
@@ -1627,9 +1631,10 @@ fn dial_proxy_session(
     timings: &mut proxy::DialTimings,
     setup: &mut TcpSetupTrace,
 ) -> std::result::Result<TcpStream, ProxyDialFailure> {
+    let deadline = proxy::Deadline::from_start(handler_started, cfg.connect_timeout);
     let Some(pool) = warm_pool else {
         setup.set_proxy_session("cold", None);
-        return proxy::dial_with_timings(&cfg.proxy, dest, cfg.connect_timeout, timings)
+        return proxy::dial_with_deadline(&cfg.proxy, dest, deadline, timings)
             .map_err(|err| cold_dial_failure(timings, err));
     };
     let lease_started = Instant::now();
@@ -1637,22 +1642,11 @@ fn dial_proxy_session(
     let lease_elapsed = lease_started.elapsed();
     let Some(warm) = leased else {
         setup.set_proxy_session("warm_miss", Some(lease_elapsed));
-        return proxy::dial_with_timings(
-            &cfg.proxy,
-            dest,
-            remaining_connect_budget(cfg, handler_started),
-            timings,
-        )
-        .map_err(|err| cold_dial_failure(timings, err));
+        return proxy::dial_with_deadline(&cfg.proxy, dest, deadline, timings)
+            .map_err(|err| cold_dial_failure(timings, err));
     };
     setup.set_proxy_session("warm_hit", Some(lease_elapsed));
-    match proxy::warm::complete_warm_lease(
-        &cfg.proxy,
-        warm,
-        dest,
-        remaining_connect_budget(cfg, handler_started),
-        timings,
-    ) {
+    match proxy::warm::complete_warm_lease(&cfg.proxy, warm, dest, deadline, timings) {
         Ok(stream) => Ok(stream),
         Err(WarmCompletionError::NothingSent(err)) => {
             // No request byte reached the kernel, so the proxy cannot have
@@ -1664,13 +1658,8 @@ fn dial_proxy_session(
             }
             pool.reclassify_dead_lease();
             setup.set_proxy_session("warm_miss", Some(lease_elapsed));
-            proxy::dial_with_timings(
-                &cfg.proxy,
-                dest,
-                remaining_connect_budget(cfg, handler_started),
-                timings,
-            )
-            .map_err(|err| cold_dial_failure(timings, err))
+            proxy::dial_with_deadline(&cfg.proxy, dest, deadline, timings)
+                .map_err(|err| cold_dial_failure(timings, err))
         }
         Err(WarmCompletionError::SessionDied(err)) => Err(ProxyDialFailure {
             error: err,
@@ -1684,14 +1673,6 @@ fn dial_proxy_session(
             stage: "proxy_handshake",
         }),
     }
-}
-
-fn remaining_connect_budget(cfg: &EffectiveConfig, handler_started: Instant) -> Duration {
-    // Keep at least a token budget: timeout setters reject zero, and an
-    // exhausted deadline should fail fast inside the dial instead.
-    cfg.connect_timeout
-        .saturating_sub(handler_started.elapsed())
-        .max(Duration::from_millis(1))
 }
 
 fn handle_sendto(
@@ -2244,41 +2225,44 @@ fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
     }
 }
 
-struct CachedTgid {
-    tgid: u32,
+struct CachedThreadPidfd {
+    tgid: Option<u32>,
     pidfd: OwnedFd,
 }
 
-static TGID_CACHE: OnceLock<Mutex<HashMap<u32, CachedTgid>>> = OnceLock::new();
+static THREAD_PIDFD_CACHE: OnceLock<Mutex<HashMap<u32, CachedThreadPidfd>>> = OnceLock::new();
 
 fn cached_thread_group_id(pid: u32) -> io::Result<u32> {
-    let cache = TGID_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let mut cache = cache.lock().unwrap();
-        match cache.get(&pid) {
-            Some(entry) if pidfd_is_alive(entry.pidfd.as_raw_fd()) => return Ok(entry.tgid),
-            Some(_) => {
-                cache.remove(&pid);
-            }
-            None => {}
-        }
-    }
-
-    let pidfd = match pidfd_open(pid, libc::PIDFD_THREAD) {
-        Ok(pidfd) => pidfd,
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-            return thread_group_id(pid);
-        }
-        Err(_) => return thread_group_id(pid),
-    };
-    let tgid = thread_group_id(pid)?;
-
+    let cache = THREAD_PIDFD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().unwrap();
-    if cache.len() >= TGID_CACHE_MAX_ENTRIES {
+    if cache
+        .get(&pid)
+        .is_some_and(|entry| !pidfd_is_alive(entry.pidfd.as_raw_fd()))
+    {
+        cache.remove(&pid);
+    }
+    ensure_cached_thread_pidfd(&mut cache, pid)?;
+    if let Some(tgid) = cache.get(&pid).and_then(|entry| entry.tgid) {
+        return Ok(tgid);
+    }
+    let tgid = thread_group_id(pid)?;
+    cache.get_mut(&pid).unwrap().tgid = Some(tgid);
+    Ok(tgid)
+}
+
+fn ensure_cached_thread_pidfd(
+    cache: &mut HashMap<u32, CachedThreadPidfd>,
+    pid: u32,
+) -> io::Result<()> {
+    if cache.contains_key(&pid) {
+        return Ok(());
+    }
+    if cache.len() >= THREAD_PIDFD_CACHE_MAX_ENTRIES {
         cache.clear();
     }
-    cache.insert(pid, CachedTgid { tgid, pidfd });
-    Ok(tgid)
+    let pidfd = pidfd_open(pid, libc::PIDFD_THREAD)?;
+    cache.insert(pid, CachedThreadPidfd { tgid: None, pidfd });
+    Ok(())
 }
 
 fn pidfd_is_alive(pidfd: RawFd) -> bool {
@@ -2391,6 +2375,7 @@ impl UdpRelayRegistry {
                     }
                     // Free to claim: publish the marker and build below.
                     _ => {
+                        ensure_udp_relay_capacity(&relays)?;
                         relays.insert(key, RelayState::Creating);
                         break;
                     }
@@ -2436,10 +2421,14 @@ impl UdpRelayRegistry {
         {
             bail!("UDP target fd changed before relay injection");
         }
-        seccomp::notif_addfd(listener_fd, &mut addfd).context("inject UDP relay fd")?;
+        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity)
+            .context("start bounded UDP relay workers")?;
+        if let Err(err) = seccomp::notif_addfd(listener_fd, &mut addfd) {
+            handle.shutdown();
+            return Err(err).context("inject UDP relay fd");
+        }
         drop(target_fd);
 
-        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity);
         // Publish the ready relay and hand the marker off to Ready in one
         // critical section so waiters wake to a usable handle.
         guard.commit(RelayState::Ready(handle.clone()));
@@ -2598,6 +2587,13 @@ impl UdpRelayRegistry {
     }
 }
 
+fn ensure_udp_relay_capacity(relays: &HashMap<RelayKey, RelayState>) -> Result<()> {
+    if relays.len() >= MAX_UDP_RELAYS {
+        bail!("active UDP relay limit of {MAX_UDP_RELAYS} reached");
+    }
+    Ok(())
+}
+
 fn fd_in_close_range(fd: RawFd, first: u32, last: u32) -> bool {
     u32::try_from(fd)
         .map(|fd| (first..=last).contains(&fd))
@@ -2707,7 +2703,7 @@ fn start_udp_relay(
     relay_socket: OwnedFd,
     default_dest: Option<(Destination, UdpRouteKind)>,
     target_identity: FdIdentity,
-) -> UdpRelayHandle {
+) -> io::Result<UdpRelayHandle> {
     let relay_fd = Arc::new(relay_socket);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
@@ -2718,87 +2714,101 @@ fn start_udp_relay(
     let read_tx = tx.clone();
     let read_default_dest = Arc::clone(&default_dest);
     let read_shutdown = Arc::clone(&shutdown);
-    thread::spawn(move || {
-        let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
-        loop {
-            let n = match recv_relay_socket(read_fd.as_raw_fd(), &mut buf) {
-                Ok(n) => n,
-                // A signal can interrupt the blocking recv; retry rather than
-                // terminating the reader, which would silently break the
-                // connected-UDP return path (target recvfrom would hang).
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            if read_shutdown.load(Ordering::SeqCst) {
-                break;
+    let reader = thread::Builder::new()
+        .name("yatht-udp-relay-read".to_string())
+        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
+            loop {
+                let n = match recv_relay_socket(read_fd.as_raw_fd(), &mut buf) {
+                    Ok(n) => n,
+                    // A signal can interrupt the blocking recv; retry rather than
+                    // terminating the reader, which would silently break the
+                    // connected-UDP return path (target recvfrom would hang).
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if read_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some((dest, route)) = *read_default_dest.lock().unwrap() else {
+                    continue;
+                };
+                let payload = buf[..n].to_vec();
+                if read_tx
+                    .send(UdpJob {
+                        dest,
+                        payload,
+                        route,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let Some((dest, route)) = *read_default_dest.lock().unwrap() else {
-                continue;
-            };
-            let payload = buf[..n].to_vec();
-            if read_tx
-                .send(UdpJob {
-                    dest,
-                    payload,
-                    route,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+        })?;
 
     let write_pending_sources = Arc::clone(&pending_sources);
     let write_fd = Arc::clone(&relay_fd);
     let write_shutdown = Arc::clone(&shutdown);
-    thread::spawn(move || {
-        let mut dns_tcp = None;
-        let mut socks_udp = None;
-        let mut direct_udp = None;
-        for job in rx {
-            if write_shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            let source = job.dest;
-            match forward_udp_job(&cfg, &mut dns_tcp, &mut socks_udp, &mut direct_udp, job) {
-                Ok(Some(response)) => {
-                    let mut pending = write_pending_sources.lock().unwrap();
-                    // Drop the response if the target is not draining fast
-                    // enough. The socketpair send below uses MSG_DONTWAIT, so a
-                    // successful send means the datagram is actually queued.
-                    if pending.len() >= MAX_PENDING_SOURCES {
+    let writer = thread::Builder::new()
+        .name("yatht-udp-relay-write".to_string())
+        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut dns_tcp = None;
+            let mut socks_udp = None;
+            let mut direct_udp = None;
+            for job in rx {
+                if write_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let source = job.dest;
+                match forward_udp_job(&cfg, &mut dns_tcp, &mut socks_udp, &mut direct_udp, job) {
+                    Ok(Some(response)) => {
+                        let mut pending = write_pending_sources.lock().unwrap();
+                        // Drop the response if the target is not draining fast
+                        // enough. The socketpair send below uses MSG_DONTWAIT, so a
+                        // successful send means the datagram is actually queued.
+                        if pending.len() >= MAX_PENDING_SOURCES {
+                            if cfg.debug {
+                                eprintln!("yatht: UDP relay pending queue full, dropping response");
+                            }
+                            continue;
+                        }
+                        pending.push_back(source);
+                        if !send_relay_response(write_fd.as_raw_fd(), &response) {
+                            let _ = pending.pop_back();
+                            if write_shutdown.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
                         if cfg.debug {
-                            eprintln!("yatht: UDP relay pending queue full, dropping response");
+                            eprintln!("yatht: UDP relay forward failed: {err:#}");
                         }
-                        continue;
-                    }
-                    pending.push_back(source);
-                    if !send_relay_response(write_fd.as_raw_fd(), &response) {
-                        let _ = pending.pop_back();
-                        if write_shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    if cfg.debug {
-                        eprintln!("yatht: UDP relay forward failed: {err:#}");
                     }
                 }
             }
-        }
-    });
+        });
+    if let Err(err) = writer {
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = unsafe { libc::shutdown(relay_fd.as_raw_fd(), libc::SHUT_RDWR) };
+        drop(reader);
+        return Err(err);
+    }
+    drop(reader);
+    drop(writer);
 
-    UdpRelayHandle {
+    Ok(UdpRelayHandle {
         tx,
         default_dest,
         pending_sources,
         relay_fd,
         target_identity,
         shutdown,
-    }
+    })
 }
 
 fn recv_relay_socket(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
@@ -2842,22 +2852,20 @@ fn forward_udp_job(
     direct_udp: &mut Option<DirectUdpSocket>,
     job: UdpJob,
 ) -> Result<Option<Vec<u8>>> {
+    let deadline = proxy::Deadline::after(cfg.timeout);
     // The route was decided by the notification handler, which has the full
     // routing table. Honour it verbatim so a datagram bound for a direct route
     // is never accidentally tunnelled through the proxy (and vice versa).
     match job.route {
-        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload).map(Some),
+        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(Some),
         UdpRouteKind::Generic => {
             if socks_udp.is_none() {
-                *socks_udp = Some(proxy::Socks5UdpAssociation::connect(
-                    &cfg.proxy,
-                    cfg.timeout,
-                )?);
+                *socks_udp = Some(proxy::Socks5UdpAssociation::connect(&cfg.proxy, deadline)?);
             }
             socks_udp
                 .as_mut()
                 .expect("SOCKS5 UDP association initialized")
-                .send_datagram(job.dest, &job.payload)
+                .send_datagram(job.dest, &job.payload, deadline)
         }
         UdpRouteKind::Direct => forward_direct_udp(direct_udp, job.dest, &job.payload, cfg.timeout),
     }
@@ -2867,27 +2875,27 @@ fn forward_dns_tcp(
     cfg: &UdpRelayConfig,
     dns_tcp: &mut Option<proxy::DnsTcpConnection>,
     payload: &[u8],
+    deadline: proxy::Deadline,
 ) -> Result<Vec<u8>> {
     if dns_tcp.is_none() {
         *dns_tcp = Some(proxy::DnsTcpConnection::connect(
             &cfg.proxy,
             cfg.dns_server,
-            cfg.timeout,
+            deadline,
         )?);
     }
 
     match dns_tcp
         .as_mut()
         .expect("DNS-over-TCP connection initialized")
-        .query(payload)
+        .query(payload, deadline)
     {
         Ok(response) => Ok(response),
         Err(first_err) => {
             *dns_tcp = None;
-            let mut fresh =
-                proxy::DnsTcpConnection::connect(&cfg.proxy, cfg.dns_server, cfg.timeout)
-                    .with_context(|| format!("reconnect DNS-over-TCP after {first_err:#}"))?;
-            let response = fresh.query(payload)?;
+            let mut fresh = proxy::DnsTcpConnection::connect(&cfg.proxy, cfg.dns_server, deadline)
+                .with_context(|| format!("reconnect DNS-over-TCP after {first_err:#}"))?;
+            let response = fresh.query(payload, deadline)?;
             *dns_tcp = Some(fresh);
             Ok(response)
         }
@@ -3943,12 +3951,20 @@ fn recv_listener_fd(sock: RawFd, child_pid: u32) -> io::Result<OwnedFd> {
 }
 
 fn duplicate_remote_fd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
-    let pidfd = match pidfd_open(pid, libc::PIDFD_THREAD) {
-        Ok(pidfd) => pidfd,
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => pidfd_open(pid, 0)?,
-        Err(err) => return Err(err),
-    };
-    duplicate_remote_fd_from_pidfd(pidfd.as_raw_fd(), fd)
+    let cache = THREAD_PIDFD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    ensure_cached_thread_pidfd(&mut cache, pid)?;
+    let first = duplicate_remote_fd_from_pidfd(cache[&pid].pidfd.as_raw_fd(), fd);
+    if !matches!(&first, Err(err) if err.raw_os_error() == Some(libc::ESRCH)) {
+        return first;
+    }
+
+    // A dead cached pidfd can share its numeric TID with a newly created
+    // thread. Refresh only on ESRCH; EBADF may describe the requested target
+    // fd and must be returned unchanged.
+    cache.remove(&pid);
+    ensure_cached_thread_pidfd(&mut cache, pid)?;
+    duplicate_remote_fd_from_pidfd(cache[&pid].pidfd.as_raw_fd(), fd)
 }
 
 fn duplicate_remote_fd_from_pidfd(pidfd: RawFd, fd: RawFd) -> io::Result<OwnedFd> {
@@ -4083,6 +4099,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_fd_duplication_reuses_thread_pidfd() {
+        let pid = std::process::id();
+        let (_relay, target) = make_relay_pair().unwrap();
+        let cache = THREAD_PIDFD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        cache.lock().unwrap().remove(&pid);
+
+        let first = duplicate_remote_fd(pid, target.as_raw_fd()).unwrap();
+        let cached_pidfd = cache.lock().unwrap()[&pid].pidfd.as_raw_fd();
+        let second = duplicate_remote_fd(pid, target.as_raw_fd()).unwrap();
+
+        assert_eq!(
+            fd_identity(first.as_raw_fd()).unwrap(),
+            fd_identity(second.as_raw_fd()).unwrap()
+        );
+        assert_eq!(cache.lock().unwrap()[&pid].pidfd.as_raw_fd(), cached_pidfd);
+    }
+
+    #[test]
     fn termination_poll_returns_before_deadline() {
         let attempts = Cell::new(0);
         let value = poll_until_termination(
@@ -4176,6 +4210,29 @@ mod tests {
             registry.lookup(std::process::id(), 9, false),
             RelayLookup::Creating
         ));
+    }
+
+    #[test]
+    fn udp_relay_capacity_is_globally_bounded() {
+        let mut relays = HashMap::new();
+        for fd in 0..MAX_UDP_RELAYS {
+            relays.insert(
+                RelayKey {
+                    tgid: 1,
+                    fd: fd as RawFd,
+                },
+                RelayState::Creating,
+            );
+        }
+
+        let err = ensure_udp_relay_capacity(&relays).unwrap_err().to_string();
+        assert!(err.contains("active UDP relay limit"), "{err}");
+
+        relays.remove(&RelayKey {
+            tgid: 1,
+            fd: (MAX_UDP_RELAYS - 1) as RawFd,
+        });
+        ensure_udp_relay_capacity(&relays).unwrap();
     }
 
     #[test]
@@ -4531,7 +4588,7 @@ mod tests {
     fn test_config(enable_dns: bool) -> EffectiveConfig {
         EffectiveConfig {
             proxy: crate::config::ProxyConfig::Socks5 {
-                addr: "127.0.0.1:1080".to_string(),
+                endpoint: crate::config::ProxyEndpoint::new("127.0.0.1:1080".to_string()),
                 username: None,
                 password: None,
             },

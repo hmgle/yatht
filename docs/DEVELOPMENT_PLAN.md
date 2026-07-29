@@ -12,8 +12,10 @@ seccomp backend is a compatibility tool, not a complete emulation of Linux
 socket semantics or a security boundary.
 
 The implementation is from-scratch Rust and targets Linux x86_64 with kernel
-5.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
-`SECCOMP_USER_NOTIF_FLAG_CONTINUE`, and `SECCOMP_IOCTL_NOTIF_ADDFD`.
+6.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
+`SECCOMP_USER_NOTIF_FLAG_CONTINUE`, `SECCOMP_IOCTL_NOTIF_ADDFD`, and
+`PIDFD_THREAD`. Startup fails before launching the target when thread-scoped
+pidfds are unavailable.
 
 ## Public Interface
 
@@ -26,7 +28,7 @@ Options:
   --bypass-cidr <CIDR>            CIDR that bypasses the proxy; repeatable
   --proxy-cidr <CIDR>             CIDR allow-list for proxying; repeatable
   --proxy-local                   Proxy local/private destinations too
-  --connect-timeout <duration>    Proxy connection timeout, default 10s
+  --connect-timeout <duration>    Absolute proxy setup deadline, default 10s
   --enable-dns                    Redirect UDP/53 through DNS-over-TCP
   --enable-udp                    Redirect generic UDP through SOCKS5 UDP ASSOCIATE
   --dns-server <addr>             DNS-over-TCP upstream, default 1.1.1.1:53
@@ -81,6 +83,10 @@ is `socks5://127.0.0.1:1080`.
   original syscall run unchanged. Direct non-DNS `connect(2)` notifications use
   this fast path before socket-type inspection to avoid an extra
   `pidfd_getfd(2)`/`getsockopt(2)` round trip.
+- Thread-scoped pidfds are cached by notification TID in a bounded 256-entry
+  cache and refreshed on thread exit or TID reuse. Repeated fd inspections
+  avoid a separate `pidfd_open(2)` syscall while preserving each required
+  `pidfd_getfd(2)` identity check.
 - Proxied routes duplicate the target TCP fd with `pidfd_getfd(2)`, complete the
   SOCKS5/HTTP CONNECT handshake on a separate upstream socket, then connect the
   original target open file description to a per-flow loopback listener. A
@@ -101,6 +107,10 @@ is `socks5://127.0.0.1:1080`.
   demand-driven pool of at most 16 pre-established proxy sessions with a 30 s
   idle timeout; each warm session serves one flow and misses fall back to
   cold dials.
+- Proxy endpoint DNS is resolved once during configuration loading under the
+  configured timeout and reused by cold and warm paths. Each flow has one
+  absolute setup deadline across all candidate-address connection attempts,
+  proxy protocol reads/writes, warm completion, and any safe cold fallback.
 - Before proxy setup, the broker reserves an active-flow permit. The default
   ceiling is 16,384 flows and is reduced from `RLIMIT_NOFILE` after preserving
   the larger of 20% or 256 fds, plus setup-worker headroom. Registration has a
@@ -132,8 +142,10 @@ is `socks5://127.0.0.1:1080`.
   a concurrent descriptor change cannot cross the injection window. Closing
   calls also remove matching relays so long-running targets do not retain relay
   threads after closing UDP sockets.
-- Each UDP relay has a bounded job queue. Blocking sends apply backpressure;
-  nonblocking sends return `EAGAIN` when the queue is full.
+- UDP relay admission is globally capped at 128. Each relay uses two fallible
+  workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
+  sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
+  full, and relay setup fails closed when the global limit is reached.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
@@ -146,6 +158,8 @@ The first matching rule wins:
 
 1. Non-IPv4/IPv6 socket families are continued directly.
 2. Local/private/link-local/multicast/unspecified addresses bypass by default.
+   IPv4-mapped IPv6 destinations are also classified by their mapped IPv4
+   address and can match IPv4 CIDR rules.
 3. `--bypass-cidr` / `bypass_cidrs` matches bypass.
 4. If any `--proxy-cidr` / `proxy_cidrs` exist, only matching destinations are
    proxied.
@@ -218,7 +232,7 @@ uv run scripts/tcp_broker_benchmark.py \
   --addfd-build-command 'cargo build --release --locked'
 ```
 
-- Manual integration check on Linux x86_64/kernel >= 5.9:
+- Manual integration check on Linux x86_64/kernel >= 6.9:
 
 ```sh
 cargo build
@@ -232,7 +246,8 @@ should bypass the proxy unless `--proxy-local` is set.
 ## Deferred Work
 
 - Additional architectures such as aarch64.
-- Optional compatibility fallback for kernels older than 5.9.
+- Optional compatibility backend for kernels older than 6.9, if a current use
+  case justifies the additional fd-table semantics and maintenance cost.
 - Strict nonblocking connect completion, logical peer query virtualization, and
   general UDP socket semantics. These require the backend decisions in
   [SOCKET_SEMANTICS_ROADMAP.md](SOCKET_SEMANTICS_ROADMAP.md), not local syscall
