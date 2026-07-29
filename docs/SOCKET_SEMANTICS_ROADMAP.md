@@ -106,7 +106,14 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    Blocking batches retain progress in the receive reactor and use an absolute
    deadline; an empty queue returns zero at expiry instead of preserving the
    documented Linux timeout bug.
-8. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
+8. [x] Honor `SO_RCVTIMEO` for blocking relayed receives. The supervisor
+   samples the timeout from its duplicate of the injected endpoint, expires a
+   quiet `recvfrom(2)`/`recvmsg(2)` with `EAGAIN`, bounds each `recvmmsg(2)`
+   inter-datagram gap with per-entry re-arming, and lets the earlier of the
+   socket timeout and an explicit timespec keep its own expiry result. A
+   direct-kernel probe anchors the semantics and runs unchanged against
+   stable direct, stable SOCKS5, and lazy relays.
+9. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
    unsolicited datagrams, error queues, and multi-response ordering remain open
    compatibility work. These need explicit support or an unsupported policy;
    the batch source-queue consistency issue is closed.

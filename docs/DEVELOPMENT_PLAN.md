@@ -168,7 +168,14 @@ is `socks5://127.0.0.1:1080`.
   the SOCKS5 UDP header source or the direct worker's kernel peer across
   `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, and mixed receive calls. Empty-queue
   batch timeouts use an absolute reactor deadline rather than reproducing the
-  documented Linux timeout hang. SOCKS5 domain-name response sources, error
+  documented Linux timeout hang. Blocking receives sample `SO_RCVTIMEO` from
+  the supervisor's duplicate of the injected endpoint (one open file
+  description, so dup/fork aliases and lazy replacements share it): a quiet
+  `recvfrom(2)`/`recvmsg(2)` fails with `EAGAIN` at the deadline, and
+  `recvmmsg(2)` bounds each inter-datagram gap, re-arms after every delivered
+  entry, and returns the completed count when the timeout expires with
+  progress; the earlier of the socket timeout and the explicit timespec keeps
+  its own expiry result. SOCKS5 domain-name response sources, error
   queues, and ancillary/control data remain deferred.
 
 ## Routing Rules

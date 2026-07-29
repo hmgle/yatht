@@ -167,9 +167,15 @@ replaced with a kernel-assigned ephemeral port. For unconnected request/response
 traffic, `recvfrom(2)`, `recvmsg(2)`, and each `recvmmsg(2)` entry report the
 numeric source from the SOCKS5 UDP response header or the direct worker's kernel
 peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, partial completion, and mixed
-receive calls preserve payload/source queue order. Stable `recvmmsg(2)` uses an
-absolute reactor deadline and returns zero when an empty-queue timeout expires,
-instead of reproducing Linux's documented timeout hang. SOCKS5 domain-name
+receive calls preserve payload/source queue order. Blocking relayed receives
+honor `SO_RCVTIMEO` read from the injected endpoint: a quiet
+`recvfrom(2)`/`recvmsg(2)` fails with `EAGAIN` at the deadline, while
+`recvmmsg(2)` re-arms the socket timeout after each delivered entry and returns
+the completed count once it expires with progress. Stable `recvmmsg(2)` uses an
+absolute reactor deadline and returns zero when an empty-queue explicit timeout
+expires, instead of reproducing Linux's documented timeout hang; when both the
+socket timeout and an explicit timespec are armed, the earlier deadline keeps
+its own expiry result. SOCKS5 domain-name
 response sources, `msg_control` data, error queues, and other IP-level option
 semantics remain limited.
 
