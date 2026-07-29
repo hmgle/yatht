@@ -161,8 +161,13 @@ is `socks5://127.0.0.1:1080`.
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
 - Stable mode rewrites explicit destinations in `sendmmsg(2)` and writes each
   successful message length back to the target array. `recvmmsg(2)` continues
-  through the injected AF_UNIX endpoint; source-address, error-queue, and
-  ancillary-data virtualization remains deferred.
+  through the injected AF_UNIX endpoint. Trapped `recvfrom(2)` and `recvmsg(2)`
+  pair each response with the numeric SOCKS5 UDP header source or the direct
+  worker's kernel peer, including across `MSG_PEEK` and `MSG_TRUNC`. Source
+  virtualization for `recvmmsg(2)`, SOCKS5 domain-name response sources,
+  error queues, and ancillary data remains deferred. Because endpoint
+  `recvmmsg(2)` consumption cannot advance the supervisor's source queue,
+  mixing it with trapped receive calls can desynchronize later source metadata.
 
 ## Routing Rules
 

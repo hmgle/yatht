@@ -163,8 +163,14 @@ also virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
 wildcard address with port zero, and an explicitly bound port zero is not
-replaced with a kernel-assigned ephemeral port. Source-address, ancillary-data,
-error-queue, and other IP-level option semantics remain limited.
+replaced with a kernel-assigned ephemeral port. For unconnected request/response
+traffic, `recvfrom(2)` and `recvmsg(2)` report the numeric source from the
+SOCKS5 UDP response header or the direct worker's kernel peer; `MSG_PEEK` and
+`MSG_TRUNC` preserve that source and match direct Linux payload-length behavior.
+`recvmmsg(2)` source addresses, SOCKS5 domain-name response sources, ancillary
+data, error queues, and other IP-level option semantics remain limited. Mixing
+`recvmmsg(2)` with the trapped receive calls can desynchronize later source
+metadata, so applications that depend on source addresses should not mix them.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

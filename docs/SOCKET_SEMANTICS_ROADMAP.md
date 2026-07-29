@@ -90,12 +90,21 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    only as a lookup cache. This naturally follows dup and fork aliases.
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
-5. [~] Stable mode rewrites `sendmmsg(2)` and supports batched responses via
-   `recvmmsg(2)` on the endpoint. It now virtualizes `getsockname(2)`,
+5. [x] Stable mode rewrites `sendmmsg(2)` and virtualizes `getsockname(2)`,
    `getpeername(2)`, and the common `SOL_SOCKET` identity options for the
-   logical AF_INET/AF_INET6 UDP socket. Source-address/ancillary-data
-   virtualization, unsolicited datagrams, error queues, and multi-response
-   ordering remain the next compatibility slice.
+   logical AF_INET/AF_INET6 UDP socket.
+6. [x] Preserve numeric response sources for unconnected `recvfrom(2)` and
+   `recvmsg(2)`. SOCKS5 replies use the UDP response header and direct replies
+   use the kernel peer. A direct-kernel probe covers changed-source responses,
+   `MSG_PEEK`, payload truncation, and `MSG_TRUNC` before running the same
+   assertions through stable relays.
+7. [~] Batched responses work through `recvmmsg(2)` on the endpoint, but their
+   source/control metadata is not virtualized. SOCKS5 domain-name response
+   sources, ancillary data, unsolicited datagrams, error queues, and
+   multi-response ordering also remain open compatibility work. Endpoint
+   `recvmmsg(2)` does not advance the supervisor's source queue, so mixing it
+   with trapped receives can desynchronize later source metadata; resolving
+   that interaction is the next receive-semantics priority.
 
 AF_UNIX cannot receive arbitrary IP error-queue entries or generate matching
 `EPOLLERR` state. `IP_RECVERR`, `MSG_ERRQUEUE`, packet-info control messages,
