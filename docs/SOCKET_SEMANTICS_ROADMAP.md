@@ -98,13 +98,18 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    use the kernel peer. A direct-kernel probe covers changed-source responses,
    `MSG_PEEK`, payload truncation, and `MSG_TRUNC` before running the same
    assertions through stable relays.
-7. [~] Batched responses work through `recvmmsg(2)` on the endpoint, but their
-   source/control metadata is not virtualized. SOCKS5 domain-name response
-   sources, ancillary data, unsolicited datagrams, error queues, and
-   multi-response ordering also remain open compatibility work. Endpoint
-   `recvmmsg(2)` does not advance the supervisor's source queue, so mixing it
-   with trapped receives can desynchronize later source metadata; resolving
-   that interaction is the next receive-semantics priority.
+7. [x] Trap stable `recvmmsg(2)` and preserve per-entry payload length, flags,
+   and numeric source while atomically advancing the response-source queue.
+   Direct-kernel and stable probes cover `MSG_PEEK`, `MSG_TRUNC`,
+   `MSG_WAITFORONE`, nonblocking calls, invalid target memory, partial
+   completion, and mixing batches with later `recvfrom(2)`/`recvmsg(2)` calls.
+   Blocking batches retain progress in the receive reactor and use an absolute
+   deadline; an empty queue returns zero at expiry instead of preserving the
+   documented Linux timeout bug.
+8. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
+   unsolicited datagrams, error queues, and multi-response ordering remain open
+   compatibility work. These need explicit support or an unsupported policy;
+   the batch source-queue consistency issue is closed.
 
 AF_UNIX cannot receive arbitrary IP error-queue entries or generate matching
 `EPOLLERR` state. `IP_RECVERR`, `MSG_ERRQUEUE`, packet-info control messages,

@@ -156,21 +156,22 @@ so applications that create and discard hundreds of UDP sockets in one target
 process should stay on lazy mode for now.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
-`recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`;
-`recvmmsg(2)` is served by the injected AF_UNIX datagram endpoint. Stable mode
-also virtualizes `getsockname(2)`, `getpeername(2)`, and the common
+`recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`
+and serves `recvmmsg(2)` through the receive supervisor. Stable mode also
+virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
 wildcard address with port zero, and an explicitly bound port zero is not
 replaced with a kernel-assigned ephemeral port. For unconnected request/response
-traffic, `recvfrom(2)` and `recvmsg(2)` report the numeric source from the
-SOCKS5 UDP response header or the direct worker's kernel peer; `MSG_PEEK` and
-`MSG_TRUNC` preserve that source and match direct Linux payload-length behavior.
-`recvmmsg(2)` source addresses, SOCKS5 domain-name response sources, ancillary
-data, error queues, and other IP-level option semantics remain limited. Mixing
-`recvmmsg(2)` with the trapped receive calls can desynchronize later source
-metadata, so applications that depend on source addresses should not mix them.
+traffic, `recvfrom(2)`, `recvmsg(2)`, and each `recvmmsg(2)` entry report the
+numeric source from the SOCKS5 UDP response header or the direct worker's kernel
+peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, partial completion, and mixed
+receive calls preserve payload/source queue order. Stable `recvmmsg(2)` uses an
+absolute reactor deadline and returns zero when an empty-queue timeout expires,
+instead of reproducing Linux's documented timeout hang. SOCKS5 domain-name
+response sources, `msg_control` data, error queues, and other IP-level option
+semantics remain limited.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

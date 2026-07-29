@@ -72,8 +72,9 @@ is `socks5://127.0.0.1:1080`.
 - The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
   send/receive plus descriptor close/replacement syscalls only when DNS or
   generic UDP redirection is enabled. Opt-in stable UDP mode also traps
-  `socket(2)`, `bind(2)`, `sendmmsg(2)`, `getsockname(2)`, `getpeername(2)`,
-  and selected `getsockopt(2)` queries; all other syscalls are allowed.
+  `socket(2)`, `bind(2)`, `sendmmsg(2)`, `recvmmsg(2)`, `getsockname(2)`,
+  `getpeername(2)`, and selected `getsockopt(2)` queries; all other syscalls are
+  allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
@@ -160,14 +161,15 @@ is `socks5://127.0.0.1:1080`.
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
 - Stable mode rewrites explicit destinations in `sendmmsg(2)` and writes each
-  successful message length back to the target array. `recvmmsg(2)` continues
-  through the injected AF_UNIX endpoint. Trapped `recvfrom(2)` and `recvmsg(2)`
-  pair each response with the numeric SOCKS5 UDP header source or the direct
-  worker's kernel peer, including across `MSG_PEEK` and `MSG_TRUNC`. Source
-  virtualization for `recvmmsg(2)`, SOCKS5 domain-name response sources,
-  error queues, and ancillary data remains deferred. Because endpoint
-  `recvmmsg(2)` consumption cannot advance the supervisor's source queue,
-  mixing it with trapped receive calls can desynchronize later source metadata.
+  successful message length back to the target array. Stable `recvmmsg(2)` runs
+  through the receive reactor, retains partial batch progress across readiness
+  waits, and writes each entry's payload length, flags, and numeric source.
+  `recvfrom(2)`, `recvmsg(2)`, and `recvmmsg(2)` atomically pair responses with
+  the SOCKS5 UDP header source or the direct worker's kernel peer across
+  `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, and mixed receive calls. Empty-queue
+  batch timeouts use an absolute reactor deadline rather than reproducing the
+  documented Linux timeout hang. SOCKS5 domain-name response sources, error
+  queues, and ancillary/control data remain deferred.
 
 ## Routing Rules
 
