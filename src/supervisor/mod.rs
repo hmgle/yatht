@@ -69,6 +69,7 @@ struct PendingBlockingRecv {
     notif: SeccompNotif,
     relay_fd: OwnedFd,
     relay: FdIdentity,
+    state: BlockingRecvState,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +77,14 @@ struct BlockingRecvWork {
     notif: SeccompNotif,
     relay: Option<FdIdentity>,
     terminal_revents: libc::c_short,
+    state: BlockingRecvState,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BlockingRecvState {
+    completed: usize,
+    timeout_initialized: bool,
+    deadline: Option<Instant>,
 }
 
 struct BlockingRecvCompletion {
@@ -93,6 +102,7 @@ enum RecvHandling {
     Deferred {
         relay_fd: OwnedFd,
         relay: FdIdentity,
+        state: BlockingRecvState,
     },
 }
 
@@ -139,6 +149,8 @@ const X86_64_MSGHDR_IOV_LEN_OFFSET: usize = 24;
 const X86_64_MSGHDR_FLAGS_OFFSET: u64 = 48;
 const X86_64_MMSGHDR_SIZE: usize = 64;
 const X86_64_MMSGHDR_LEN_OFFSET: u64 = 56;
+const X86_64_TIMESPEC_SIZE: usize = 16;
+const MAX_RECVMMSG_VLEN: usize = 1_024;
 const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 const CLOSE_RANGE_KNOWN_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
@@ -992,6 +1004,7 @@ fn is_blocking_recv_notification(notif: &SeccompNotif) -> bool {
     let flags = match notif.data.nr as libc::c_long {
         libc::SYS_recvfrom => notif.data.args[3] as i32,
         libc::SYS_recvmsg => notif.data.args[2] as i32,
+        libc::SYS_recvmmsg => notif.data.args[3] as i32,
         _ => return false,
     };
     flags & libc::MSG_DONTWAIT == 0
@@ -1012,6 +1025,7 @@ fn blocking_recv_worker(
                 work.notif,
                 Arc::clone(&relays),
                 false,
+                work.state,
             )
         })) {
             Ok(handling) => handling,
@@ -1071,8 +1085,61 @@ fn queue_ready_blocking_recvs(
             notif: pending_recv.notif,
             relay: Some(pending_recv.relay),
             terminal_revents: revents & terminal_events,
+            state: pending_recv.state,
         });
     }
+}
+
+fn queue_expired_blocking_recvs(
+    pending: &mut Vec<PendingBlockingRecv>,
+    in_flight: &mut HashSet<FdIdentity>,
+    work_backlog: &mut VecDeque<BlockingRecvWork>,
+) {
+    let now = Instant::now();
+    let mut index = pending.len();
+    while index > 0 {
+        index -= 1;
+        let recv = &pending[index];
+        if in_flight.contains(&recv.relay)
+            || recv.state.deadline.is_none_or(|deadline| deadline > now)
+        {
+            continue;
+        }
+        let pending_recv = pending.swap_remove(index);
+        in_flight.insert(pending_recv.relay);
+        work_backlog.push_back(BlockingRecvWork {
+            notif: pending_recv.notif,
+            relay: Some(pending_recv.relay),
+            terminal_revents: 0,
+            state: pending_recv.state,
+        });
+    }
+}
+
+fn blocking_recv_poll_timeout(
+    pending: &[PendingBlockingRecv],
+    in_flight: &HashSet<FdIdentity>,
+    channels_may_have_more: bool,
+) -> libc::c_int {
+    if channels_may_have_more {
+        return 0;
+    }
+    let now = Instant::now();
+    let Some(until_deadline) = pending
+        .iter()
+        .filter(|recv| !in_flight.contains(&recv.relay))
+        .filter_map(|recv| recv.state.deadline)
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .min()
+    else {
+        return BLOCKING_RECV_POLL_INTERVAL_MS;
+    };
+    if until_deadline.is_zero() {
+        return 0;
+    }
+    until_deadline
+        .as_millis()
+        .clamp(1, BLOCKING_RECV_POLL_INTERVAL_MS as u128) as libc::c_int
 }
 
 /// Owns readiness and pending-notification state without performing payload
@@ -1137,11 +1204,7 @@ fn blocking_recv_reactor(
             revents: 0,
         }));
 
-        let timeout = if channels_may_have_more {
-            0
-        } else {
-            BLOCKING_RECV_POLL_INTERVAL_MS
-        };
+        let timeout = blocking_recv_poll_timeout(&pending, &in_flight, channels_may_have_more);
         let rc =
             unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
@@ -1161,6 +1224,7 @@ fn blocking_recv_reactor(
         }
 
         queue_ready_blocking_recvs(&mut pending, &pollfds, &mut in_flight, &mut work_backlog);
+        queue_expired_blocking_recvs(&mut pending, &mut in_flight, &mut work_backlog);
 
         if last_validity_sweep.elapsed() >= validity_interval {
             let mut index = pending.len();
@@ -1206,19 +1270,32 @@ fn blocking_recv_reactor(
             }
             match completion.handling {
                 RecvHandling::Completed => {}
-                RecvHandling::Deferred { relay_fd, relay } => {
+                RecvHandling::Deferred {
+                    relay_fd,
+                    relay,
+                    state,
+                } => {
                     if completion.work.terminal_revents != 0 {
-                        send_blocking_recv_poll_error(
-                            listener_fd.as_raw_fd(),
-                            completion.work.notif.id,
-                            relay_fd.as_raw_fd(),
-                            completion.work.terminal_revents,
-                        );
+                        if state.completed == 0 {
+                            send_blocking_recv_poll_error(
+                                listener_fd.as_raw_fd(),
+                                completion.work.notif.id,
+                                relay_fd.as_raw_fd(),
+                                completion.work.terminal_revents,
+                            );
+                        } else {
+                            seccomp::send_value(
+                                listener_fd.as_raw_fd(),
+                                completion.work.notif.id,
+                                state.completed as i64,
+                            );
+                        }
                     } else {
                         pending.push(PendingBlockingRecv {
                             notif: completion.work.notif,
                             relay_fd,
                             relay,
+                            state,
                         });
                     }
                 }
@@ -1235,6 +1312,7 @@ fn blocking_recv_reactor(
                     notif,
                     relay: None,
                     terminal_revents: 0,
+                    state: BlockingRecvState::default(),
                 }),
                 Err(channel::TryRecvError::Empty) => break,
                 Err(channel::TryRecvError::Disconnected) => break 'reactor,
@@ -1285,10 +1363,14 @@ fn handle_recv_notification_once(
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
     wait_for_readable: bool,
+    state: BlockingRecvState,
 ) -> RecvHandling {
     match notif.data.nr as libc::c_long {
         libc::SYS_recvfrom => handle_recvfrom_once(listener_fd, notif, relays, wait_for_readable),
         libc::SYS_recvmsg => handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable),
+        libc::SYS_recvmmsg => {
+            handle_recvmmsg_once(listener_fd, notif, relays, wait_for_readable, state)
+        }
         _ => {
             seccomp::send_continue(listener_fd, notif.id);
             RecvHandling::Completed
@@ -1328,6 +1410,7 @@ fn handle_notification(
         libc::SYS_sendmmsg => handle_sendmmsg(listener_fd, notif, cfg, relays),
         libc::SYS_recvfrom => handle_recvfrom(listener_fd, notif, relays),
         libc::SYS_recvmsg => handle_recvmsg(listener_fd, notif, relays),
+        libc::SYS_recvmmsg => handle_recvmmsg(listener_fd, notif, relays),
         libc::SYS_close => handle_close(listener_fd, notif, relays),
         libc::SYS_close_range => handle_close_range(listener_fd, notif, relays),
         libc::SYS_dup2 | libc::SYS_dup3 => handle_fd_replacement(listener_fd, notif, relays),
@@ -2393,6 +2476,7 @@ fn handle_recvfrom_once(
             RecvHandling::Deferred {
                 relay_fd,
                 relay: handle.target_identity,
+                state: BlockingRecvState::default(),
             }
         }
         Err(err) => {
@@ -2467,27 +2551,9 @@ fn handle_recvmsg_once(
         wait_for_readable,
     ) {
         Ok(received) => {
-            let source = received.source;
-            if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
-                || write_proc_bytes(
-                    notif.pid,
-                    msg_ptr + X86_64_MSGHDR_FLAGS_OFFSET,
-                    &received.msg_flags.to_ne_bytes(),
-                )
-                .is_err()
-            {
+            if write_recvmsg_result(notif.pid, msg_ptr, &msg, &iovecs, &received).is_err() {
                 seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                 return RecvHandling::Completed;
-            }
-            if msg.name != 0 {
-                if let Some(source) = source {
-                    if write_sockaddr_to_msghdr(notif.pid, msg_ptr, msg.name, msg.name_len, source)
-                        .is_err()
-                    {
-                        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-                        return RecvHandling::Completed;
-                    }
-                }
             }
             seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
             RecvHandling::Completed
@@ -2496,6 +2562,7 @@ fn handle_recvmsg_once(
             RecvHandling::Deferred {
                 relay_fd,
                 relay: handle.target_identity,
+                state: BlockingRecvState::default(),
             }
         }
         Err(err) => {
@@ -2503,6 +2570,165 @@ fn handle_recvmsg_once(
             RecvHandling::Completed
         }
     }
+}
+
+fn handle_recvmmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let _ = handle_recvmmsg_once(
+        listener_fd,
+        notif,
+        relays,
+        true,
+        BlockingRecvState::default(),
+    );
+}
+
+fn handle_recvmmsg_once(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    relays: Arc<UdpRelayRegistry>,
+    _wait_for_readable: bool,
+    mut state: BlockingRecvState,
+) -> RecvHandling {
+    let target_fd = notif.data.args[0] as RawFd;
+    let msgvec = notif.data.args[1];
+    let vlen = notif.data.args[2] as usize;
+    let flags = notif.data.args[3] as i32;
+    let timeout_ptr = notif.data.args[4];
+
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return RecvHandling::Completed;
+    }
+    let Some((handle, relay_fd)) =
+        lookup_relay_for_recv(listener_fd, &notif, &relays, target_fd, flags)
+    else {
+        return RecvHandling::Completed;
+    };
+    if !state.timeout_initialized {
+        state.deadline = match read_recvmmsg_deadline(notif.pid, timeout_ptr) {
+            Ok(deadline) => deadline,
+            Err(err) => {
+                let errno = if err.kind() == io::ErrorKind::InvalidInput {
+                    libc::EINVAL
+                } else {
+                    libc::EFAULT
+                };
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return RecvHandling::Completed;
+            }
+        };
+        state.timeout_initialized = true;
+    }
+    if vlen == 0 {
+        seccomp::send_success(listener_fd, notif.id);
+        return RecvHandling::Completed;
+    }
+    if vlen > MAX_RECVMMSG_VLEN {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return RecvHandling::Completed;
+    }
+    if msgvec == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return RecvHandling::Completed;
+    }
+
+    let nonblocking = recv_is_nonblocking(relay_fd.as_raw_fd(), flags);
+    while state.completed < vlen {
+        if !seccomp::notif_id_valid(listener_fd, notif.id) {
+            return RecvHandling::Completed;
+        }
+        let Some(entry_offset) = state.completed.checked_mul(X86_64_MMSGHDR_SIZE) else {
+            send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+            return RecvHandling::Completed;
+        };
+        let Some(entry_ptr) = msgvec.checked_add(entry_offset as u64) else {
+            send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+            return RecvHandling::Completed;
+        };
+        let msg = match read_msghdr(notif.pid, entry_ptr) {
+            Ok(msg) => msg,
+            Err(_) => {
+                send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+                return RecvHandling::Completed;
+            }
+        };
+        let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
+            Ok(iovecs) => iovecs,
+            Err(_) => {
+                send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+                return RecvHandling::Completed;
+            }
+        };
+        let capacity = iovecs
+            .iter()
+            .try_fold(0_usize, |acc, iov| acc.checked_add(iov.len))
+            .filter(|len| *len <= MAX_UDP_PAYLOAD)
+            .unwrap_or(MAX_UDP_PAYLOAD);
+        let mut recv_flags = flags & !libc::MSG_WAITFORONE;
+        if state.completed > 0 && flags & libc::MSG_WAITFORONE != 0 {
+            recv_flags |= libc::MSG_DONTWAIT;
+        }
+
+        match recv_msg_from_relay_fd(
+            listener_fd,
+            notif.id,
+            relay_fd.as_raw_fd(),
+            capacity,
+            recv_flags,
+            &handle.pending_sources,
+            false,
+        ) {
+            Ok(received) => {
+                if write_recvmsg_result(notif.pid, entry_ptr, &msg, &iovecs, &received).is_err()
+                    || write_proc_bytes(
+                        notif.pid,
+                        entry_ptr + X86_64_MMSGHDR_LEN_OFFSET,
+                        &(received.result_len as u32).to_ne_bytes(),
+                    )
+                    .is_err()
+                {
+                    send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+                    return RecvHandling::Completed;
+                }
+                state.completed += 1;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let deadline_expired = state
+                    .deadline
+                    .is_some_and(|deadline| deadline <= Instant::now());
+                if state.completed > 0
+                    && (nonblocking || flags & libc::MSG_WAITFORONE != 0 || deadline_expired)
+                {
+                    seccomp::send_value(listener_fd, notif.id, state.completed as i64);
+                    return RecvHandling::Completed;
+                }
+                if deadline_expired {
+                    seccomp::send_success(listener_fd, notif.id);
+                    return RecvHandling::Completed;
+                }
+                if nonblocking {
+                    seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+                    return RecvHandling::Completed;
+                }
+                return RecvHandling::Deferred {
+                    relay_fd,
+                    relay: handle.target_identity,
+                    state,
+                };
+            }
+            Err(err) => {
+                send_mmsg_result_or_errno(
+                    listener_fd,
+                    notif.id,
+                    state.completed,
+                    errno_from_io(&err),
+                );
+                return RecvHandling::Completed;
+            }
+        }
+    }
+
+    seccomp::send_value(listener_fd, notif.id, state.completed as i64);
+    RecvHandling::Completed
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3902,6 +4128,36 @@ fn notification_interrupted() -> io::Error {
     io::Error::from_raw_os_error(libc::EINTR)
 }
 
+fn read_recvmmsg_deadline(pid: u32, timeout_ptr: u64) -> io::Result<Option<Instant>> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let raw = read_proc_bytes(pid, timeout_ptr, X86_64_TIMESPEC_SIZE)?;
+    let duration = parse_recvmmsg_timeout(&raw)?;
+    Instant::now()
+        .checked_add(duration)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recvmmsg timeout overflow"))
+}
+
+fn parse_recvmmsg_timeout(raw: &[u8]) -> io::Result<Duration> {
+    if raw.len() != X86_64_TIMESPEC_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid x86_64 timespec size",
+        ));
+    }
+    let seconds = i64::from_ne_bytes(raw[0..8].try_into().unwrap());
+    let nanos = i64::from_ne_bytes(raw[8..16].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid recvmmsg timeout",
+        ));
+    }
+    Ok(Duration::new(seconds as u64, nanos as u32))
+}
+
 fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::Result<()> {
     if payload.is_empty() {
         return Ok(());
@@ -3927,6 +4183,27 @@ fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::
     }
 
     process_vm_writev_all(pid, &mut local, &mut remote)
+}
+
+fn write_recvmsg_result(
+    pid: u32,
+    msg_ptr: u64,
+    msg: &TargetMsghdr,
+    iovecs: &[TargetIovec],
+    received: &RelayRecvmsg,
+) -> io::Result<()> {
+    write_iovec_payload(pid, iovecs, &received.payload)?;
+    write_proc_bytes(
+        pid,
+        msg_ptr + X86_64_MSGHDR_FLAGS_OFFSET,
+        &received.msg_flags.to_ne_bytes(),
+    )?;
+    if msg.name != 0 {
+        if let Some(source) = received.source {
+            write_sockaddr_to_msghdr(pid, msg_ptr, msg.name, msg.name_len, source)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_socklen(pid: u32, addr: u64) -> io::Result<u32> {
@@ -5080,16 +5357,19 @@ mod tests {
                 notif: first_notif,
                 relay_fd: create_eventfd().unwrap(),
                 relay: first_relay,
+                state: BlockingRecvState::default(),
             },
             PendingBlockingRecv {
                 notif: second_notif,
                 relay_fd: create_eventfd().unwrap(),
                 relay: first_relay,
+                state: BlockingRecvState::default(),
             },
             PendingBlockingRecv {
                 notif: third_notif,
                 relay_fd: create_eventfd().unwrap(),
                 relay: second_relay,
+                state: BlockingRecvState::default(),
             },
         ];
         let pollfds = std::iter::once(libc::pollfd {
@@ -5125,6 +5405,94 @@ mod tests {
     }
 
     #[test]
+    fn expired_recvmmsg_receive_reenters_worker_queue() {
+        let expired_relay = FdIdentity { dev: 1, ino: 1 };
+        let future_relay = FdIdentity { dev: 1, ino: 2 };
+        let mut pending = vec![
+            PendingBlockingRecv {
+                notif: SeccompNotif {
+                    id: 1,
+                    ..SeccompNotif::default()
+                },
+                relay_fd: create_eventfd().unwrap(),
+                relay: expired_relay,
+                state: BlockingRecvState {
+                    completed: 0,
+                    timeout_initialized: true,
+                    deadline: Some(Instant::now() - Duration::from_millis(1)),
+                },
+            },
+            PendingBlockingRecv {
+                notif: SeccompNotif {
+                    id: 2,
+                    ..SeccompNotif::default()
+                },
+                relay_fd: create_eventfd().unwrap(),
+                relay: future_relay,
+                state: BlockingRecvState {
+                    completed: 0,
+                    timeout_initialized: true,
+                    deadline: Some(Instant::now() + Duration::from_secs(1)),
+                },
+            },
+        ];
+        let mut in_flight = HashSet::new();
+        let mut work_backlog = VecDeque::new();
+
+        queue_expired_blocking_recvs(&mut pending, &mut in_flight, &mut work_backlog);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].relay, future_relay);
+        assert_eq!(work_backlog.len(), 1);
+        assert_eq!(work_backlog[0].relay, Some(expired_relay));
+        assert!(in_flight.contains(&expired_relay));
+    }
+
+    #[test]
+    fn recvmmsg_timeout_controls_reactor_poll_deadline() {
+        let relay = FdIdentity { dev: 1, ino: 1 };
+        let pending = vec![PendingBlockingRecv {
+            notif: SeccompNotif::default(),
+            relay_fd: create_eventfd().unwrap(),
+            relay,
+            state: BlockingRecvState {
+                completed: 0,
+                timeout_initialized: true,
+                deadline: Some(Instant::now() + Duration::from_secs(10)),
+            },
+        }];
+
+        let timeout = blocking_recv_poll_timeout(&pending, &HashSet::new(), false);
+
+        assert_eq!(timeout, BLOCKING_RECV_POLL_INTERVAL_MS);
+        assert_eq!(
+            blocking_recv_poll_timeout(&pending, &HashSet::new(), true),
+            0
+        );
+    }
+
+    #[test]
+    fn parses_x86_64_recvmmsg_timeout() {
+        let mut raw = [0_u8; X86_64_TIMESPEC_SIZE];
+        raw[0..8].copy_from_slice(&2_i64.to_ne_bytes());
+        raw[8..16].copy_from_slice(&3_i64.to_ne_bytes());
+
+        assert_eq!(parse_recvmmsg_timeout(&raw).unwrap(), Duration::new(2, 3));
+
+        raw[0..8].copy_from_slice(&(-1_i64).to_ne_bytes());
+        assert_eq!(
+            parse_recvmmsg_timeout(&raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        raw[0..8].copy_from_slice(&0_i64.to_ne_bytes());
+        raw[8..16].copy_from_slice(&1_000_000_000_i64.to_ne_bytes());
+        assert_eq!(
+            parse_recvmmsg_timeout(&raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn explicit_nonblocking_receives_skip_blocking_reactor() {
         let mut recvfrom = SeccompNotif::default();
         recvfrom.data.nr = libc::SYS_recvfrom as i32;
@@ -5137,6 +5505,12 @@ mod tests {
         assert!(is_blocking_recv_notification(&recvmsg));
         recvmsg.data.args[2] = libc::MSG_DONTWAIT as u64;
         assert!(!is_blocking_recv_notification(&recvmsg));
+
+        let mut recvmmsg = SeccompNotif::default();
+        recvmmsg.data.nr = libc::SYS_recvmmsg as i32;
+        assert!(is_blocking_recv_notification(&recvmmsg));
+        recvmmsg.data.args[3] = libc::MSG_DONTWAIT as u64;
+        assert!(!is_blocking_recv_notification(&recvmmsg));
 
         let mut sendmsg = SeccompNotif::default();
         sendmsg.data.nr = libc::SYS_sendmsg as i32;

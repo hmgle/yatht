@@ -11,15 +11,27 @@ use tempfile::TempDir;
 
 const UDP_METADATA_QUERY: &[u8] = b"receive-metadata-query";
 const UDP_METADATA_RESPONSE: &[u8] = b"receive-metadata-response";
-const UDP_RECVMMSG_QUERIES: [&[u8]; 3] = [
+const UDP_RECVMMSG_QUERIES: [&[u8]; 4] = [
     b"recvmmsg-query-one",
     b"recvmmsg-query-two",
     b"recvmmsg-query-three",
+    b"recvmmsg-query-four",
 ];
-const UDP_RECVMMSG_RESPONSES: [&[u8]; 3] = [
+const UDP_RECVMMSG_RESPONSES: [&[u8]; 4] = [
     b"recvmmsg-first-response",
     b"recvmmsg-second-response",
     b"recvmmsg-third-response",
+    b"recvmmsg-fourth-response",
+];
+const UDP_RECVMMSG_FLAG_QUERIES: [&[u8]; 3] = [
+    b"recvmmsg-peek-query",
+    b"recvmmsg-wait-one-query",
+    b"recvmmsg-wait-two-query",
+];
+const UDP_RECVMMSG_FLAG_RESPONSES: [&[u8]; 3] = [
+    b"recvmmsg-peek-response",
+    b"recvmmsg-wait-one-response",
+    b"recvmmsg-wait-two-response",
 ];
 
 #[test]
@@ -405,6 +417,253 @@ fn direct_kernel_recvmmsg_source_and_mixed_receive_baseline() {
     assert_success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "recvmmsg-ok");
     server_thread.join().unwrap();
+}
+
+#[test]
+fn direct_kernel_recvmmsg_error_and_nonblocking_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_error_probe();
+    let output = Command::new(&probe).output().unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-errors-ok"
+    );
+}
+
+#[test]
+fn stable_udp_recvmmsg_matches_error_and_nonblocking_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_error_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-errors-ok"
+    );
+}
+
+#[test]
+fn stable_udp_recvmmsg_honors_an_empty_queue_deadline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_deadline_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-deadline-ok"
+    );
+}
+
+#[test]
+fn direct_kernel_recvmmsg_returns_partial_count_before_bad_entry() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_partial_probe();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-partial-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_recvmmsg_returns_partial_count_before_bad_entry() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_partial_probe();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-partial-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn direct_kernel_recvmmsg_peek_and_waitforone_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_flag_probe();
+    let (destination, response_sources, server_thread) = spawn_udp_recvmmsg_flag_exchange();
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .args(response_sources.map(|source| source.to_string()))
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "recvmmsg-flags-ok");
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_recvmmsg_preserves_peek_and_waitforone() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_flag_probe();
+    let (destination, response_sources, server_thread) = spawn_udp_recvmmsg_flag_exchange();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .args(response_sources.map(|source| source.to_string()))
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "recvmmsg-flags-ok");
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_direct_recvmmsg_preserves_sources_and_queue_order() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_source_probe();
+    let (destination, response_sources, server_thread) = spawn_changed_source_udp_batch_exchange();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .args(response_sources.map(|source| source.to_string()))
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "recvmmsg-ok");
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_proxy_recvmmsg_preserves_sources_and_queue_order() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_source_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 15), 4499));
+    let response_sources = [
+        SocketAddr::from((Ipv4Addr::new(203, 0, 113, 31), 5601)),
+        SocketAddr::from((Ipv4Addr::new(203, 0, 113, 32), 5602)),
+        SocketAddr::from((Ipv4Addr::new(203, 0, 113, 33), 5603)),
+        SocketAddr::from((Ipv4Addr::new(203, 0, 113, 34), 5604)),
+    ];
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        for index in 0..4 {
+            let mut packet = vec![0_u8; 2048];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            packet.truncate(n);
+            let (actual_destination, payload) = parse_udp_packet(&packet);
+            assert_eq!(actual_destination, destination);
+            assert_eq!(payload, UDP_RECVMMSG_QUERIES[index]);
+            udp.send_to(
+                &encode_udp_packet(response_sources[index], UDP_RECVMMSG_RESPONSES[index]),
+                peer,
+            )
+            .unwrap();
+        }
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .args(response_sources.map(|source| source.to_string()))
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "recvmmsg-ok");
+    socks_thread.join().unwrap();
 }
 
 #[test]
@@ -1484,12 +1743,14 @@ fn build_udp_recvmmsg_source_probe() -> (TempDir, PathBuf) {
 #include <unistd.h>
 
 static const char *queries[] = {
-    "recvmmsg-query-one", "recvmmsg-query-two", "recvmmsg-query-three"
+    "recvmmsg-query-one", "recvmmsg-query-two", "recvmmsg-query-three",
+    "recvmmsg-query-four"
 };
 static const char *responses[] = {
     "recvmmsg-first-response",
     "recvmmsg-second-response",
-    "recvmmsg-third-response"
+    "recvmmsg-third-response",
+    "recvmmsg-fourth-response"
 };
 
 static int parse_address(const char *value, struct sockaddr_in *address) {
@@ -1512,11 +1773,11 @@ static int same_address(const struct sockaddr_in *left,
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) return 2;
+    if (argc != 6) return 2;
     struct sockaddr_in destination;
-    struct sockaddr_in expected_sources[3];
+    struct sockaddr_in expected_sources[4];
     if (parse_address(argv[1], &destination) != 0) return 3;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (parse_address(argv[i + 2], &expected_sources[i]) != 0) return 4;
     }
 
@@ -1525,10 +1786,10 @@ int main(int argc, char **argv) {
     struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 6;
 
-    struct iovec send_iov[3];
-    struct mmsghdr send_msgs[3];
+    struct iovec send_iov[4];
+    struct mmsghdr send_msgs[4];
     memset(send_msgs, 0, sizeof(send_msgs));
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         send_iov[i].iov_base = (void *)queries[i];
         send_iov[i].iov_len = strlen(queries[i]);
         send_msgs[i].msg_hdr.msg_name = &destination;
@@ -1536,7 +1797,7 @@ int main(int argc, char **argv) {
         send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
         send_msgs[i].msg_hdr.msg_iovlen = 1;
     }
-    if (sendmmsg(fd, send_msgs, 3, 0) != 3) return 7;
+    if (sendmmsg(fd, send_msgs, 4, 0) != 4) return 7;
 
     char first[7];
     char second[64];
@@ -1576,7 +1837,396 @@ int main(int argc, char **argv) {
         memcmp(third, responses[2], (size_t)third_len) != 0) return 12;
     if (third_source_len != sizeof(third_source) ||
         !same_address(&third_source, &expected_sources[2])) return 13;
-    if (write(STDOUT_FILENO, "recvmmsg-ok", 11) != 11) return 14;
+
+    char fourth[64];
+    struct iovec fourth_iov = { .iov_base = fourth, .iov_len = sizeof(fourth) };
+    struct sockaddr_in fourth_source;
+    struct msghdr fourth_msg;
+    memset(&fourth_msg, 0, sizeof(fourth_msg));
+    fourth_msg.msg_name = &fourth_source;
+    fourth_msg.msg_namelen = sizeof(fourth_source);
+    fourth_msg.msg_iov = &fourth_iov;
+    fourth_msg.msg_iovlen = 1;
+    ssize_t fourth_len = recvmsg(fd, &fourth_msg, 0);
+    if (fourth_len != (ssize_t)strlen(responses[3]) ||
+        memcmp(fourth, responses[3], (size_t)fourth_len) != 0) return 14;
+    if (fourth_msg.msg_namelen != sizeof(fourth_source) ||
+        !same_address(&fourth_source, &expected_sources[3])) return 15;
+    if (write(STDOUT_FILENO, "recvmmsg-ok", 11) != 11) return 16;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_recvmmsg_error_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_recvmmsg_error_probe.c");
+    let bin = dir.path().join("udp_recvmmsg_error_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 2;
+
+    char buffer[1];
+    struct iovec iov = { .iov_base = buffer, .iov_len = sizeof(buffer) };
+    struct mmsghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_hdr.msg_iov = &iov;
+    msg.msg_hdr.msg_iovlen = 1;
+
+    errno = 0;
+    if (recvmmsg(fd, NULL, 0, MSG_DONTWAIT, NULL) != 0) return 3;
+
+    errno = 0;
+    if (recvmmsg(fd, NULL, 1, MSG_DONTWAIT, NULL) != -1 || errno != EFAULT) return 4;
+
+    struct timespec invalid = { .tv_sec = 0, .tv_nsec = 1000000000 };
+    errno = 0;
+    if (recvmmsg(fd, &msg, 1, MSG_DONTWAIT, &invalid) != -1 || errno != EINVAL) return 5;
+
+    errno = 0;
+    if (recvmmsg(fd, &msg, 1, MSG_DONTWAIT,
+                 (struct timespec *)1) != -1 || errno != EFAULT) return 6;
+
+    errno = 0;
+    if (recvmmsg(fd, NULL, 0, MSG_DONTWAIT,
+                 (struct timespec *)1) != -1 || errno != EFAULT) return 7;
+
+    int status = fcntl(fd, F_GETFL, 0);
+    if (status < 0 || fcntl(fd, F_SETFL, status | O_NONBLOCK) != 0) return 8;
+    errno = 0;
+    if (recvmmsg(fd, &msg, 1, 0, NULL) != -1 ||
+        (errno != EAGAIN && errno != EWOULDBLOCK)) return 9;
+
+    if (write(STDOUT_FILENO, "recvmmsg-errors-ok", 18) != 18) return 10;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_recvmmsg_deadline_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_recvmmsg_deadline_probe.c");
+    let bin = dir.path().join("udp_recvmmsg_deadline_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 2;
+    char buffer[1];
+    struct iovec iov = { .iov_base = buffer, .iov_len = sizeof(buffer) };
+    struct mmsghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_hdr.msg_iov = &iov;
+    msg.msg_hdr.msg_iovlen = 1;
+    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 50000000 };
+    if (recvmmsg(fd, &msg, 1, 0, &timeout) != 0) return 3;
+    errno = 0;
+    if (recvmmsg(fd, &msg, 1025, MSG_DONTWAIT, NULL) != -1 ||
+        errno != EINVAL) return 4;
+    if (write(STDOUT_FILENO, "recvmmsg-deadline-ok", 20) != 20) return 5;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_recvmmsg_partial_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_recvmmsg_partial_probe.c");
+    let bin = dir.path().join("udp_recvmmsg_partial_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int parse_address(const char *value, struct sockaddr_in *address) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+static int same_address(const struct sockaddr_in *left,
+                        const struct sockaddr_in *right) {
+    return left->sin_family == right->sin_family &&
+           left->sin_port == right->sin_port &&
+           left->sin_addr.s_addr == right->sin_addr.s_addr;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    struct sockaddr_in destination;
+    struct sockaddr_in expected_source;
+    if (parse_address(argv[1], &destination) != 0 ||
+        parse_address(argv[2], &expected_source) != 0) return 3;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 4;
+    const char query[] = "receive-metadata-query";
+    if (sendto(fd, query, sizeof(query) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(query) - 1)) return 5;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 6;
+    void *mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return 7;
+    struct mmsghdr *msgs = (struct mmsghdr *)((char *)mapping + page_size -
+                                               sizeof(struct mmsghdr));
+    char response[64];
+    struct iovec iov = { .iov_base = response, .iov_len = sizeof(response) };
+    struct sockaddr_in source;
+    memset(msgs, 0, sizeof(*msgs));
+    msgs[0].msg_hdr.msg_name = &source;
+    msgs[0].msg_hdr.msg_namelen = sizeof(source);
+    msgs[0].msg_hdr.msg_iov = &iov;
+    msgs[0].msg_hdr.msg_iovlen = 1;
+    if (mprotect((char *)mapping + page_size, (size_t)page_size, PROT_NONE) != 0) return 8;
+
+    if (recvmmsg(fd, msgs, 2, 0, NULL) != 1) return 9;
+    const char expected[] = "receive-metadata-response";
+    if (msgs[0].msg_len != sizeof(expected) - 1 ||
+        memcmp(response, expected, sizeof(expected) - 1) != 0) return 10;
+    if (msgs[0].msg_hdr.msg_namelen != sizeof(source) ||
+        !same_address(&source, &expected_source)) return 11;
+
+    if (write(STDOUT_FILENO, "recvmmsg-partial-ok", 19) != 19) return 12;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_recvmmsg_flag_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_recvmmsg_flag_probe.c");
+    let bin = dir.path().join("udp_recvmmsg_flag_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static const char *queries[] = {
+    "recvmmsg-peek-query",
+    "recvmmsg-wait-one-query",
+    "recvmmsg-wait-two-query"
+};
+static const char *responses[] = {
+    "recvmmsg-peek-response",
+    "recvmmsg-wait-one-response",
+    "recvmmsg-wait-two-response"
+};
+
+static int parse_address(const char *value, struct sockaddr_in *address) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+static int same_address(const struct sockaddr_in *left,
+                        const struct sockaddr_in *right) {
+    return left->sin_family == right->sin_family &&
+           left->sin_port == right->sin_port &&
+           left->sin_addr.s_addr == right->sin_addr.s_addr;
+}
+
+static int check_message(const struct mmsghdr *msg, const char *payload,
+                         const char *expected,
+                         const struct sockaddr_in *source,
+                         const struct sockaddr_in *expected_source) {
+    return msg->msg_len == strlen(expected) &&
+           memcmp(payload, expected, strlen(expected)) == 0 &&
+           msg->msg_hdr.msg_namelen == sizeof(*source) &&
+           same_address(source, expected_source);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 5) return 2;
+    struct sockaddr_in destination;
+    struct sockaddr_in expected_sources[3];
+    if (parse_address(argv[1], &destination) != 0) return 3;
+    for (int i = 0; i < 3; ++i) {
+        if (parse_address(argv[i + 2], &expected_sources[i]) != 0) return 4;
+    }
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 5;
+    struct timeval socket_timeout = { .tv_sec = 5, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &socket_timeout,
+                   sizeof(socket_timeout)) != 0) return 6;
+
+    if (sendto(fd, queries[0], strlen(queries[0]), 0,
+               (struct sockaddr *)&destination, sizeof(destination)) < 0) return 7;
+    char peek_payload[64];
+    struct sockaddr_in peek_source;
+    struct iovec peek_iov = {
+        .iov_base = peek_payload, .iov_len = sizeof(peek_payload)
+    };
+    struct mmsghdr peek_msg;
+    memset(&peek_msg, 0, sizeof(peek_msg));
+    peek_msg.msg_hdr.msg_name = &peek_source;
+    peek_msg.msg_hdr.msg_namelen = sizeof(peek_source);
+    peek_msg.msg_hdr.msg_iov = &peek_iov;
+    peek_msg.msg_hdr.msg_iovlen = 1;
+    if (recvmmsg(fd, &peek_msg, 1, MSG_PEEK, NULL) != 1 ||
+        !check_message(&peek_msg, peek_payload, responses[0], &peek_source,
+                       &expected_sources[0])) return 8;
+
+    char consumed[64];
+    struct sockaddr_in consumed_source;
+    socklen_t consumed_source_len = sizeof(consumed_source);
+    ssize_t consumed_len = recvfrom(fd, consumed, sizeof(consumed), 0,
+                                    (struct sockaddr *)&consumed_source,
+                                    &consumed_source_len);
+    if (consumed_len != (ssize_t)strlen(responses[0]) ||
+        memcmp(consumed, responses[0], (size_t)consumed_len) != 0 ||
+        consumed_source_len != sizeof(consumed_source) ||
+        !same_address(&consumed_source, &expected_sources[0])) return 9;
+
+    struct iovec send_iov[2];
+    struct mmsghdr send_msgs[2];
+    memset(send_msgs, 0, sizeof(send_msgs));
+    for (int i = 0; i < 2; ++i) {
+        send_iov[i].iov_base = (void *)queries[i + 1];
+        send_iov[i].iov_len = strlen(queries[i + 1]);
+        send_msgs[i].msg_hdr.msg_name = &destination;
+        send_msgs[i].msg_hdr.msg_namelen = sizeof(destination);
+        send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
+        send_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    if (sendmmsg(fd, send_msgs, 2, 0) != 2) return 10;
+
+    char wait_payloads[2][64];
+    struct sockaddr_in wait_sources[2];
+    struct iovec wait_iov[2];
+    struct mmsghdr wait_msgs[2];
+    memset(wait_msgs, 0, sizeof(wait_msgs));
+    for (int i = 0; i < 2; ++i) {
+        wait_iov[i].iov_base = wait_payloads[i];
+        wait_iov[i].iov_len = sizeof(wait_payloads[i]);
+        wait_msgs[i].msg_hdr.msg_name = &wait_sources[i];
+        wait_msgs[i].msg_hdr.msg_namelen = sizeof(wait_sources[i]);
+        wait_msgs[i].msg_hdr.msg_iov = &wait_iov[i];
+        wait_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    if (recvmmsg(fd, wait_msgs, 2, MSG_WAITFORONE, NULL) != 1 ||
+        !check_message(&wait_msgs[0], wait_payloads[0], responses[1],
+                       &wait_sources[0], &expected_sources[1])) return 11;
+
+    char final_payload[64];
+    struct sockaddr_in final_source;
+    socklen_t final_source_len = sizeof(final_source);
+    ssize_t final_len = recvfrom(fd, final_payload, sizeof(final_payload), 0,
+                                 (struct sockaddr *)&final_source,
+                                 &final_source_len);
+    if (final_len != (ssize_t)strlen(responses[2]) ||
+        memcmp(final_payload, responses[2], (size_t)final_len) != 0 ||
+        final_source_len != sizeof(final_source) ||
+        !same_address(&final_source, &expected_sources[2])) return 12;
+
+    if (write(STDOUT_FILENO, "recvmmsg-flags-ok", 17) != 17) return 13;
     return 0;
 }
 "#,
@@ -1610,8 +2260,26 @@ fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinH
     (destination, response_source, server_thread)
 }
 
-fn spawn_changed_source_udp_batch_exchange() -> (SocketAddr, [SocketAddr; 3], thread::JoinHandle<()>)
+fn spawn_changed_source_udp_batch_exchange() -> (SocketAddr, [SocketAddr; 4], thread::JoinHandle<()>)
 {
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let senders = std::array::from_fn::<_, 4, _>(|_| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let response_sources = senders
+        .each_ref()
+        .map(|sender| sender.local_addr().unwrap());
+    let server_thread = thread::spawn(move || {
+        for (index, sender) in senders.into_iter().enumerate() {
+            let mut query = [0_u8; 128];
+            let (n, peer) = receiver.recv_from(&mut query).unwrap();
+            assert_eq!(&query[..n], UDP_RECVMMSG_QUERIES[index]);
+            sender.send_to(UDP_RECVMMSG_RESPONSES[index], peer).unwrap();
+        }
+    });
+    (destination, response_sources, server_thread)
+}
+
+fn spawn_udp_recvmmsg_flag_exchange() -> (SocketAddr, [SocketAddr; 3], thread::JoinHandle<()>) {
     let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
     let destination = receiver.local_addr().unwrap();
     let senders = std::array::from_fn::<_, 3, _>(|_| UdpSocket::bind("127.0.0.1:0").unwrap());
@@ -1622,8 +2290,13 @@ fn spawn_changed_source_udp_batch_exchange() -> (SocketAddr, [SocketAddr; 3], th
         for (index, sender) in senders.into_iter().enumerate() {
             let mut query = [0_u8; 128];
             let (n, peer) = receiver.recv_from(&mut query).unwrap();
-            assert_eq!(&query[..n], UDP_RECVMMSG_QUERIES[index]);
-            sender.send_to(UDP_RECVMMSG_RESPONSES[index], peer).unwrap();
+            assert_eq!(&query[..n], UDP_RECVMMSG_FLAG_QUERIES[index]);
+            if index == 2 {
+                thread::sleep(Duration::from_millis(200));
+            }
+            sender
+                .send_to(UDP_RECVMMSG_FLAG_RESPONSES[index], peer)
+                .unwrap();
         }
     });
     (destination, response_sources, server_thread)
