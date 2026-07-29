@@ -33,6 +33,21 @@ const UDP_RECVMMSG_FLAG_RESPONSES: [&[u8]; 3] = [
     b"recvmmsg-wait-one-response",
     b"recvmmsg-wait-two-response",
 ];
+const UDP_RCVTIMEO_BATCH_QUERIES: [&[u8]; 2] =
+    [b"rcvtimeo-batch-query-one", b"rcvtimeo-batch-query-two"];
+const UDP_RCVTIMEO_BATCH_RESPONSES: [&[u8]; 2] = [
+    b"rcvtimeo-batch-response-one",
+    b"rcvtimeo-batch-response-two",
+];
+const UDP_RCVTIMEO_LATE_QUERY: &[u8] = b"rcvtimeo-late-query";
+const UDP_RCVTIMEO_LATE_RESPONSE: &[u8] = b"rcvtimeo-late-response";
+const UDP_RCVTIMEO_PROMPT_QUERY: &[u8] = b"rcvtimeo-prompt-query";
+const UDP_RCVTIMEO_PROMPT_RESPONSE: &[u8] = b"rcvtimeo-prompt-response";
+// The probe arms a 500 ms SO_RCVTIMEO; the batch gap must stay well under it
+// so the per-entry reset keeps both responses, and the late delay must exceed
+// it so a cleared timeout provably blocks past the old deadline.
+const UDP_RCVTIMEO_BATCH_GAP: Duration = Duration::from_millis(250);
+const UDP_RCVTIMEO_LATE_DELAY: Duration = Duration::from_millis(700);
 
 #[test]
 fn does_not_replace_non_socket_fd_for_udp_send() {
@@ -481,6 +496,25 @@ fn stable_udp_recvmmsg_honors_an_empty_queue_deadline() {
         String::from_utf8_lossy(&output.stdout),
         "recvmmsg-deadline-ok"
     );
+}
+
+#[test]
+fn direct_kernel_udp_receive_rcvtimeo_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_rcvtimeo_probe();
+    let (destination, server_thread) = spawn_udp_rcvtimeo_exchange();
+
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "rcvtimeo-ok");
+    server_thread.join().unwrap();
 }
 
 #[test]
@@ -2246,6 +2280,209 @@ int main(int argc, char **argv) {
     (dir, bin)
 }
 
+fn build_udp_rcvtimeo_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_rcvtimeo_probe.c");
+    let bin = dir.path().join("udp_rcvtimeo_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+static const char batch_query_one[] = "rcvtimeo-batch-query-one";
+static const char batch_query_two[] = "rcvtimeo-batch-query-two";
+static const char batch_response_one[] = "rcvtimeo-batch-response-one";
+static const char batch_response_two[] = "rcvtimeo-batch-response-two";
+static const char late_query[] = "rcvtimeo-late-query";
+static const char late_response[] = "rcvtimeo-late-response";
+static const char prompt_query[] = "rcvtimeo-prompt-query";
+static const char prompt_response[] = "rcvtimeo-prompt-response";
+
+static int parse_address(const char *value, struct sockaddr_in *address) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+static long elapsed_ms(const struct timespec *start) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (now.tv_sec - start->tv_sec) * 1000L +
+           (now.tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+static int set_rcvtimeo_ms(int fd, long ms) {
+    struct timeval timeout = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+}
+
+static void reset_batch(struct mmsghdr *batch, struct iovec *iovs,
+                        char (*buffers)[128], unsigned int count) {
+    memset(batch, 0, sizeof(*batch) * count);
+    for (unsigned int index = 0; index < count; index++) {
+        iovs[index].iov_base = buffers[index];
+        iovs[index].iov_len = sizeof(buffers[index]);
+        batch[index].msg_hdr.msg_iov = &iovs[index];
+        batch[index].msg_hdr.msg_iovlen = 1;
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    struct sockaddr_in destination;
+    if (parse_address(argv[1], &destination) != 0) return 3;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 4;
+    if (set_rcvtimeo_ms(fd, 500) != 0) return 5;
+
+    /* The stored timeout reads back through getsockopt. */
+    struct timeval readback = { .tv_sec = 0, .tv_usec = 0 };
+    socklen_t readback_len = sizeof(readback);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &readback, &readback_len) != 0) return 6;
+    long readback_ms = readback.tv_sec * 1000L + readback.tv_usec / 1000L;
+    if (readback_len != sizeof(readback) || readback_ms < 490 || readback_ms > 510) return 7;
+
+    char buffer[128];
+    struct timespec start;
+
+    /* A quiet blocking recvfrom expires with EAGAIN at the socket timeout. */
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 8;
+    errno = 0;
+    if (recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL) != -1 || errno != EAGAIN) return 9;
+    long waited = elapsed_ms(&start);
+    if (waited < 450 || waited > 5000) return 10;
+
+    /* A quiet blocking recvmsg expires the same way. */
+    struct iovec single_iov = { .iov_base = buffer, .iov_len = sizeof(buffer) };
+    struct msghdr single;
+    memset(&single, 0, sizeof(single));
+    single.msg_iov = &single_iov;
+    single.msg_iovlen = 1;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 11;
+    errno = 0;
+    if (recvmsg(fd, &single, 0) != -1 || errno != EAGAIN) return 12;
+    waited = elapsed_ms(&start);
+    if (waited < 450 || waited > 5000) return 13;
+
+    /* MSG_DONTWAIT returns immediately despite the socket timeout. */
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 14;
+    errno = 0;
+    if (recvfrom(fd, buffer, sizeof(buffer), MSG_DONTWAIT, NULL, NULL) != -1 ||
+        errno != EAGAIN) return 15;
+    waited = elapsed_ms(&start);
+    if (waited < 0 || waited > 250) return 16;
+
+    /* O_NONBLOCK returns immediately despite the socket timeout. */
+    int status = fcntl(fd, F_GETFL);
+    if (status < 0 || fcntl(fd, F_SETFL, status | O_NONBLOCK) != 0) return 17;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 18;
+    errno = 0;
+    if (recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL) != -1 || errno != EAGAIN) return 19;
+    waited = elapsed_ms(&start);
+    if (waited < 0 || waited > 250) return 20;
+    if (fcntl(fd, F_SETFL, status & ~O_NONBLOCK) != 0) return 21;
+
+    /* A quiet recvmmsg without an explicit timeout expires with EAGAIN. */
+    struct mmsghdr batch[3];
+    struct iovec batch_iovs[3];
+    char batch_buffers[3][128];
+    reset_batch(batch, batch_iovs, batch_buffers, 3);
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 22;
+    errno = 0;
+    if (recvmmsg(fd, batch, 1, 0, NULL) != -1 || errno != EAGAIN) return 23;
+    waited = elapsed_ms(&start);
+    if (waited < 450 || waited > 5000) return 24;
+
+    /* The shorter socket timeout beats a longer explicit recvmmsg timeout. */
+    struct timespec explicit_timeout = { .tv_sec = 3, .tv_nsec = 0 };
+    reset_batch(batch, batch_iovs, batch_buffers, 3);
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 25;
+    errno = 0;
+    if (recvmmsg(fd, batch, 2, 0, &explicit_timeout) != -1 || errno != EAGAIN) return 26;
+    waited = elapsed_ms(&start);
+    if (waited < 450 || waited > 2000) return 27;
+
+    /* The socket timeout bounds each inter-datagram gap: a batch whose second
+       response arrives after the first still completes, and the trailing
+       quiet wait adds a full timeout, proving the deadline resets per entry. */
+    if (sendto(fd, batch_query_one, sizeof(batch_query_one) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(batch_query_one) - 1)) return 28;
+    if (sendto(fd, batch_query_two, sizeof(batch_query_two) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(batch_query_two) - 1)) return 29;
+    reset_batch(batch, batch_iovs, batch_buffers, 3);
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 30;
+    if (recvmmsg(fd, batch, 3, 0, NULL) != 2) return 31;
+    waited = elapsed_ms(&start);
+    if (waited < 700 || waited > 5000) return 32;
+    if (batch[0].msg_len != sizeof(batch_response_one) - 1 ||
+        memcmp(batch_buffers[0], batch_response_one, sizeof(batch_response_one) - 1) != 0)
+        return 33;
+    if (batch[1].msg_len != sizeof(batch_response_two) - 1 ||
+        memcmp(batch_buffers[1], batch_response_two, sizeof(batch_response_two) - 1) != 0)
+        return 34;
+
+    /* Clearing the timeout back to zero restores indefinite blocking: the
+       late response lands after the old 500 ms deadline would have fired. */
+    if (set_rcvtimeo_ms(fd, 0) != 0) return 35;
+    if (sendto(fd, late_query, sizeof(late_query) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(late_query) - 1)) return 36;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 37;
+    ssize_t received = recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL);
+    if (received != (ssize_t)(sizeof(late_response) - 1) ||
+        memcmp(buffer, late_response, sizeof(late_response) - 1) != 0) return 38;
+    waited = elapsed_ms(&start);
+    if (waited < 600 || waited > 5000) return 39;
+
+    /* A response inside the window still completes before the timeout. */
+    if (set_rcvtimeo_ms(fd, 500) != 0) return 40;
+    if (sendto(fd, prompt_query, sizeof(prompt_query) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(prompt_query) - 1)) return 41;
+    received = recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL);
+    if (received != (ssize_t)(sizeof(prompt_response) - 1) ||
+        memcmp(buffer, prompt_response, sizeof(prompt_response) - 1) != 0) return 42;
+
+    if (close(fd) != 0) return 43;
+    if (write(STDOUT_FILENO, "rcvtimeo-ok", 11) != 11) return 44;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
 fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinHandle<()>) {
     let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
     let destination = receiver.local_addr().unwrap();
@@ -2300,6 +2537,45 @@ fn spawn_udp_recvmmsg_flag_exchange() -> (SocketAddr, [SocketAddr; 3], thread::J
         }
     });
     (destination, response_sources, server_thread)
+}
+
+fn spawn_udp_rcvtimeo_exchange() -> (SocketAddr, thread::JoinHandle<()>) {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = server.local_addr().unwrap();
+    let server_thread = thread::spawn(move || {
+        let script: [(&[u8], &[u8], Duration); 4] = [
+            (
+                UDP_RCVTIMEO_BATCH_QUERIES[0],
+                UDP_RCVTIMEO_BATCH_RESPONSES[0],
+                Duration::ZERO,
+            ),
+            (
+                UDP_RCVTIMEO_BATCH_QUERIES[1],
+                UDP_RCVTIMEO_BATCH_RESPONSES[1],
+                UDP_RCVTIMEO_BATCH_GAP,
+            ),
+            (
+                UDP_RCVTIMEO_LATE_QUERY,
+                UDP_RCVTIMEO_LATE_RESPONSE,
+                UDP_RCVTIMEO_LATE_DELAY,
+            ),
+            (
+                UDP_RCVTIMEO_PROMPT_QUERY,
+                UDP_RCVTIMEO_PROMPT_RESPONSE,
+                Duration::ZERO,
+            ),
+        ];
+        for (expected_query, response, delay) in script {
+            let mut query = [0_u8; 128];
+            let (n, peer) = server.recv_from(&mut query).unwrap();
+            assert_eq!(&query[..n], expected_query);
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            server.send_to(response, peer).unwrap();
+        }
+    });
+    (destination, server_thread)
 }
 
 fn build_reconnecting_udp_probe() -> (TempDir, PathBuf) {
