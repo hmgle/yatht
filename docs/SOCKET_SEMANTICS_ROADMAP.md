@@ -91,16 +91,18 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
 5. [~] Stable mode rewrites `sendmmsg(2)` and supports batched responses via
-   `recvmmsg(2)` on the endpoint. Source-address/ancillary-data virtualization,
-   unsolicited datagrams, error queues, and multi-response ordering remain the
-   next compatibility slice.
+   `recvmmsg(2)` on the endpoint. It now virtualizes `getsockname(2)`,
+   `getpeername(2)`, and the common `SOL_SOCKET` identity options for the
+   logical AF_INET/AF_INET6 UDP socket. Source-address/ancillary-data
+   virtualization, unsolicited datagrams, error queues, and multi-response
+   ordering remain the next compatibility slice.
 
 AF_UNIX cannot receive arbitrary IP error-queue entries or generate matching
 `EPOLLERR` state. `IP_RECVERR`, `MSG_ERRQUEUE`, packet-info control messages,
-and untrapped domain/protocol queries remain explicit limitations. The
-descriptor-identity slice is delivered, but the full milestone remains open
-until the remaining IP-level semantics have explicit tests and a documented
-policy.
+and other untrapped IP-level options remain explicit limitations. The
+descriptor-identity and basic logical-query slices are delivered, but the full
+milestone remains open until the remaining IP-level semantics have explicit
+tests and a documented policy.
 
 ## Milestone 3: Rootless Network Backends
 

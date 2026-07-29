@@ -157,8 +157,14 @@ process should stay on lazy mode for now.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`;
-`recvmmsg(2)` is served by the injected AF_UNIX datagram endpoint, so its source
-address and ancillary-data semantics remain limited.
+`recvmmsg(2)` is served by the injected AF_UNIX datagram endpoint. Stable mode
+also virtualizes `getsockname(2)`, `getpeername(2)`, and the common
+`SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
+`SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
+addresses are logical relay state; an unbound socket reports its family's
+wildcard address with port zero, and an explicitly bound port zero is not
+replaced with a kernel-assigned ephemeral port. Source-address, ancillary-data,
+error-queue, and other IP-level option semantics remain limited.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

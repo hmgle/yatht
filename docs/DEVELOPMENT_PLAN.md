@@ -72,7 +72,8 @@ is `socks5://127.0.0.1:1080`.
 - The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
   send/receive plus descriptor close/replacement syscalls only when DNS or
   generic UDP redirection is enabled. Opt-in stable UDP mode also traps
-  `socket(2)`, `bind(2)`, and `sendmmsg(2)`; all other syscalls are allowed.
+  `socket(2)`, `bind(2)`, `sendmmsg(2)`, `getsockname(2)`, `getpeername(2)`,
+  and selected `getsockopt(2)` queries; all other syscalls are allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
@@ -141,6 +142,9 @@ is `socks5://127.0.0.1:1080`.
   traps UDP socket creation and uses `SECCOMP_ADDFD_FLAG_SEND` so the target sees
   the injected fd as the `socket(2)` result; `bind(2)` is emulated for the
   logical endpoint and direct workers reuse that requested local address.
+  `getsockname(2)` and `getpeername(2)` return the logical local/connected
+  destination, while `getsockopt(2)` reports the AF_INET/AF_INET6 UDP domain,
+  type, protocol, and a zero socket error.
   Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
   `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
   descriptor-number change. Explicit `sendto(2)`/`sendmsg(2)` destinations are
