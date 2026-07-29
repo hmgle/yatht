@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+const UDP_METADATA_QUERY: &[u8] = b"receive-metadata-query";
+const UDP_METADATA_RESPONSE: &[u8] = b"receive-metadata-response";
+
 #[test]
 fn does_not_replace_non_socket_fd_for_udp_send() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -347,6 +350,117 @@ fn redirects_generic_udp_over_socks5_associate() {
     assert_eq!(
         dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 4444))
+    );
+    socks_thread.join().unwrap();
+}
+
+#[test]
+fn direct_kernel_udp_receive_metadata_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_receive_metadata_probe();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "receive-metadata-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_direct_receive_reports_actual_response_source() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_receive_metadata_probe();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "receive-metadata-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_proxy_receive_reports_socks5_response_source() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_receive_metadata_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 14), 4488));
+    let response_source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 21), 5599));
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        let mut packet = vec![0_u8; 2048];
+        let (n, peer) = udp.recv_from(&mut packet).unwrap();
+        packet.truncate(n);
+        let (actual_destination, payload) = parse_udp_packet(&packet);
+        assert_eq!(actual_destination, destination);
+        assert_eq!(payload, UDP_METADATA_QUERY);
+        udp.send_to(
+            &encode_udp_packet(response_source, UDP_METADATA_RESPONSE),
+            peer,
+        )
+        .unwrap();
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "receive-metadata-ok"
     );
     socks_thread.join().unwrap();
 }
@@ -1219,6 +1333,121 @@ int main(int argc, char **argv) {
         .unwrap();
     assert!(status.success());
     (dir, bin)
+}
+
+fn build_udp_receive_metadata_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_receive_metadata_probe.c");
+    let bin = dir.path().join("udp_receive_metadata_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static const char query[] = "receive-metadata-query";
+static const char response[] = "receive-metadata-response";
+
+static int parse_address(const char *value, struct sockaddr_in *address) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+static int same_address(const struct sockaddr_in *left,
+                        const struct sockaddr_in *right) {
+    return left->sin_family == right->sin_family &&
+           left->sin_port == right->sin_port &&
+           left->sin_addr.s_addr == right->sin_addr.s_addr;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    struct sockaddr_in destination;
+    struct sockaddr_in expected_source;
+    if (parse_address(argv[1], &destination) != 0 ||
+        parse_address(argv[2], &expected_source) != 0) return 3;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 4;
+    struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 5;
+    if (sendto(fd, query, sizeof(query) - 1, MSG_NOSIGNAL,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(query) - 1)) return 6;
+
+    char peek[7];
+    struct sockaddr_in peek_source;
+    socklen_t peek_source_len = sizeof(peek_source);
+    memset(&peek_source, 0, sizeof(peek_source));
+    ssize_t peeked = recvfrom(fd, peek, sizeof(peek), MSG_PEEK | MSG_TRUNC,
+                              (struct sockaddr *)&peek_source, &peek_source_len);
+    if (peeked != (ssize_t)(sizeof(response) - 1)) return 7;
+    if (peek_source_len != sizeof(peek_source) ||
+        !same_address(&peek_source, &expected_source)) return 8;
+    if (memcmp(peek, response, sizeof(peek)) != 0) return 9;
+
+    char received[9];
+    struct iovec iov = { .iov_base = received, .iov_len = sizeof(received) };
+    struct sockaddr_in msg_source;
+    struct msghdr msg;
+    memset(&msg_source, 0, sizeof(msg_source));
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &msg_source;
+    msg.msg_namelen = sizeof(msg_source);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    ssize_t received_len = recvmsg(fd, &msg, 0);
+    if (received_len != (ssize_t)sizeof(received)) return 10;
+    if ((msg.msg_flags & MSG_TRUNC) == 0) return 11;
+    if (msg.msg_namelen != sizeof(msg_source) ||
+        !same_address(&msg_source, &expected_source)) return 12;
+    if (memcmp(received, response, sizeof(received)) != 0) return 13;
+    if (write(STDOUT_FILENO, "receive-metadata-ok", 19) != 19) return 14;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinHandle<()>) {
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let response_source = sender.local_addr().unwrap();
+    let server_thread = thread::spawn(move || {
+        let mut query = [0_u8; 128];
+        let (n, peer) = receiver.recv_from(&mut query).unwrap();
+        assert_eq!(&query[..n], UDP_METADATA_QUERY);
+        sender.send_to(UDP_METADATA_RESPONSE, peer).unwrap();
+    });
+    (destination, response_source, server_thread)
 }
 
 fn build_reconnecting_udp_probe() -> (TempDir, PathBuf) {

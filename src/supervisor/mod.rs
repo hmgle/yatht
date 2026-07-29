@@ -2586,6 +2586,11 @@ struct UdpJob {
     route: UdpRouteKind,
 }
 
+struct UdpRelayResponse {
+    source: Destination,
+    payload: Vec<u8>,
+}
+
 #[derive(Clone)]
 struct UdpRelayConfig {
     proxy: crate::config::ProxyConfig,
@@ -3329,7 +3334,6 @@ fn start_udp_relay(
                 if write_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                let source = job.dest;
                 let local_bind = *write_local_bind.lock().unwrap();
                 match forward_udp_job(
                     &cfg,
@@ -3350,8 +3354,8 @@ fn start_udp_relay(
                             }
                             continue;
                         }
-                        pending.push_back(source);
-                        if !send_relay_response(write_fd.as_raw_fd(), &response) {
+                        pending.push_back(response.source);
+                        if !send_relay_response(write_fd.as_raw_fd(), &response.payload) {
                             let _ = pending.pop_back();
                             if write_shutdown.load(Ordering::SeqCst) {
                                 break;
@@ -3431,13 +3435,18 @@ fn forward_udp_job(
     direct_udp: &mut Option<DirectUdpSocket>,
     local_bind: Option<Destination>,
     job: UdpJob,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<UdpRelayResponse>> {
     let deadline = proxy::Deadline::after(cfg.timeout);
     // The route was decided by the notification handler, which has the full
     // routing table. Honour it verbatim so a datagram bound for a direct route
     // is never accidentally tunnelled through the proxy (and vice versa).
     match job.route {
-        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(Some),
+        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(|payload| {
+            Some(UdpRelayResponse {
+                source: job.dest,
+                payload,
+            })
+        }),
         UdpRouteKind::Generic => {
             if socks_udp.is_none() {
                 *socks_udp = Some(proxy::Socks5UdpAssociation::connect(&cfg.proxy, deadline)?);
@@ -3446,6 +3455,12 @@ fn forward_udp_job(
                 .as_mut()
                 .expect("SOCKS5 UDP association initialized")
                 .send_datagram(job.dest, &job.payload, deadline)
+                .map(|response| {
+                    response.map(|response| UdpRelayResponse {
+                        source: response.source,
+                        payload: response.payload,
+                    })
+                })
         }
         UdpRouteKind::Direct => {
             forward_direct_udp(direct_udp, local_bind, job.dest, &job.payload, cfg.timeout)
@@ -3494,7 +3509,7 @@ fn forward_direct_udp(
     dest: Destination,
     payload: &[u8],
     timeout: Duration,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<UdpRelayResponse>> {
     let default_bind = Destination {
         ip: if dest.ip.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -3528,7 +3543,13 @@ fn forward_direct_udp(
         .send_to(payload, SocketAddr::new(dest.ip, dest.port))?;
 
     match state.sock.recv_from(&mut state.recv_buf) {
-        Ok((n, _)) => Ok(Some(state.recv_buf[..n].to_vec())),
+        Ok((n, source)) => Ok(Some(UdpRelayResponse {
+            source: Destination {
+                ip: source.ip(),
+                port: source.port(),
+            },
+            payload: state.recv_buf[..n].to_vec(),
+        })),
         Err(err)
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut =>
         {
