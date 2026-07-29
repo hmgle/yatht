@@ -518,6 +518,140 @@ fn direct_kernel_udp_receive_rcvtimeo_baseline() {
 }
 
 #[test]
+fn stable_udp_direct_receive_honors_rcvtimeo() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_rcvtimeo_probe();
+    let (destination, server_thread) = spawn_udp_rcvtimeo_exchange();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "rcvtimeo-ok");
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_proxy_receive_honors_rcvtimeo() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_rcvtimeo_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 23), 4499));
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        for (expected_query, response, delay) in udp_rcvtimeo_script() {
+            let mut packet = vec![0_u8; 2048];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            packet.truncate(n);
+            let (actual_destination, payload) = parse_udp_packet(&packet);
+            assert_eq!(actual_destination, destination);
+            assert_eq!(payload, expected_query);
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            udp.send_to(&encode_udp_packet(destination, response), peer)
+                .unwrap();
+        }
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "rcvtimeo-ok");
+    socks_thread.join().unwrap();
+}
+
+#[test]
+fn lazy_udp_relay_receive_honors_rcvtimeo() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_lazy_udp_rcvtimeo_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 24), 4499));
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        let mut packet = vec![0_u8; 2048];
+        let (n, peer) = udp.recv_from(&mut packet).unwrap();
+        packet.truncate(n);
+        let (actual_destination, payload) = parse_udp_packet(&packet);
+        assert_eq!(actual_destination, destination);
+        assert_eq!(payload, UDP_RCVTIMEO_PROMPT_QUERY);
+        udp.send_to(
+            &encode_udp_packet(destination, UDP_RCVTIMEO_PROMPT_RESPONSE),
+            peer,
+        )
+        .unwrap();
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "lazy-rcvtimeo-ok");
+    socks_thread.join().unwrap();
+}
+
+#[test]
 fn direct_kernel_recvmmsg_returns_partial_count_before_bad_entry() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1988,6 +2122,7 @@ fn build_udp_recvmmsg_deadline_probe() -> (TempDir, PathBuf) {
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2005,7 +2140,22 @@ int main(void) {
     errno = 0;
     if (recvmmsg(fd, &msg, 1025, MSG_DONTWAIT, NULL) != -1 ||
         errno != EINVAL) return 4;
-    if (write(STDOUT_FILENO, "recvmmsg-deadline-ok", 20) != 20) return 5;
+
+    /* A short explicit timespec still returns zero ahead of a longer armed
+       SO_RCVTIMEO: the earlier deadline keeps its own expiry result. */
+    struct timeval socket_timeout = { .tv_sec = 3, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &socket_timeout,
+                   sizeof(socket_timeout)) != 0) return 5;
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 6;
+    if (recvmmsg(fd, &msg, 1, 0, &timeout) != 0) return 7;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 8;
+    long waited = (now.tv_sec - start.tv_sec) * 1000L +
+                  (now.tv_nsec - start.tv_nsec) / 1000000L;
+    if (waited < 0 || waited > 2000) return 9;
+
+    if (write(STDOUT_FILENO, "recvmmsg-deadline-ok", 20) != 20) return 10;
     return 0;
 }
 "#,
@@ -2296,6 +2446,7 @@ fn build_udp_rcvtimeo_probe() -> (TempDir, PathBuf) {
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2483,6 +2634,95 @@ int main(int argc, char **argv) {
     (dir, bin)
 }
 
+fn build_lazy_udp_rcvtimeo_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("lazy_udp_rcvtimeo_probe.c");
+    let bin = dir.path().join("lazy_udp_rcvtimeo_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+static const char prompt_query[] = "rcvtimeo-prompt-query";
+static const char prompt_response[] = "rcvtimeo-prompt-response";
+
+static int parse_address(const char *value, struct sockaddr_in *address) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+static long elapsed_ms(const struct timespec *start) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (now.tv_sec - start->tv_sec) * 1000L +
+           (now.tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    struct sockaddr_in destination;
+    if (parse_address(argv[1], &destination) != 0) return 3;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 4;
+
+    /* The first proxied send lazily replaces the descriptor with the relay
+       endpoint; the prompt response proves the relay is live. */
+    if (sendto(fd, prompt_query, sizeof(prompt_query) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(prompt_query) - 1)) return 5;
+    char buffer[128];
+    ssize_t received = recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL);
+    if (received != (ssize_t)(sizeof(prompt_response) - 1) ||
+        memcmp(buffer, prompt_response, sizeof(prompt_response) - 1) != 0) return 6;
+
+    /* SO_RCVTIMEO armed on the replaced descriptor bounds a quiet receive. */
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = 500000 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 7;
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 8;
+    errno = 0;
+    if (recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL) != -1 || errno != EAGAIN) return 9;
+    long waited = elapsed_ms(&start);
+    if (waited < 450 || waited > 5000) return 10;
+
+    if (write(STDOUT_FILENO, "lazy-rcvtimeo-ok", 16) != 16) return 11;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
 fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinHandle<()>) {
     let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
     let destination = receiver.local_addr().unwrap();
@@ -2539,33 +2779,36 @@ fn spawn_udp_recvmmsg_flag_exchange() -> (SocketAddr, [SocketAddr; 3], thread::J
     (destination, response_sources, server_thread)
 }
 
+fn udp_rcvtimeo_script() -> [(&'static [u8], &'static [u8], Duration); 4] {
+    [
+        (
+            UDP_RCVTIMEO_BATCH_QUERIES[0],
+            UDP_RCVTIMEO_BATCH_RESPONSES[0],
+            Duration::ZERO,
+        ),
+        (
+            UDP_RCVTIMEO_BATCH_QUERIES[1],
+            UDP_RCVTIMEO_BATCH_RESPONSES[1],
+            UDP_RCVTIMEO_BATCH_GAP,
+        ),
+        (
+            UDP_RCVTIMEO_LATE_QUERY,
+            UDP_RCVTIMEO_LATE_RESPONSE,
+            UDP_RCVTIMEO_LATE_DELAY,
+        ),
+        (
+            UDP_RCVTIMEO_PROMPT_QUERY,
+            UDP_RCVTIMEO_PROMPT_RESPONSE,
+            Duration::ZERO,
+        ),
+    ]
+}
+
 fn spawn_udp_rcvtimeo_exchange() -> (SocketAddr, thread::JoinHandle<()>) {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let destination = server.local_addr().unwrap();
     let server_thread = thread::spawn(move || {
-        let script: [(&[u8], &[u8], Duration); 4] = [
-            (
-                UDP_RCVTIMEO_BATCH_QUERIES[0],
-                UDP_RCVTIMEO_BATCH_RESPONSES[0],
-                Duration::ZERO,
-            ),
-            (
-                UDP_RCVTIMEO_BATCH_QUERIES[1],
-                UDP_RCVTIMEO_BATCH_RESPONSES[1],
-                UDP_RCVTIMEO_BATCH_GAP,
-            ),
-            (
-                UDP_RCVTIMEO_LATE_QUERY,
-                UDP_RCVTIMEO_LATE_RESPONSE,
-                UDP_RCVTIMEO_LATE_DELAY,
-            ),
-            (
-                UDP_RCVTIMEO_PROMPT_QUERY,
-                UDP_RCVTIMEO_PROMPT_RESPONSE,
-                Duration::ZERO,
-            ),
-        ];
-        for (expected_query, response, delay) in script {
+        for (expected_query, response, delay) in udp_rcvtimeo_script() {
             let mut query = [0_u8; 128];
             let (n, peer) = server.recv_from(&mut query).unwrap();
             assert_eq!(&query[..n], expected_query);

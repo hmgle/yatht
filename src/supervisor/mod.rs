@@ -85,6 +85,35 @@ struct BlockingRecvState {
     completed: usize,
     timeout_initialized: bool,
     deadline: Option<Instant>,
+    rcvtimeo: Option<Duration>,
+    rcvtimeo_deadline: Option<Instant>,
+}
+
+impl BlockingRecvState {
+    /// Earliest pending timer. The explicit recvmmsg timespec and the socket
+    /// `SO_RCVTIMEO` keep distinct expiry results, but the reactor only needs
+    /// the next wake-up instant.
+    fn next_deadline(&self) -> Option<Instant> {
+        match (self.deadline, self.rcvtimeo_deadline) {
+            (Some(explicit), Some(rcvtimeo)) => Some(explicit.min(rcvtimeo)),
+            (explicit, rcvtimeo) => explicit.or(rcvtimeo),
+        }
+    }
+
+    fn arm_rcvtimeo(&mut self, relay_fd: RawFd) {
+        self.rcvtimeo = socket_recv_timeout(relay_fd);
+        self.reset_rcvtimeo_deadline();
+    }
+
+    /// Restarts the `SO_RCVTIMEO` window. The kernel bounds each blocking
+    /// wait with the socket timeout, so batched receives re-arm it after
+    /// every delivered datagram (anchored by the direct-kernel baseline
+    /// probe); an `Instant` overflow degrades to an unbounded wait.
+    fn reset_rcvtimeo_deadline(&mut self) {
+        self.rcvtimeo_deadline = self
+            .rcvtimeo
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+    }
 }
 
 struct BlockingRecvCompletion {
@@ -1101,7 +1130,10 @@ fn queue_expired_blocking_recvs(
         index -= 1;
         let recv = &pending[index];
         if in_flight.contains(&recv.relay)
-            || recv.state.deadline.is_none_or(|deadline| deadline > now)
+            || recv
+                .state
+                .next_deadline()
+                .is_none_or(|deadline| deadline > now)
         {
             continue;
         }
@@ -1128,7 +1160,7 @@ fn blocking_recv_poll_timeout(
     let Some(until_deadline) = pending
         .iter()
         .filter(|recv| !in_flight.contains(&recv.relay))
-        .filter_map(|recv| recv.state.deadline)
+        .filter_map(|recv| recv.state.next_deadline())
         .map(|deadline| deadline.saturating_duration_since(now))
         .min()
     else {
@@ -1366,8 +1398,12 @@ fn handle_recv_notification_once(
     state: BlockingRecvState,
 ) -> RecvHandling {
     match notif.data.nr as libc::c_long {
-        libc::SYS_recvfrom => handle_recvfrom_once(listener_fd, notif, relays, wait_for_readable),
-        libc::SYS_recvmsg => handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable),
+        libc::SYS_recvfrom => {
+            handle_recvfrom_once(listener_fd, notif, relays, wait_for_readable, state)
+        }
+        libc::SYS_recvmsg => {
+            handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable, state)
+        }
         libc::SYS_recvmmsg => {
             handle_recvmmsg_once(listener_fd, notif, relays, wait_for_readable, state)
         }
@@ -2389,7 +2425,13 @@ fn recv_request_is_nonblocking(pid: u32, fd: RawFd, flags: i32) -> io::Result<bo
 }
 
 fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
-    let _ = handle_recvfrom_once(listener_fd, notif, relays, true);
+    let _ = handle_recvfrom_once(
+        listener_fd,
+        notif,
+        relays,
+        true,
+        BlockingRecvState::default(),
+    );
 }
 
 fn handle_recvfrom_once(
@@ -2397,6 +2439,7 @@ fn handle_recvfrom_once(
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
     wait_for_readable: bool,
+    mut state: BlockingRecvState,
 ) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
     let buf_ptr = notif.data.args[1];
@@ -2413,6 +2456,10 @@ fn handle_recvfrom_once(
     else {
         return RecvHandling::Completed;
     };
+    if !state.timeout_initialized {
+        state.arm_rcvtimeo(relay_fd.as_raw_fd());
+        state.timeout_initialized = true;
+    }
     // A single UDP datagram never exceeds MAX_UDP_PAYLOAD, so cap the local
     // receive buffer instead of continuing the syscall on the relay fd: a plain
     // send_continue would bypass source rewrite and leave pending_sources
@@ -2473,10 +2520,18 @@ fn handle_recvfrom_once(
             RecvHandling::Completed
         }
         Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
-            RecvHandling::Deferred {
-                relay_fd,
-                relay: handle.target_identity,
-                state: BlockingRecvState::default(),
+            if state
+                .rcvtimeo_deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
+                send_recv_error(listener_fd, notif.id, &err);
+                RecvHandling::Completed
+            } else {
+                RecvHandling::Deferred {
+                    relay_fd,
+                    relay: handle.target_identity,
+                    state,
+                }
             }
         }
         Err(err) => {
@@ -2487,7 +2542,13 @@ fn handle_recvfrom_once(
 }
 
 fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
-    let _ = handle_recvmsg_once(listener_fd, notif, relays, true);
+    let _ = handle_recvmsg_once(
+        listener_fd,
+        notif,
+        relays,
+        true,
+        BlockingRecvState::default(),
+    );
 }
 
 fn handle_recvmsg_once(
@@ -2495,6 +2556,7 @@ fn handle_recvmsg_once(
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
     wait_for_readable: bool,
+    mut state: BlockingRecvState,
 ) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
     let msg_ptr = notif.data.args[1];
@@ -2508,6 +2570,10 @@ fn handle_recvmsg_once(
     else {
         return RecvHandling::Completed;
     };
+    if !state.timeout_initialized {
+        state.arm_rcvtimeo(relay_fd.as_raw_fd());
+        state.timeout_initialized = true;
+    }
     if msg_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return RecvHandling::Completed;
@@ -2559,10 +2625,18 @@ fn handle_recvmsg_once(
             RecvHandling::Completed
         }
         Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
-            RecvHandling::Deferred {
-                relay_fd,
-                relay: handle.target_identity,
-                state: BlockingRecvState::default(),
+            if state
+                .rcvtimeo_deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
+                send_recv_error(listener_fd, notif.id, &err);
+                RecvHandling::Completed
+            } else {
+                RecvHandling::Deferred {
+                    relay_fd,
+                    relay: handle.target_identity,
+                    state,
+                }
             }
         }
         Err(err) => {
@@ -2616,6 +2690,7 @@ fn handle_recvmmsg_once(
                 return RecvHandling::Completed;
             }
         };
+        state.arm_rcvtimeo(relay_fd.as_raw_fd());
         state.timeout_initialized = true;
     }
     if vlen == 0 {
@@ -2690,19 +2765,39 @@ fn handle_recvmmsg_once(
                     return RecvHandling::Completed;
                 }
                 state.completed += 1;
+                state.reset_rcvtimeo_deadline();
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let deadline_expired = state
-                    .deadline
-                    .is_some_and(|deadline| deadline <= Instant::now());
+                let now = Instant::now();
+                let deadline_expired = state.deadline.is_some_and(|deadline| deadline <= now);
+                let rcvtimeo_expired = state
+                    .rcvtimeo_deadline
+                    .is_some_and(|deadline| deadline <= now);
                 if state.completed > 0
-                    && (nonblocking || flags & libc::MSG_WAITFORONE != 0 || deadline_expired)
+                    && (nonblocking
+                        || flags & libc::MSG_WAITFORONE != 0
+                        || deadline_expired
+                        || rcvtimeo_expired)
                 {
                     seccomp::send_value(listener_fd, notif.id, state.completed as i64);
                     return RecvHandling::Completed;
                 }
-                if deadline_expired {
+                // When both timers are expired the earlier one keeps its own
+                // result: an explicit timespec returns the batch count (zero
+                // included) instead of Linux's documented quiet-socket hang,
+                // while an expired SO_RCVTIMEO matches the kernel's EAGAIN.
+                let explicit_governs = deadline_expired
+                    && state.deadline.is_some_and(|explicit| {
+                        state
+                            .rcvtimeo_deadline
+                            .is_none_or(|rcvtimeo| explicit <= rcvtimeo)
+                    });
+                if explicit_governs {
                     seccomp::send_success(listener_fd, notif.id);
+                    return RecvHandling::Completed;
+                }
+                if rcvtimeo_expired {
+                    seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
                     return RecvHandling::Completed;
                 }
                 if nonblocking {
@@ -4128,6 +4223,34 @@ fn notification_interrupted() -> io::Error {
     io::Error::from_raw_os_error(libc::EINTR)
 }
 
+/// Reads the target-visible `SO_RCVTIMEO` from a descriptor sharing the
+/// injected endpoint's open file description. A zero timeout means "block
+/// forever" and maps to `None`, as does a read failure: an unreadable option
+/// must degrade to the previous unbounded wait rather than fail the receive.
+fn socket_recv_timeout(fd: RawFd) -> Option<Duration> {
+    let mut timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = std::mem::size_of_val(&timeout) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&mut timeout as *mut libc::timeval).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || timeout.tv_sec < 0 || timeout.tv_usec < 0 {
+        return None;
+    }
+    if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(timeout.tv_sec as u64) + Duration::from_micros(timeout.tv_usec as u64))
+}
+
 fn read_recvmmsg_deadline(pid: u32, timeout_ptr: u64) -> io::Result<Option<Instant>> {
     if timeout_ptr == 0 {
         return Ok(None);
@@ -5420,6 +5543,7 @@ mod tests {
                     completed: 0,
                     timeout_initialized: true,
                     deadline: Some(Instant::now() - Duration::from_millis(1)),
+                    ..BlockingRecvState::default()
                 },
             },
             PendingBlockingRecv {
@@ -5433,6 +5557,7 @@ mod tests {
                     completed: 0,
                     timeout_initialized: true,
                     deadline: Some(Instant::now() + Duration::from_secs(1)),
+                    ..BlockingRecvState::default()
                 },
             },
         ];
@@ -5459,6 +5584,7 @@ mod tests {
                 completed: 0,
                 timeout_initialized: true,
                 deadline: Some(Instant::now() + Duration::from_secs(10)),
+                ..BlockingRecvState::default()
             },
         }];
 
@@ -5469,6 +5595,52 @@ mod tests {
             blocking_recv_poll_timeout(&pending, &HashSet::new(), true),
             0
         );
+    }
+
+    #[test]
+    fn socket_recv_timeout_reads_target_configured_value() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(socket_recv_timeout(socket.as_raw_fd()), None);
+
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let timeout = socket_recv_timeout(socket.as_raw_fd()).unwrap();
+        assert!(timeout >= Duration::from_millis(500));
+        assert!(timeout <= Duration::from_millis(600));
+
+        socket.set_read_timeout(None).unwrap();
+        assert_eq!(socket_recv_timeout(socket.as_raw_fd()), None);
+    }
+
+    #[test]
+    fn next_deadline_prefers_earliest_pending_timer() {
+        let now = Instant::now();
+        let earlier = now + Duration::from_millis(100);
+        let later = now + Duration::from_millis(200);
+        let mut state = BlockingRecvState::default();
+        assert_eq!(state.next_deadline(), None);
+
+        state.deadline = Some(later);
+        assert_eq!(state.next_deadline(), Some(later));
+
+        state.rcvtimeo_deadline = Some(earlier);
+        assert_eq!(state.next_deadline(), Some(earlier));
+
+        state.deadline = None;
+        assert_eq!(state.next_deadline(), Some(earlier));
+    }
+
+    #[test]
+    fn reset_rcvtimeo_deadline_rearms_only_with_a_timeout() {
+        let mut state = BlockingRecvState::default();
+        state.reset_rcvtimeo_deadline();
+        assert_eq!(state.rcvtimeo_deadline, None);
+
+        state.rcvtimeo = Some(Duration::from_millis(250));
+        let before = Instant::now();
+        state.reset_rcvtimeo_deadline();
+        assert!(state.rcvtimeo_deadline.unwrap() >= before + Duration::from_millis(250));
     }
 
     #[test]
