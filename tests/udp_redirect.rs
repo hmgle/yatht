@@ -11,6 +11,16 @@ use tempfile::TempDir;
 
 const UDP_METADATA_QUERY: &[u8] = b"receive-metadata-query";
 const UDP_METADATA_RESPONSE: &[u8] = b"receive-metadata-response";
+const UDP_RECVMMSG_QUERIES: [&[u8]; 3] = [
+    b"recvmmsg-query-one",
+    b"recvmmsg-query-two",
+    b"recvmmsg-query-three",
+];
+const UDP_RECVMMSG_RESPONSES: [&[u8]; 3] = [
+    b"recvmmsg-first-response",
+    b"recvmmsg-second-response",
+    b"recvmmsg-third-response",
+];
 
 #[test]
 fn does_not_replace_non_socket_fd_for_udp_send() {
@@ -374,6 +384,26 @@ fn direct_kernel_udp_receive_metadata_baseline() {
         String::from_utf8_lossy(&output.stdout),
         "receive-metadata-ok"
     );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn direct_kernel_recvmmsg_source_and_mixed_receive_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_source_probe();
+    let (destination, response_sources, server_thread) = spawn_changed_source_udp_batch_exchange();
+
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .args(response_sources.map(|source| source.to_string()))
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "recvmmsg-ok");
     server_thread.join().unwrap();
 }
 
@@ -1436,6 +1466,136 @@ int main(int argc, char **argv) {
     (dir, bin)
 }
 
+fn build_udp_recvmmsg_source_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_recvmmsg_source_probe.c");
+    let bin = dir.path().join("udp_recvmmsg_source_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static const char *queries[] = {
+    "recvmmsg-query-one", "recvmmsg-query-two", "recvmmsg-query-three"
+};
+static const char *responses[] = {
+    "recvmmsg-first-response",
+    "recvmmsg-second-response",
+    "recvmmsg-third-response"
+};
+
+static int parse_address(const char *value, struct sockaddr_in *address) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+static int same_address(const struct sockaddr_in *left,
+                        const struct sockaddr_in *right) {
+    return left->sin_family == right->sin_family &&
+           left->sin_port == right->sin_port &&
+           left->sin_addr.s_addr == right->sin_addr.s_addr;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 5) return 2;
+    struct sockaddr_in destination;
+    struct sockaddr_in expected_sources[3];
+    if (parse_address(argv[1], &destination) != 0) return 3;
+    for (int i = 0; i < 3; ++i) {
+        if (parse_address(argv[i + 2], &expected_sources[i]) != 0) return 4;
+    }
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 5;
+    struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 6;
+
+    struct iovec send_iov[3];
+    struct mmsghdr send_msgs[3];
+    memset(send_msgs, 0, sizeof(send_msgs));
+    for (int i = 0; i < 3; ++i) {
+        send_iov[i].iov_base = (void *)queries[i];
+        send_iov[i].iov_len = strlen(queries[i]);
+        send_msgs[i].msg_hdr.msg_name = &destination;
+        send_msgs[i].msg_hdr.msg_namelen = sizeof(destination);
+        send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
+        send_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    if (sendmmsg(fd, send_msgs, 3, 0) != 3) return 7;
+
+    char first[7];
+    char second[64];
+    struct iovec recv_iov[2] = {
+        { .iov_base = first, .iov_len = sizeof(first) },
+        { .iov_base = second, .iov_len = sizeof(second) },
+    };
+    struct sockaddr_in sources[2];
+    struct mmsghdr recv_msgs[2];
+    memset(sources, 0, sizeof(sources));
+    memset(recv_msgs, 0, sizeof(recv_msgs));
+    for (int i = 0; i < 2; ++i) {
+        recv_msgs[i].msg_hdr.msg_name = &sources[i];
+        recv_msgs[i].msg_hdr.msg_namelen = sizeof(sources[i]);
+        recv_msgs[i].msg_hdr.msg_iov = &recv_iov[i];
+        recv_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    if (recvmmsg(fd, recv_msgs, 2, MSG_TRUNC, NULL) != 2) return 8;
+    if (recv_msgs[0].msg_len != strlen(responses[0]) ||
+        (recv_msgs[0].msg_hdr.msg_flags & MSG_TRUNC) == 0 ||
+        memcmp(first, responses[0], sizeof(first)) != 0) return 9;
+    if (recv_msgs[1].msg_len != strlen(responses[1]) ||
+        recv_msgs[1].msg_hdr.msg_flags != 0 ||
+        memcmp(second, responses[1], strlen(responses[1])) != 0) return 10;
+    for (int i = 0; i < 2; ++i) {
+        if (recv_msgs[i].msg_hdr.msg_namelen != sizeof(sources[i]) ||
+            !same_address(&sources[i], &expected_sources[i])) return 11;
+    }
+
+    char third[64];
+    struct sockaddr_in third_source;
+    socklen_t third_source_len = sizeof(third_source);
+    ssize_t third_len = recvfrom(fd, third, sizeof(third), 0,
+                                 (struct sockaddr *)&third_source,
+                                 &third_source_len);
+    if (third_len != (ssize_t)strlen(responses[2]) ||
+        memcmp(third, responses[2], (size_t)third_len) != 0) return 12;
+    if (third_source_len != sizeof(third_source) ||
+        !same_address(&third_source, &expected_sources[2])) return 13;
+    if (write(STDOUT_FILENO, "recvmmsg-ok", 11) != 11) return 14;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
 fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinHandle<()>) {
     let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
     let destination = receiver.local_addr().unwrap();
@@ -1448,6 +1608,25 @@ fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinH
         sender.send_to(UDP_METADATA_RESPONSE, peer).unwrap();
     });
     (destination, response_source, server_thread)
+}
+
+fn spawn_changed_source_udp_batch_exchange() -> (SocketAddr, [SocketAddr; 3], thread::JoinHandle<()>)
+{
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let senders = std::array::from_fn::<_, 3, _>(|_| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let response_sources = senders
+        .each_ref()
+        .map(|sender| sender.local_addr().unwrap());
+    let server_thread = thread::spawn(move || {
+        for (index, sender) in senders.into_iter().enumerate() {
+            let mut query = [0_u8; 128];
+            let (n, peer) = receiver.recv_from(&mut query).unwrap();
+            assert_eq!(&query[..n], UDP_RECVMMSG_QUERIES[index]);
+            sender.send_to(UDP_RECVMMSG_RESPONSES[index], peer).unwrap();
+        }
+    });
+    (destination, response_sources, server_thread)
 }
 
 fn build_reconnecting_udp_probe() -> (TempDir, PathBuf) {

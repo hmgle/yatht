@@ -91,6 +91,7 @@ pub struct TrapSet {
     pub getsockopt: bool,
     pub recvfrom: bool,
     pub recvmsg: bool,
+    pub recvmmsg: bool,
     pub close: bool,
     pub close_range: bool,
     pub dup2: bool,
@@ -111,6 +112,7 @@ impl TrapSet {
             getsockopt: false,
             recvfrom: false,
             recvmsg: false,
+            recvmmsg: false,
             close: false,
             close_range: false,
             dup2: false,
@@ -131,6 +133,7 @@ impl TrapSet {
             getsockopt: false,
             recvfrom: true,
             recvmsg: true,
+            recvmmsg: false,
             close: true,
             close_range: true,
             dup2: true,
@@ -146,11 +149,12 @@ impl TrapSet {
         traps.getsockname = true;
         traps.getpeername = true;
         traps.getsockopt = true;
+        traps.recvmmsg = true;
         traps
     }
 
     pub fn encode(self) -> String {
-        let mut bits = 0_u16;
+        let mut bits = 0_u32;
         if self.connect {
             bits |= 1 << 0;
         }
@@ -196,12 +200,15 @@ impl TrapSet {
         if self.getsockopt {
             bits |= 1 << 14;
         }
+        if self.recvmmsg {
+            bits |= 1 << 15;
+        }
         bits.to_string()
     }
 
     pub fn decode(raw: &str) -> Option<Self> {
-        let bits = raw.parse::<u16>().ok()?;
-        if bits & !0b111_1111_1111_1111 != 0 {
+        let bits = raw.parse::<u32>().ok()?;
+        if bits & !0xffff != 0 {
             return None;
         }
         Some(Self {
@@ -216,6 +223,7 @@ impl TrapSet {
             getsockopt: bits & (1 << 14) != 0,
             recvfrom: bits & (1 << 3) != 0,
             recvmsg: bits & (1 << 4) != 0,
+            recvmmsg: bits & (1 << 15) != 0,
             close: bits & (1 << 5) != 0,
             close_range: bits & (1 << 6) != 0,
             dup2: bits & (1 << 7) != 0,
@@ -257,6 +265,9 @@ impl TrapSet {
         }
         if self.recvmsg {
             nrs.push(libc::SYS_recvmsg as u32);
+        }
+        if self.recvmmsg {
+            nrs.push(libc::SYS_recvmmsg as u32);
         }
         if self.close {
             nrs.push(libc::SYS_close as u32);
@@ -560,7 +571,7 @@ mod tests {
     #[test]
     fn socket_filter_traps_stable_udp_creation_and_io() {
         let filter = socket_filter(TrapSet::with_udp());
-        assert_eq!(filter.len(), 21);
+        assert_eq!(filter.len(), 22);
         assert_eq!(filter[4].k, libc::SYS_connect as u32);
         assert_eq!(filter[5].k, libc::SYS_socket as u32);
         assert_eq!(filter[6].k, libc::SYS_bind as u32);
@@ -572,12 +583,13 @@ mod tests {
         assert_eq!(filter[12].k, libc::SYS_getsockopt as u32);
         assert_eq!(filter[13].k, libc::SYS_recvfrom as u32);
         assert_eq!(filter[14].k, libc::SYS_recvmsg as u32);
-        assert_eq!(filter[15].k, libc::SYS_close as u32);
-        assert_eq!(filter[16].k, libc::SYS_close_range as u32);
-        assert_eq!(filter[17].k, libc::SYS_dup2 as u32);
-        assert_eq!(filter[18].k, libc::SYS_dup3 as u32);
-        assert_eq!(filter[19].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[20].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[15].k, libc::SYS_recvmmsg as u32);
+        assert_eq!(filter[16].k, libc::SYS_close as u32);
+        assert_eq!(filter[17].k, libc::SYS_close_range as u32);
+        assert_eq!(filter[18].k, libc::SYS_dup2 as u32);
+        assert_eq!(filter[19].k, libc::SYS_dup3 as u32);
+        assert_eq!(filter[20].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[21].k, SECCOMP_RET_USER_NOTIF);
     }
 
     #[test]
@@ -587,6 +599,9 @@ mod tests {
         assert!(!filter
             .iter()
             .any(|instruction| instruction.k == libc::SYS_socket as u32));
+        assert!(!filter
+            .iter()
+            .any(|instruction| instruction.k == libc::SYS_recvmmsg as u32));
     }
 
     #[test]
@@ -599,7 +614,7 @@ mod tests {
 
     #[test]
     fn trap_set_rejects_unknown_bits() {
-        assert_eq!(TrapSet::decode("32768"), None);
+        assert_eq!(TrapSet::decode("65536"), None);
     }
 
     #[test]
