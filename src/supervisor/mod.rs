@@ -1310,6 +1310,9 @@ fn handle_notification(
     match notif.data.nr as libc::c_long {
         libc::SYS_socket => handle_socket(listener_fd, notif, cfg, relays),
         libc::SYS_bind => handle_bind(listener_fd, notif, relays),
+        libc::SYS_getsockname => handle_getsockname(listener_fd, notif, relays),
+        libc::SYS_getpeername => handle_getpeername(listener_fd, notif, relays),
+        libc::SYS_getsockopt => handle_getsockopt(listener_fd, notif, relays),
         libc::SYS_connect => handle_connect(
             listener_fd,
             notif,
@@ -1410,6 +1413,141 @@ fn handle_bind(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegi
     }
     if !handle.set_local_bind(destination) {
         seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
+}
+
+fn handle_getsockname(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let addr = notif.data.args[1];
+    let addr_len_ptr = notif.data.args[2];
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if addr == 0 || addr_len_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let addr_len = match read_socklen(notif.pid, addr_len_ptr) {
+        Ok(addr_len) => addr_len,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    let local = handle
+        .local_bind()
+        .unwrap_or_else(|| handle.unspecified_destination());
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if write_sockaddr_result(notif.pid, addr, addr_len_ptr, addr_len, local).is_err() {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
+}
+
+fn handle_getpeername(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let addr = notif.data.args[1];
+    let addr_len_ptr = notif.data.args[2];
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    let Some(peer) = handle.default_destination().map(|(dest, _)| dest) else {
+        seccomp::send_errno(listener_fd, notif.id, libc::ENOTCONN);
+        return;
+    };
+    if addr == 0 || addr_len_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let addr_len = match read_socklen(notif.pid, addr_len_ptr) {
+        Ok(addr_len) => addr_len,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if write_sockaddr_result(notif.pid, addr, addr_len_ptr, addr_len, peer).is_err() {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
+}
+
+fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let level = notif.data.args[1] as i32;
+    let option = notif.data.args[2] as i32;
+    let optval = notif.data.args[3];
+    let optlen_ptr = notif.data.args[4];
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if level != libc::SOL_SOCKET
+        || !matches!(
+            option,
+            libc::SO_DOMAIN | libc::SO_TYPE | libc::SO_PROTOCOL | libc::SO_ERROR
+        )
+    {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if optval == 0 || optlen_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let optlen = match read_socklen(notif.pid, optlen_ptr) {
+        Ok(optlen) => optlen,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    if optlen < std::mem::size_of::<libc::c_int>() as u32 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return;
+    }
+    let value = match option {
+        libc::SO_DOMAIN => handle.domain,
+        libc::SO_TYPE => libc::SOCK_DGRAM,
+        libc::SO_PROTOCOL => libc::IPPROTO_UDP,
+        libc::SO_ERROR => 0,
+        _ => unreachable!("getsockopt option filtered above"),
+    };
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if write_proc_bytes(notif.pid, optval, &value.to_ne_bytes()).is_err()
+        || write_proc_bytes(
+            notif.pid,
+            optlen_ptr,
+            &(std::mem::size_of::<libc::c_int>() as u32).to_ne_bytes(),
+        )
+        .is_err()
+    {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
     seccomp::send_success(listener_fd, notif.id);
@@ -2394,6 +2532,7 @@ struct FdIdentity {
 
 struct UdpTargetSnapshot {
     identity: FdIdentity,
+    domain: i32,
     flags: TargetFdFlags,
 }
 
@@ -2436,6 +2575,7 @@ struct UdpRelayHandle {
     relay_fd: Arc<OwnedFd>,
     target_identity: FdIdentity,
     target_cookie: u64,
+    domain: i32,
     stable: bool,
     shutdown: Arc<AtomicBool>,
 }
@@ -2638,6 +2778,7 @@ impl UdpRelayRegistry {
             None,
             target_identity,
             target_cookie,
+            notif.data.args[0] as i32,
             true,
         )
         .context("start stable UDP relay workers")?;
@@ -2779,6 +2920,7 @@ impl UdpRelayRegistry {
             default_dest,
             target_identity,
             target_cookie,
+            target_snapshot.domain,
             false,
         )
         .context("start bounded UDP relay workers")?;
@@ -3033,6 +3175,25 @@ impl Drop for CreatingGuard<'_> {
 }
 
 impl UdpRelayHandle {
+    fn local_bind(&self) -> Option<Destination> {
+        *self.local_bind.lock().unwrap()
+    }
+
+    fn default_destination(&self) -> Option<(Destination, UdpRouteKind)> {
+        *self.default_dest.lock().unwrap()
+    }
+
+    fn unspecified_destination(&self) -> Destination {
+        Destination {
+            ip: if self.domain == libc::AF_INET6 {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            },
+            port: 0,
+        }
+    }
+
     fn set_default_dest(&self, dest: Destination, route: UdpRouteKind) {
         *self.default_dest.lock().unwrap() = Some((dest, route));
     }
@@ -3105,6 +3266,7 @@ fn start_udp_relay(
     default_dest: Option<(Destination, UdpRouteKind)>,
     target_identity: FdIdentity,
     target_cookie: u64,
+    domain: i32,
     stable: bool,
 ) -> io::Result<UdpRelayHandle> {
     let relay_fd = Arc::new(relay_socket);
@@ -3222,6 +3384,7 @@ fn start_udp_relay(
         relay_fd,
         target_identity,
         target_cookie,
+        domain,
         stable,
         shutdown,
     })
@@ -3970,12 +4133,13 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
         }
         Err(err) => return Err(err).context("duplicate UDP target fd"),
     };
-    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
-        || !matches!(
-            socket_domain_from_fd(target.as_raw_fd()),
-            Some(libc::AF_INET | libc::AF_INET6)
-        )
-    {
+    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM) {
+        return Ok(None);
+    }
+    let Some(domain) = socket_domain_from_fd(target.as_raw_fd()) else {
+        return Ok(None);
+    };
+    if !matches!(domain, libc::AF_INET | libc::AF_INET6) {
         return Ok(None);
     }
 
@@ -3983,6 +4147,7 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
     flags.status_flags = fd_status_flags(target.as_raw_fd()).unwrap_or(flags.status_flags);
     Ok(Some(UdpTargetSnapshot {
         identity: fd_identity(target.as_raw_fd()).context("stat UDP target fd")?,
+        domain,
         flags,
     }))
 }
@@ -4714,6 +4879,7 @@ mod tests {
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             target_cookie,
+            domain: libc::AF_INET,
             stable: false,
             shutdown: Arc::clone(&shutdown),
         };
@@ -4827,6 +4993,7 @@ mod tests {
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             target_cookie,
+            domain: libc::AF_INET,
             stable: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
@@ -5013,6 +5180,7 @@ mod tests {
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             target_cookie,
+            domain: libc::AF_INET,
             stable: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         }

@@ -408,6 +408,63 @@ fn stable_udp_socket_survives_bind_dup_close_and_fork() {
 }
 
 #[test]
+fn stable_udp_connected_socket_reports_logical_peer() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_connected_udp_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 13), 4477));
+    let (dest_tx, dest_rx) = mpsc::channel();
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        let mut packet = vec![0_u8; 2048];
+        let (n, peer) = udp.recv_from(&mut packet).unwrap();
+        packet.truncate(n);
+        let (dest, payload) = parse_udp_packet(&packet);
+        dest_tx.send((dest, payload.to_vec())).unwrap();
+        let response = encode_udp_packet(dest, b"connected-ok");
+        udp.send_to(&response, peer).unwrap();
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .arg("connected-query")
+        .arg("--check-peer")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "connected-ok");
+    assert_eq!(
+        dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        (destination, b"connected-query".to_vec())
+    );
+    socks_thread.join().unwrap();
+}
+
+#[test]
 fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -682,41 +739,58 @@ int main(int argc, char **argv) {
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) return 5;
 
+    struct sockaddr_in reported;
+    socklen_t reported_len = sizeof(reported);
+    if (getsockname(fd, (struct sockaddr *)&reported, &reported_len) != 0
+        || reported.sin_family != AF_INET) return 6;
+    int domain = 0;
+    socklen_t option_len = sizeof(domain);
+    if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &option_len) != 0
+        || domain != AF_INET) return 7;
+    int type = 0;
+    option_len = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &option_len) != 0
+        || type != SOCK_DGRAM) return 8;
+    int protocol = 0;
+    option_len = sizeof(protocol);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &option_len) != 0
+        || protocol != IPPROTO_UDP) return 9;
+
     struct stat after_bind;
-    if (fstat(fd, &after_bind) != 0 || !same_socket(&created, &after_bind)) return 6;
+    if (fstat(fd, &after_bind) != 0 || !same_socket(&created, &after_bind)) return 10;
     int alias = dup(fd);
-    if (alias < 0) return 7;
+    if (alias < 0) return 11;
     struct stat duplicated;
-    if (fstat(alias, &duplicated) != 0 || !same_socket(&created, &duplicated)) return 8;
-    if (close(fd) != 0) return 9;
+    if (fstat(alias, &duplicated) != 0 || !same_socket(&created, &duplicated)) return 12;
+    if (close(fd) != 0) return 13;
 
     pid_t child = fork();
-    if (child < 0) return 10;
+    if (child < 0) return 14;
     if (child == 0) {
         struct sockaddr_in dest;
         memset(&dest, 0, sizeof(dest));
         dest.sin_family = AF_INET;
         char *colon = strrchr(argv[1], ':');
-        if (colon == NULL) _exit(11);
+        if (colon == NULL) _exit(15);
         *colon = '\0';
         dest.sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
-        if (inet_pton(AF_INET, argv[1], &dest.sin_addr) != 1) _exit(12);
+        if (inet_pton(AF_INET, argv[1], &dest.sin_addr) != 1) _exit(16);
 
         struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
-        if (setsockopt(alias, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) _exit(13);
+        if (setsockopt(alias, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) _exit(17);
         if (sendto(alias, "stable-query", 12, 0,
-                   (struct sockaddr *)&dest, sizeof(dest)) != 12) _exit(14);
+                   (struct sockaddr *)&dest, sizeof(dest)) != 12) _exit(18);
         char response[64];
         ssize_t received = recvfrom(alias, response, sizeof(response), 0, NULL, NULL);
-        if (received < 0) _exit(15);
-        if (write(STDOUT_FILENO, response, (size_t)received) != received) _exit(16);
+        if (received < 0) _exit(19);
+        if (write(STDOUT_FILENO, response, (size_t)received) != received) _exit(20);
         _exit(0);
     }
 
-    if (close(alias) != 0) return 17;
+    if (close(alias) != 0) return 21;
     int status = 0;
-    if (waitpid(child, &status, 0) != child) return 18;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 19;
+    if (waitpid(child, &status, 0) != child) return 22;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 23;
     return 0;
 }
 "#,
@@ -948,6 +1022,9 @@ fn main() {
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     socket.connect(&args[1]).unwrap();
+    if args.get(3).is_some() {
+        assert_eq!(socket.peer_addr().unwrap(), args[1].parse().unwrap());
+    }
     socket.send(args[2].as_bytes()).unwrap();
     let mut buf = [0_u8; 2048];
     let n = socket.recv(&mut buf).unwrap();
