@@ -352,6 +352,126 @@ fn redirects_generic_udp_over_socks5_associate() {
 }
 
 #[test]
+fn stable_udp_socket_survives_bind_dup_close_and_fork() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_stable_udp_alias_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 11), 4455));
+    let (dest_tx, dest_rx) = mpsc::channel();
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        let mut packet = vec![0_u8; 2048];
+        let (n, peer) = udp.recv_from(&mut packet).unwrap();
+        packet.truncate(n);
+        let (dest, payload) = parse_udp_packet(&packet);
+        dest_tx.send((dest, payload.to_vec())).unwrap();
+        let response = encode_udp_packet(dest, b"stable-ok");
+        udp.send_to(&response, peer).unwrap();
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--debug")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "stable-ok");
+    assert_eq!(
+        dest_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        (destination, b"stable-query".to_vec())
+    );
+    socks_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_mmsg_probe();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 12), 4466));
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    let socks_thread = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _associate_dest = read_socks5_request(&mut client);
+        let port = udp_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+
+        for response in [b"batch-one-ok".as_slice(), b"batch-two-ok".as_slice()] {
+            let mut packet = vec![0_u8; 2048];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            packet.truncate(n);
+            let (dest, payload) = parse_udp_packet(&packet);
+            payload_tx.send((dest, payload.to_vec())).unwrap();
+            udp.send_to(&encode_udp_packet(dest, response), peer)
+                .unwrap();
+        }
+
+        let mut keepalive = [0_u8; 1];
+        let _ = client.read(&mut keepalive);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg(format!("socks5://{tcp_addr}"))
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "batch-one-ok:batch-two-ok"
+    );
+    assert_eq!(
+        payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        (destination, b"batch-one".to_vec())
+    );
+    assert_eq!(
+        payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        (destination, b"batch-two".to_vec())
+    );
+    socks_thread.join().unwrap();
+}
+
+#[test]
 fn updates_connected_udp_destination_on_reconnect() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -513,11 +633,188 @@ fn main() {
     let (n, _) = socket.recv_from(&mut buf).unwrap();
     print!("{}", String::from_utf8_lossy(&buf[..n]));
 }
+
 "#,
     )
     .unwrap();
     let status = Command::new("rustc")
         .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_stable_udp_alias_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("stable_udp_alias_probe.c");
+    let bin = dir.path().join("stable_udp_alias_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int same_socket(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 3;
+
+    struct stat created;
+    if (fstat(fd, &created) != 0) return 4;
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) return 5;
+
+    struct stat after_bind;
+    if (fstat(fd, &after_bind) != 0 || !same_socket(&created, &after_bind)) return 6;
+    int alias = dup(fd);
+    if (alias < 0) return 7;
+    struct stat duplicated;
+    if (fstat(alias, &duplicated) != 0 || !same_socket(&created, &duplicated)) return 8;
+    if (close(fd) != 0) return 9;
+
+    pid_t child = fork();
+    if (child < 0) return 10;
+    if (child == 0) {
+        struct sockaddr_in dest;
+        memset(&dest, 0, sizeof(dest));
+        dest.sin_family = AF_INET;
+        char *colon = strrchr(argv[1], ':');
+        if (colon == NULL) _exit(11);
+        *colon = '\0';
+        dest.sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+        if (inet_pton(AF_INET, argv[1], &dest.sin_addr) != 1) _exit(12);
+
+        struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+        if (setsockopt(alias, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) _exit(13);
+        if (sendto(alias, "stable-query", 12, 0,
+                   (struct sockaddr *)&dest, sizeof(dest)) != 12) _exit(14);
+        char response[64];
+        ssize_t received = recvfrom(alias, response, sizeof(response), 0, NULL, NULL);
+        if (received < 0) _exit(15);
+        if (write(STDOUT_FILENO, response, (size_t)received) != received) _exit(16);
+        _exit(0);
+    }
+
+    if (close(alias) != 0) return 17;
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) return 18;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 19;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_mmsg_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_mmsg_probe.c");
+    let bin = dir.path().join("udp_mmsg_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 3;
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) return 4;
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    char *colon = strrchr(argv[1], ':');
+    if (colon == NULL) return 5;
+    *colon = '\0';
+    dest.sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    if (inet_pton(AF_INET, argv[1], &dest.sin_addr) != 1) return 6;
+
+    char first[] = "batch-one";
+    char second[] = "batch-two";
+    struct iovec send_iov[2] = {
+        { .iov_base = first, .iov_len = sizeof(first) - 1 },
+        { .iov_base = second, .iov_len = sizeof(second) - 1 },
+    };
+    struct mmsghdr send_msgs[2];
+    memset(send_msgs, 0, sizeof(send_msgs));
+    for (int i = 0; i < 2; ++i) {
+        send_msgs[i].msg_hdr.msg_name = &dest;
+        send_msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+        send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
+        send_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    if (sendmmsg(fd, send_msgs, 2, 0) != 2) return 7;
+    if (send_msgs[0].msg_len != sizeof(first) - 1 ||
+        send_msgs[1].msg_len != sizeof(second) - 1) return 8;
+
+    struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 9;
+    char responses[2][64];
+    unsigned int lengths[2];
+    for (int i = 0; i < 2; ++i) {
+        struct iovec recv_iov = { .iov_base = responses[i], .iov_len = sizeof(responses[i]) };
+        struct mmsghdr recv_msg;
+        memset(&recv_msg, 0, sizeof(recv_msg));
+        recv_msg.msg_hdr.msg_iov = &recv_iov;
+        recv_msg.msg_hdr.msg_iovlen = 1;
+        if (recvmmsg(fd, &recv_msg, 1, 0, NULL) != 1) return 10;
+        lengths[i] = recv_msg.msg_len;
+    }
+    if (write(STDOUT_FILENO, responses[0], lengths[0]) != (ssize_t)lengths[0]) return 11;
+    if (write(STDOUT_FILENO, ":", 1) != 1) return 12;
+    if (write(STDOUT_FILENO, responses[1], lengths[1]) != (ssize_t)lengths[1]) return 13;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
         .arg("-o")
         .arg(&bin)
         .status()
