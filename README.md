@@ -144,13 +144,21 @@ loopback broker.
 
 Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
-multiple responses, ancillary data, pre-existing epoll registrations, or fd
-aliases created with `dup(2)` or inherited across `fork(2)`.
-Active UDP relays are capped at 128, with a bounded 16-datagram input queue per
-relay. New relay setup fails closed when the global limit is reached.
+multiple responses, ancillary data, or pre-existing epoll registrations. The
+default lazy mode creates the relay on the first proxied send and does not
+preserve aliases created before that point. Set `SUP_UDP_SOCKET_MODE=stable`
+with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
+the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
+using `SO_COOKIE` as the primary relay key.
+Active UDP relay creation is capped at 128, with a bounded 16-datagram input
+queue per relay. Stable aliases remain registered until the supervisor exits,
+so applications that create and discard hundreds of UDP sockets in one target
+process should stay on lazy mode for now.
 
-UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
-`recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.
+UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
+`recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`;
+`recvmmsg(2)` is served by the injected AF_UNIX datagram endpoint, so its source
+address and ancillary-data semantics remain limited.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

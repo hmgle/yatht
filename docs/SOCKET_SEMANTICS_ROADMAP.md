@@ -77,24 +77,30 @@ regressions in the integration matrix, and bounded memory under a stalled peer.
 
 ## Milestone 2: Stable UDP Creation
 
-UDP should use an opt-in virtual-socket mode when generic UDP interception is
-enabled:
+UDP now has an opt-in virtual-socket mode when generic UDP interception is
+enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
+`lazy` keeps the existing first-send replacement path.
 
-1. Trap `socket(AF_INET/AF_INET6, SOCK_DGRAM, ...)` and inject the relay endpoint
-   as the syscall result with `SECCOMP_ADDFD_FLAG_SEND`.
-2. Feature-detect `SECCOMP_ADDFD_FLAG_SEND`; it requires Linux 5.14 and is
-   available on the current Linux 6.9 baseline.
-3. Key relay state by the injected socket's `SO_COOKIE`, with `(tgid, fd)` only
-   as a lookup cache. This naturally follows dup and fork aliases.
-4. Relay direct and proxied destinations through the same stable endpoint once
-   virtualized; destination-based bypass cannot be decided at `socket(2)` time.
-5. Add `sendmmsg(2)`/`recvmmsg(2)`, multi-response, unsolicited datagram,
-   truncation, peek, timeout, reconnect, and ancillary-data tests.
+1. [x] Trap `socket(AF_INET/AF_INET6, SOCK_DGRAM, ...)` and inject the relay
+   endpoint as the syscall result with `SECCOMP_ADDFD_FLAG_SEND`.
+2. [x] Feature-detect `SECCOMP_ADDFD_FLAG_SEND`; it requires Linux 5.14 and is
+   available on the current Linux 6.9 baseline. Unsupported kernels fall back
+   to the lazy path after the first failed atomic addfd attempt.
+3. [x] Key relay state by the injected socket's `SO_COOKIE`, with `(tgid, fd)`
+   only as a lookup cache. This naturally follows dup and fork aliases.
+4. [x] Relay direct and proxied destinations through the same stable endpoint
+   once virtualized; destination-based bypass is decided per datagram.
+5. [~] Stable mode rewrites `sendmmsg(2)` and supports batched responses via
+   `recvmmsg(2)` on the endpoint. Source-address/ancillary-data virtualization,
+   unsolicited datagrams, error queues, and multi-response ordering remain the
+   next compatibility slice.
 
 AF_UNIX cannot receive arbitrary IP error-queue entries or generate matching
 `EPOLLERR` state. `IP_RECVERR`, `MSG_ERRQUEUE`, packet-info control messages,
-and untrapped domain/protocol queries remain explicit limitations. Do not label
-this milestone complete merely because descriptor identity is stable.
+and untrapped domain/protocol queries remain explicit limitations. The
+descriptor-identity slice is delivered, but the full milestone remains open
+until the remaining IP-level semantics have explicit tests and a documented
+policy.
 
 ## Milestone 3: Rootless Network Backends
 

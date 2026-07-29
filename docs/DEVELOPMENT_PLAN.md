@@ -71,7 +71,8 @@ is `socks5://127.0.0.1:1080`.
   acknowledges receipt.
 - The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
   send/receive plus descriptor close/replacement syscalls only when DNS or
-  generic UDP redirection is enabled. All other syscalls are allowed.
+  generic UDP redirection is enabled. Opt-in stable UDP mode also traps
+  `socket(2)`, `bind(2)`, and `sendmmsg(2)`; all other syscalls are allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
@@ -135,13 +136,18 @@ is `socks5://127.0.0.1:1080`.
   size is bounded by the number of target threads because each thread can have
   only one notification pending.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
-  target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
-  `sendmsg(2)` destinations are forwarded by the notification handler;
-  connected UDP sends are read by the relay socket. `close(2)`, closing
-  `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay creation so
-  a concurrent descriptor change cannot cross the injection window. Closing
-  calls also remove matching relays so long-running targets do not retain relay
-  threads after closing UDP sockets.
+  target and runs a supervisor relay on the other end. Lazy mode performs this
+  replacement on the first proxied send. Stable mode (`SUP_UDP_SOCKET_MODE=stable`)
+  traps UDP socket creation and uses `SECCOMP_ADDFD_FLAG_SEND` so the target sees
+  the injected fd as the `socket(2)` result; `bind(2)` is emulated for the
+  logical endpoint and direct workers reuse that requested local address.
+  Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
+  `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
+  descriptor-number change. Explicit `sendto(2)`/`sendmsg(2)` destinations are
+  forwarded by the notification handler; connected UDP sends are read by the
+  relay socket. `close(2)`, closing `close_range(2)`, `dup2(2)`, and `dup3(2)`
+  synchronize with relay creation so a concurrent descriptor change cannot
+  cross the injection window.
 - UDP relay admission is globally capped at 128. Each relay uses two fallible
   workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
   sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
@@ -149,8 +155,10 @@ is `socks5://127.0.0.1:1080`.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
-- Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten in the current
-  implementation.
+- Stable mode rewrites explicit destinations in `sendmmsg(2)` and writes each
+  successful message length back to the target array. `recvmmsg(2)` continues
+  through the injected AF_UNIX endpoint; source-address, error-queue, and
+  ancillary-data virtualization remains deferred.
 
 ## Routing Rules
 
