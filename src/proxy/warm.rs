@@ -1,4 +1,4 @@
-//! One-shot warm proxy session pool (TCP_BROKER_ROADMAP.md M4A, RESEARCH 3.5).
+//! One-shot warm proxy session pool.
 //!
 //! A warm session is a proxy connection driven through TCP connect and, for
 //! SOCKS5, method negotiation and authentication -- everything up to but not
@@ -33,8 +33,8 @@ use super::{
 
 // Internal selector for the proxy session source; cold (dial per flow) stays
 // the default and warm-one-shot is opt-in experimental. This dimension is
-// orthogonal to the application socket contract and the stable data mover
-// (TCP_BROKER_ROADMAP.md section 9) and must not be merged with them.
+// orthogonal to the application socket contract and the stable data mover and
+// must not be merged with them.
 const PROXY_SESSION_ENV: &str = "SUP_TCP_PROXY_SESSION";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,8 +65,8 @@ fn parse_proxy_session_source(value: &str) -> io::Result<ProxySessionSource> {
     }
 }
 
-// Pre-registered bounds (roadmap M4A). The pool starts empty and only
-// replenishes after observed demand, so idle supervisors hold zero warm fds.
+// The pool starts empty and only replenishes after observed demand, so idle
+// supervisors hold zero warm fds.
 //
 // Sixteen sessions cost at most 16 fds, well inside the broker's policy
 // headroom (>= 256 fds), while covering the short-connection bursts the
@@ -315,7 +315,7 @@ fn session_is_live(stream: &TcpStream) -> bool {
 ///
 /// `NothingSent` proves no request byte was handed to the kernel, so the
 /// proxy cannot have observed a request and a cold retry is safe. Any other
-/// failure must not be retried on another connection (RESEARCH 3.5):
+/// failure must not be retried on another connection:
 /// `SessionDied` is a transport-level death after bytes may have been sent
 /// (the lease-time liveness check races the proxy closing an idle session),
 /// while `Rejected` means the proxy answered and refused the tunnel.

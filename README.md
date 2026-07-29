@@ -184,10 +184,7 @@ samples, binary provenance, and environment metadata under
 cargo build --release --locked
 uv run scripts/tcp_broker_benchmark.py \
   --yatht target/release/yatht \
-  --yatht-build-command 'cargo build --release --locked' \
-  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht \
-  --addfd-commit b5554b9 \
-  --addfd-build-command 'cargo build --release --locked'
+  --yatht-build-command 'cargo build --release --locked'
 ```
 
 Paired same-repetition comparisons of the experimental data paths are

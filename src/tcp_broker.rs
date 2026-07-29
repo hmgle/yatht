@@ -15,8 +15,8 @@ const READ_CHUNK_SIZE: usize = 16 * 1024;
 // Per-direction byte budget for one reactor round; bounds how long a hot
 // flow can keep reading before other flows are serviced again.
 const READ_BATCH_BUDGET_BYTES: usize = RELAY_BUFFER_CAPACITY;
-// Internal selector for the readiness backend; epoll is the default and
-// poll remains the explicit rollback path (TCP_BROKER_ROADMAP.md M2).
+// Internal selector for the readiness backend; epoll is the default and poll
+// remains the explicit rollback path.
 const REACTOR_KIND_ENV: &str = "SUP_TCP_REACTOR";
 // Upper bound on events handled per epoll_wait; LT re-reports whatever a
 // bounded batch leaves behind, keeping per-round work finite.
@@ -49,10 +49,10 @@ fn reactor_kind_from_env() -> io::Result<ReactorKind> {
 
 // The data mover decides how relay bytes travel between the two sockets:
 // buffered user-space copies (default) or kernel pipes moved with splice.
-// Splice is opt-in experimental (TCP_BROKER_ROADMAP.md M3).
+// Splice is opt-in experimental.
 const DATA_MOVER_ENV: &str = "SUP_TCP_DATA_MOVER";
-// Per-direction, per-round splice byte budget and syscall bound. Roadmap
-// pre-registered starting values; benchmarks may tune them.
+// Per-direction, per-round splice byte budget and syscall bound. These are
+// conservative starting values; benchmarks may tune them.
 const SPLICE_BATCH_BUDGET_BYTES: usize = 256 * 1024;
 const SPLICE_MAX_SYSCALLS_PER_ROUND: usize = 8;
 // Two pipes per spliced flow, two fds per pipe, on top of the two sockets.
@@ -89,14 +89,13 @@ fn data_mover_kind_from_env() -> io::Result<DataMoverKind> {
     }
 }
 
-// Conditional quickack for the splice mover (TCP_BROKER_ROADMAP.md M3.1).
+// Conditional quickack for the splice mover.
 // Splice consumption of a lone full-MSS segment leaves the peer's delayed
 // ACK armed while Nagle holds the peer's sub-MSS tail for that ACK, a timer
 // interlock worth a full delayed-ACK period per chunk; buffered escapes it
 // through the kernel's backlog deferred-ACK path because its copy loop holds
-// the socket lock for most of each round (see
-// docs/TCP_BROKER_M3_SPLICE_STARVATION_ATTRIBUTION.md). After a draining
-// splice round at dribble scale, TCP_QUICKACK(1) flushes the pending ACK.
+// the socket lock for most of each round. After a draining splice round at
+// dribble scale, TCP_QUICKACK(1) flushes the pending ACK.
 const SPLICE_QUICKACK_ENV: &str = "SUP_TCP_SPLICE_QUICKACK";
 // Dribble signature: at most one full loopback MSS plus its Nagle tail per
 // round. Bulk rounds run up to SPLICE_BATCH_BUDGET_BYTES and must keep the
@@ -1268,8 +1267,8 @@ impl TcpRelay {
                 Some(pair) => pair,
                 None => {
                     // No bytes have moved yet, so falling back to the
-                    // buffered mover is always safe (TCP_BROKER_ROADMAP.md
-                    // 6.2); the flow itself must not fail here.
+                    // buffered mover is safe; the flow itself must not fail
+                    // just because pipe allocation failed.
                     permit.resources.observability.tcp_splice_fallback();
                     (RelayChannel::buffered(), RelayChannel::buffered())
                 }

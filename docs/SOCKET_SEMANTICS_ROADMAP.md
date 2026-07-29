@@ -61,8 +61,9 @@ Required work:
 1. Add concurrent short-flow, slow-consumer, reset-with-buffered-data, IPv6,
    HTTP CONNECT, and notification-interruption integration tests.
 2. Export active-flow, peak-buffer, queue-full, half-close, and reset metrics.
-3. Benchmark the broker against the former ADDFD path under the documented
-   mihomo TUN environment and a local fake proxy.
+3. Benchmark the broker against a direct control with a local fake proxy.
+   Report external-proxy measurements separately with enough environment
+   metadata to reproduce them.
 4. Prototype `splice(2)` pipes only after the buffered reactor remains the
    correctness oracle. Keep a per-round work budget so one hot flow cannot
    starve registrations or quiet flows. Status: delivered as the opt-in

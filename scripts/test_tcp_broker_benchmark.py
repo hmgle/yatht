@@ -189,7 +189,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_execution_order_keeps_stable_movers_adjacent(self) -> None:
         args = benchmark.argparse.Namespace(
-            variants=["direct", "stable", "addfd"],
+            variants=["direct", "stable"],
             stable_data_movers=["buffered", "splice"],
             proxy_session_sources=["inherited"],
         )

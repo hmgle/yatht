@@ -195,13 +195,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- The deterministic local TCP benchmark compares direct control, the fixed
-  pre-stable `b5554b9` ADDFD binary, and the current stable broker. It covers
+- The deterministic local TCP benchmark compares direct control with the
+  current stable broker. It covers
   short request/response flows, mostly-idle concurrency, streaming and
   slow-consumer transfers, hot/quiet fairness, mid-stream resets, stalled
   readers, and optional long-lived soak runs; randomizes variant order after
   three warmups; repeats each measurement ten times; and archives raw samples,
-  partial failure results, commands, binary hashes/commits/build commands,
+  partial failure results, commands, the binary hash/commit/build command,
   dirty-worktree artifacts, role-specific `VmHWM`/sampled fd peaks, and
   stable-broker diagnostics under `bench-results/tcp-broker/`. Paired
   same-repetition comparisons of the experimental data paths run through
@@ -226,10 +226,7 @@ cargo test
 cargo build --release --locked
 uv run scripts/tcp_broker_benchmark.py \
   --yatht target/release/yatht \
-  --yatht-build-command 'cargo build --release --locked' \
-  --addfd-yatht ../yatht-pre-stable-b5554b9/target/release/yatht \
-  --addfd-commit b5554b9 \
-  --addfd-build-command 'cargo build --release --locked'
+  --yatht-build-command 'cargo build --release --locked'
 ```
 
 - Manual integration check on Linux x86_64/kernel >= 6.9:

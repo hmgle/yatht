@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Run deterministic direct, pre-stable, and stable TCP broker benchmarks."""
+"""Run deterministic direct and stable TCP broker benchmarks."""
 
 from __future__ import annotations
 
@@ -39,17 +39,16 @@ DEFAULT_WORKLOAD = ROOT / "target" / "tcp-broker-benchmark" / "workload"
 # Raw measurement archives must survive `cargo clean`; only the rebuildable
 # workload binary stays under target/.
 DEFAULT_OUTPUT_ROOT = ROOT / "bench-results" / "tcp-broker"
-VARIANT_ORDER = ("direct", "addfd", "stable")
+VARIANT_ORDER = ("direct", "stable")
 STABLE_DATA_MOVERS = ("inherited", "buffered", "splice")
 PROXY_SESSION_SOURCES = ("inherited", "cold", "warm-one-shot")
 SPLICE_RAMP_BYTES = 4 * 1024 * 1024
 SPLICE_STEADY_BYTES = 32 * 1024 * 1024
 SPLICE_STEADY_MIN_GOODPUT_DELTA_PERCENT = -5.0
 SPLICE_STEADY_MAX_CPU_DELTA_PERCENT = -15.0
-# Pre-registered M4A warm readiness thresholds (TCP_BROKER_ROADMAP.md M4A):
-# pass needs one request point with a +20% connections/s or a -30% connect
-# p99 mean, no request point may regress connect p99 by more than 5%, and the
-# warm diagnostic must show bounded staleness with zero replenish failures.
+# Warm readiness passes when one request point improves connections/s by 20%
+# or connect p99 by 30%, no request point regresses connect p99 by more than 5%,
+# and diagnostics show bounded staleness with zero replenish failures.
 WARM_MIN_CONNS_PER_SEC_DELTA_PERCENT = 20.0
 WARM_MAX_CONNECT_P99_DELTA_PERCENT = -30.0
 WARM_CONNECT_P99_REGRESSION_LIMIT_PERCENT = 5.0
@@ -1470,9 +1469,9 @@ def variant_command(
             workload.append(str(scenario["consume"]))
     if variant == "direct":
         return workload
-    yatht = args.yatht if variant == "stable" else args.addfd_yatht
+    yatht = args.yatht
     if yatht is None:
-        raise ValueError(f"missing binary for {variant}")
+        raise ValueError("missing yatht binary")
     command = [
         yatht,
         "--proxy",
@@ -2852,7 +2851,7 @@ def binary_metadata(path: str | None, commit: str | None, build_command: str | N
 
 def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dict[str, Any]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "created_unix_ns": time.time_ns(),
         "git_commit": command_output(["git", "rev-parse", "HEAD"], cwd=ROOT),
         "git_status": command_output(["git", "status", "--short"], cwd=ROOT),
@@ -2870,11 +2869,6 @@ def environment_metadata(args: argparse.Namespace, dirty_diff_path: Path) -> dic
         ),
         "perf_stat_events": args.perf_stat_events,
         "yatht": binary_metadata(args.yatht, args.yatht_commit, args.yatht_build_command),
-        "addfd_yatht": binary_metadata(
-            args.addfd_yatht,
-            args.addfd_commit,
-            args.addfd_build_command,
-        ),
         "workload": {
             "path": str(args.workload),
             "sha256": sha256_file(args.workload),
@@ -2931,10 +2925,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yatht", default=str(ROOT / "target/release/yatht"))
     parser.add_argument("--yatht-commit", type=git_commit)
     parser.add_argument("--yatht-build-command", default="cargo build --release")
-    parser.add_argument("--addfd-yatht")
-    parser.add_argument("--addfd-commit", type=git_commit)
-    parser.add_argument("--addfd-build-command")
-    parser.add_argument("--variants", type=comma_variants, default="direct,addfd,stable")
+    parser.add_argument("--variants", type=comma_variants, default="direct,stable")
     parser.add_argument(
         "--stable-data-movers",
         type=comma_data_movers,
@@ -3032,20 +3023,6 @@ def parse_args() -> argparse.Namespace:
             parser.error("explicit stable data movers require the stable variant")
         if args.proxy_session_sources != ["inherited"]:
             parser.error("explicit proxy session sources require the stable variant")
-    if "addfd" in args.variants:
-        if (
-            args.addfd_yatht is None
-            or args.addfd_commit is None
-            or args.addfd_build_command is None
-        ):
-            parser.error("addfd requires --addfd-yatht, --addfd-commit, and --addfd-build-command")
-        try:
-            args.addfd_yatht = executable(args.addfd_yatht)
-        except argparse.ArgumentTypeError as error:
-            parser.error(str(error))
-    else:
-        args.addfd_yatht = None
-        args.addfd_commit = None
     if args.connections <= 0 or args.warmups < 0 or args.repetitions <= 0:
         parser.error("connections/repetitions must be positive and warmups nonnegative")
     if any(flows <= 0 for flows in args.idle_flows):
