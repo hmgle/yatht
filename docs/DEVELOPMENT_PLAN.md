@@ -170,8 +170,9 @@ is `socks5://127.0.0.1:1080`.
   batch timeouts use an absolute reactor deadline rather than reproducing the
   documented Linux timeout hang. Blocking receives sample `SO_RCVTIMEO` from
   the supervisor's duplicate of the injected endpoint (one open file
-  description, so dup/fork aliases and lazy replacements share it): a quiet
-  `recvfrom(2)`/`recvmsg(2)` fails with `EAGAIN` at the deadline, and
+  description, so stable dup/fork aliases and the lazy replacement endpoint
+  share the transferred option): a quiet `recvfrom(2)`/`recvmsg(2)` fails with
+  `EAGAIN` at the syscall-relative deadline, and
   `recvmmsg(2)` bounds each inter-datagram gap, re-arms after every delivered
   entry, and returns the completed count when the timeout expires with
   progress; the earlier of the socket timeout and the explicit timespec keeps

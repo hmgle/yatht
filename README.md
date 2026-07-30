@@ -175,7 +175,8 @@ the completed count once it expires with progress. Stable `recvmmsg(2)` uses an
 absolute reactor deadline and returns zero when an empty-queue explicit timeout
 expires, instead of reproducing Linux's documented timeout hang; when both the
 socket timeout and an explicit timespec are armed, the earlier deadline keeps
-its own expiry result. SOCKS5 domain-name
+its own expiry result. Lazy replacement transfers a pre-existing
+`SO_RCVTIMEO` to the injected endpoint. SOCKS5 domain-name
 response sources, `msg_control` data, error queues, and other IP-level option
 semantics remain limited.
 

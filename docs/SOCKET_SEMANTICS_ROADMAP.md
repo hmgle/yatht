@@ -111,8 +111,9 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    quiet `recvfrom(2)`/`recvmsg(2)` with `EAGAIN`, bounds each `recvmmsg(2)`
    inter-datagram gap with per-entry re-arming, and lets the earlier of the
    socket timeout and an explicit timespec keep its own expiry result. A
-   direct-kernel probe anchors the semantics and runs unchanged against
-   stable direct, stable SOCKS5, and lazy relays.
+   direct-kernel probe anchors the semantics and runs unchanged against stable
+   direct and stable SOCKS5 relays; lazy coverage verifies option transfer
+   across replacement as well as a timeout set after replacement.
 9. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
    unsolicited datagrams, error queues, and multi-response ordering remain open
    compatibility work. These need explicit support or an unsupported policy;

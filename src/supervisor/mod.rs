@@ -55,8 +55,14 @@ struct NotificationFailure {
 }
 
 struct BlockingRecvQueue {
-    tx: channel::Sender<SeccompNotif>,
+    tx: channel::Sender<BlockingRecvNotification>,
     wake_fd: Arc<OwnedFd>,
+}
+
+#[derive(Clone, Copy)]
+struct BlockingRecvNotification {
+    notif: SeccompNotif,
+    received_at: Instant,
 }
 
 struct QueuedNotification {
@@ -87,6 +93,9 @@ struct BlockingRecvState {
     deadline: Option<Instant>,
     rcvtimeo: Option<Duration>,
     rcvtimeo_deadline: Option<Instant>,
+    // Set when the notification enters the supervisor queue; direct handler
+    // calls leave it unset and use their dispatch time instead.
+    received_at: Option<Instant>,
 }
 
 impl BlockingRecvState {
@@ -102,7 +111,8 @@ impl BlockingRecvState {
 
     fn arm_rcvtimeo(&mut self, relay_fd: RawFd) {
         self.rcvtimeo = socket_recv_timeout(relay_fd);
-        self.reset_rcvtimeo_deadline();
+        let start = self.received_at.unwrap_or_else(Instant::now);
+        self.set_rcvtimeo_deadline(start);
     }
 
     /// Restarts the `SO_RCVTIMEO` window. The kernel bounds each blocking
@@ -110,9 +120,11 @@ impl BlockingRecvState {
     /// every delivered datagram (anchored by the direct-kernel baseline
     /// probe); an `Instant` overflow degrades to an unbounded wait.
     fn reset_rcvtimeo_deadline(&mut self) {
-        self.rcvtimeo_deadline = self
-            .rcvtimeo
-            .and_then(|timeout| Instant::now().checked_add(timeout));
+        self.set_rcvtimeo_deadline(Instant::now());
+    }
+
+    fn set_rcvtimeo_deadline(&mut self, start: Instant) {
+        self.rcvtimeo_deadline = self.rcvtimeo.and_then(|timeout| start.checked_add(timeout));
     }
 }
 
@@ -700,7 +712,7 @@ fn notification_loop(
     }
     let mut blocking_thread = None;
     let blocking_queue = if cfg.enable_dns || cfg.enable_udp {
-        let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
+        let (blocking_tx, blocking_rx) = channel::unbounded::<BlockingRecvNotification>();
         let wake_fd = match create_eventfd() {
             Ok(fd) => Arc::new(fd),
             Err(err) => {
@@ -752,6 +764,7 @@ fn notification_loop(
                             blocking_queue,
                             listener_raw_fd,
                             notif,
+                            Instant::now(),
                             cfg.debug,
                         ) {
                             if !report_thread_notification_error(
@@ -906,9 +919,11 @@ fn queue_blocking_notification(
     queue: &BlockingRecvQueue,
     listener_fd: RawFd,
     notif: SeccompNotif,
+    received_at: Instant,
     debug: bool,
 ) -> bool {
-    match queue.tx.send(notif) {
+    let queued = BlockingRecvNotification { notif, received_at };
+    match queue.tx.send(queued) {
         Ok(()) => {
             wake_eventfd(queue.wake_fd.as_raw_fd());
             true
@@ -917,7 +932,7 @@ fn queue_blocking_notification(
             if debug {
                 eprintln!("yatht: blocking recv reactor stopped");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            seccomp::send_errno(listener_fd, notif.notif.id, libc::EIO);
             false
         }
     }
@@ -1179,7 +1194,7 @@ fn blocking_recv_poll_timeout(
 /// a bounded worker pool, preserving liveness and parallelism across relays.
 fn blocking_recv_reactor(
     listener_fd: Arc<OwnedFd>,
-    rx: channel::Receiver<SeccompNotif>,
+    rx: channel::Receiver<BlockingRecvNotification>,
     wake_fd: Arc<OwnedFd>,
     relays: Arc<UdpRelayRegistry>,
     failure: Arc<NotificationFailure>,
@@ -1340,11 +1355,14 @@ fn blocking_recv_reactor(
         let mut received = 0;
         while received < BLOCKING_RECV_CHANNEL_BUDGET {
             match rx.try_recv() {
-                Ok(notif) => work_backlog.push_back(BlockingRecvWork {
-                    notif,
+                Ok(queued) => work_backlog.push_back(BlockingRecvWork {
+                    notif: queued.notif,
                     relay: None,
                     terminal_revents: 0,
-                    state: BlockingRecvState::default(),
+                    state: BlockingRecvState {
+                        received_at: Some(queued.received_at),
+                        ..BlockingRecvState::default()
+                    },
                 }),
                 Err(channel::TryRecvError::Empty) => break,
                 Err(channel::TryRecvError::Disconnected) => break 'reactor,
@@ -2678,7 +2696,11 @@ fn handle_recvmmsg_once(
         return RecvHandling::Completed;
     };
     if !state.timeout_initialized {
-        state.deadline = match read_recvmmsg_deadline(notif.pid, timeout_ptr) {
+        state.deadline = match read_recvmmsg_deadline(
+            notif.pid,
+            timeout_ptr,
+            state.received_at.unwrap_or_else(Instant::now),
+        ) {
             Ok(deadline) => deadline,
             Err(err) => {
                 let errno = if err.kind() == io::ErrorKind::InvalidInput {
@@ -2855,6 +2877,7 @@ struct UdpTargetSnapshot {
     identity: FdIdentity,
     domain: i32,
     flags: TargetFdFlags,
+    rcvtimeo: Option<Duration>,
 }
 
 /// Relay slot state. `Creating` is a single-flight marker published under the
@@ -3219,6 +3242,10 @@ impl UdpRelayRegistry {
             make_relay_pair().context("create UDP relay datagram socketpair")?;
         if target_snapshot.flags.status_flags & libc::O_NONBLOCK != 0 {
             let _ = set_nonblocking(target_fd.as_raw_fd());
+        }
+        if let Some(timeout) = target_snapshot.rcvtimeo {
+            set_socket_recv_timeout(target_fd.as_raw_fd(), timeout)
+                .context("preserve UDP SO_RCVTIMEO across lazy relay replacement")?;
         }
         let target_identity =
             fd_identity(target_fd.as_raw_fd()).context("stat UDP relay target socket")?;
@@ -4223,10 +4250,9 @@ fn notification_interrupted() -> io::Error {
     io::Error::from_raw_os_error(libc::EINTR)
 }
 
-/// Reads the target-visible `SO_RCVTIMEO` from a descriptor sharing the
-/// injected endpoint's open file description. A zero timeout means "block
-/// forever" and maps to `None`, as does a read failure: an unreadable option
-/// must degrade to the previous unbounded wait rather than fail the receive.
+/// Reads the target-visible `SO_RCVTIMEO`. A zero timeout means "block forever"
+/// and maps to `None`, as does a read failure: an unreadable option must
+/// degrade to the previous unbounded wait rather than fail the receive.
 fn socket_recv_timeout(fd: RawFd) -> Option<Duration> {
     let mut timeout = libc::timeval {
         tv_sec: 0,
@@ -4251,13 +4277,44 @@ fn socket_recv_timeout(fd: RawFd) -> Option<Duration> {
     Some(Duration::from_secs(timeout.tv_sec as u64) + Duration::from_micros(timeout.tv_usec as u64))
 }
 
-fn read_recvmmsg_deadline(pid: u32, timeout_ptr: u64) -> io::Result<Option<Instant>> {
+fn set_socket_recv_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
+    let tv_sec = libc::time_t::try_from(timeout.as_secs()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SO_RCVTIMEO duration does not fit timeval",
+        )
+    })?;
+    let value = libc::timeval {
+        tv_sec,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&value as *const libc::timeval).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn read_recvmmsg_deadline(
+    pid: u32,
+    timeout_ptr: u64,
+    received_at: Instant,
+) -> io::Result<Option<Instant>> {
     if timeout_ptr == 0 {
         return Ok(None);
     }
     let raw = read_proc_bytes(pid, timeout_ptr, X86_64_TIMESPEC_SIZE)?;
     let duration = parse_recvmmsg_timeout(&raw)?;
-    Instant::now()
+    received_at
         .checked_add(duration)
         .map(Some)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recvmmsg timeout overflow"))
@@ -4570,6 +4627,7 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
         identity: fd_identity(target.as_raw_fd()).context("stat UDP target fd")?,
         domain,
         flags,
+        rcvtimeo: socket_recv_timeout(target.as_raw_fd()),
     }))
 }
 
@@ -5446,6 +5504,7 @@ mod tests {
             &queue,
             -1,
             SeccompNotif::default(),
+            Instant::now(),
             false,
         ));
         assert!(rx.try_recv().is_ok());
@@ -5641,6 +5700,25 @@ mod tests {
         let before = Instant::now();
         state.reset_rcvtimeo_deadline();
         assert!(state.rcvtimeo_deadline.unwrap() >= before + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn arm_rcvtimeo_uses_notification_received_at() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let received_at = Instant::now() - Duration::from_secs(2);
+        let mut state = BlockingRecvState {
+            received_at: Some(received_at),
+            ..BlockingRecvState::default()
+        };
+
+        state.arm_rcvtimeo(socket.as_raw_fd());
+
+        assert!(state
+            .rcvtimeo_deadline
+            .is_some_and(|deadline| deadline < Instant::now() - Duration::from_secs(1)));
     }
 
     #[test]

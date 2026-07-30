@@ -2683,27 +2683,38 @@ int main(int argc, char **argv) {
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return 4;
 
+    /* The option is set before the first proxied send, so lazy replacement
+       must transfer it to the injected endpoint. */
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = 500000 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 5;
+
     /* The first proxied send lazily replaces the descriptor with the relay
        endpoint; the prompt response proves the relay is live. */
     if (sendto(fd, prompt_query, sizeof(prompt_query) - 1, 0,
                (struct sockaddr *)&destination, sizeof(destination)) !=
-        (ssize_t)(sizeof(prompt_query) - 1)) return 5;
+        (ssize_t)(sizeof(prompt_query) - 1)) return 6;
     char buffer[128];
     ssize_t received = recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL);
     if (received != (ssize_t)(sizeof(prompt_response) - 1) ||
-        memcmp(buffer, prompt_response, sizeof(prompt_response) - 1) != 0) return 6;
+        memcmp(buffer, prompt_response, sizeof(prompt_response) - 1) != 0) return 7;
+
+    struct timeval readback = { .tv_sec = 0, .tv_usec = 0 };
+    socklen_t readback_len = sizeof(readback);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &readback, &readback_len) != 0 ||
+        readback_len != sizeof(readback) ||
+        readback.tv_sec != 0 || readback.tv_usec < 490000 || readback.tv_usec > 510000)
+        return 8;
 
     /* SO_RCVTIMEO armed on the replaced descriptor bounds a quiet receive. */
-    struct timeval timeout = { .tv_sec = 0, .tv_usec = 500000 };
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 7;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 9;
     struct timespec start;
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 8;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 10;
     errno = 0;
-    if (recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL) != -1 || errno != EAGAIN) return 9;
+    if (recvfrom(fd, buffer, sizeof(buffer), 0, NULL, NULL) != -1 || errno != EAGAIN) return 11;
     long waited = elapsed_ms(&start);
-    if (waited < 450 || waited > 5000) return 10;
+    if (waited < 450 || waited > 5000) return 12;
 
-    if (write(STDOUT_FILENO, "lazy-rcvtimeo-ok", 16) != 16) return 11;
+    if (write(STDOUT_FILENO, "lazy-rcvtimeo-ok", 16) != 16) return 13;
     return 0;
 }
 "#,
