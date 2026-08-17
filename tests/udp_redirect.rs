@@ -449,6 +449,46 @@ fn stable_udp_matches_socket_error_semantics() {
 }
 
 #[test]
+fn direct_kernel_udp_address_semantics_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_address_semantics_probe();
+    let output = Command::new(&probe).output().unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "address-semantics-ok"
+    );
+}
+
+#[test]
+fn stable_udp_matches_address_semantics() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_address_semantics_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "address-semantics-ok"
+    );
+}
+
+#[test]
 fn direct_kernel_udp_getsockopt_truncation_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -2090,6 +2130,101 @@ int main(void) {
     if (send(fd, "x", 1, 0) != -1 || errno != EDESTADDRREQ) return 12;
 
     if (write(STDOUT_FILENO, "socket-errors-ok", 16) != 16) return 13;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_address_semantics_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_address_semantics_probe.c");
+    let bin = dir.path().join("udp_address_semantics_probe");
+    fs::write(
+        &src,
+        r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return 2;
+
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 3;
+    ssize_t sent = sendto(fd, "x", 1, 0, (struct sockaddr *)&ipv4, sizeof(ipv4));
+    if (sent != 1) {
+        dprintf(STDERR_FILENO, "dual-stack sendto rc=%zd errno=%d\n", sent, errno);
+        return 4;
+    }
+    if (connect(fd, (struct sockaddr *)&ipv4, sizeof(ipv4)) != 0) return 5;
+    if (close(fd) != 0) return 6;
+
+    fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 7;
+    errno = 0;
+    if (bind(fd, (struct sockaddr *)&ipv4, sizeof(ipv4)) != -1 ||
+        errno != EINVAL) return 8;
+    if (close(fd) != 0) return 9;
+
+    struct {
+        struct sockaddr_in address;
+        unsigned char padding[8];
+    } padded_ipv4;
+    memset(&padded_ipv4, 0, sizeof(padded_ipv4));
+    padded_ipv4.address = ipv4;
+    fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 10;
+    errno = 0;
+    if (bind(fd, (struct sockaddr *)&padded_ipv4, sizeof(padded_ipv4)) != -1 ||
+        errno != EAFNOSUPPORT) return 11;
+    if (close(fd) != 0) return 12;
+
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 13;
+    struct sockaddr_in zero_port = ipv4;
+    zero_port.sin_port = 0;
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&zero_port,
+               sizeof(zero_port)) != -1 || errno != EINVAL) return 14;
+
+    struct sockaddr unknown;
+    memset(&unknown, 0, sizeof(unknown));
+    unknown.sa_family = 1234;
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, &unknown, sizeof(unknown)) != -1 ||
+        errno != EAFNOSUPPORT) return 15;
+    if (close(fd) != 0) return 16;
+
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 17;
+    struct sockaddr_in unspecified;
+    memset(&unspecified, 0, sizeof(unspecified));
+    unspecified.sin_family = AF_UNSPEC;
+    if (bind(fd, (struct sockaddr *)&unspecified, sizeof(unspecified)) != 0) return 18;
+    if (close(fd) != 0) return 19;
+
+    if (write(STDOUT_FILENO, "address-semantics-ok", 20) != 20) return 20;
     return 0;
 }
 "#,

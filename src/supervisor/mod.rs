@@ -32,6 +32,8 @@ const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
 const UDP_SOCKET_MODE_ENV: &str = "SUP_UDP_SOCKET_MODE";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
+const SOCKADDR_IN_SIZE: usize = 16;
+const SOCKADDR_IN6_MIN_SIZE: usize = 24;
 // Upper bound on relay responses buffered ahead of the target's recv. Caps
 // memory when the target stops reading and keeps the source queue from growing
 // without limit; once full, further responses are dropped rather than enqueued.
@@ -1550,17 +1552,13 @@ fn handle_bind(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegi
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
-    let destination = read_sockaddr(notif.pid, addr, addr_len)
-        .ok()
-        .and_then(|raw| parse_sockaddr(&raw).ok());
-    let Some(destination) = destination else {
-        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
-        return;
+    let destination = match read_bind_destination(notif.pid, addr, addr_len, handle.domain) {
+        Ok(destination) => destination,
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
     };
-    if !handle.accepts_destination(destination) {
-        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
-        return;
-    }
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
@@ -2121,17 +2119,36 @@ fn handle_sendto(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
-    let Some(dest) = read_send_destination(notif.pid, addr, addr_len) else {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    let dest = match read_send_destination(notif.pid, addr, addr_len) {
+        Ok(dest) => dest,
+        Err(errno) => {
+            if existing.is_some() {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+            }
+            return;
+        }
     };
-    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest)
-    else {
+    let route = match udp_route_for(&cfg, dest) {
+        Some(route) => route,
+        None if existing.is_some() => UdpRouteKind::Direct,
         // Direct destination on a plain (non-relay) fd: the kernel socket is a
         // real UDP socket, so let the syscall run unmodified.
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
+        None => {
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
     };
+    let domain = existing
+        .as_ref()
+        .map(|handle| handle.domain)
+        .or_else(|| remote_udp_domain(notif.pid, target_fd));
+    if domain.is_some_and(|domain| !udp_domain_accepts_destination(domain, dest)) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
+        return;
+    }
     if len > MAX_UDP_PAYLOAD {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
         return;
@@ -2148,10 +2165,6 @@ fn handle_sendto(
         Some(handle) => handle,
         None => return,
     };
-    if !handle.accepts_destination(dest) {
-        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
-        return;
-    }
     let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     match handle.send(dest, payload, route, nonblocking) {
@@ -2160,29 +2173,6 @@ fn handle_sendto(
             seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
         }
         Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
-    }
-}
-
-/// Decides how a UDP send to `dest` must be handled.
-///
-/// A proxied/DNS destination always routes through a relay (created on demand).
-/// A direct destination only routes through a relay when the fd has *already*
-/// been turned into an AF_UNIX relay socketpair by an earlier proxied send or
-/// connect -- that fd can no longer carry an AF_INET sendto, so the relay must
-/// perform the direct send. On a plain fd a direct destination returns `None`,
-/// telling the caller to let the original syscall run.
-fn resolve_udp_send(
-    cfg: &EffectiveConfig,
-    relays: &UdpRelayRegistry,
-    pid: u32,
-    fd: RawFd,
-    dest: Destination,
-) -> Option<(Option<UdpRelayHandle>, UdpRouteKind)> {
-    match udp_route_for(cfg, dest) {
-        Some(kind) => Some((None, kind)),
-        None => relays
-            .lookup_handle(pid, fd, true)
-            .map(|handle| (Some(handle), UdpRouteKind::Direct)),
     }
 }
 
@@ -2277,25 +2267,34 @@ fn handle_sendmsg(
         return;
     }
 
-    let raw = match read_sockaddr(notif.pid, msg.name, msg.name_len as usize) {
-        Ok(raw) => raw,
-        Err(_) => {
-            seccomp::send_continue(listener_fd, notif.id);
-            return;
-        }
-    };
-    let dest = match parse_sockaddr(&raw) {
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    let dest = match read_send_destination(notif.pid, msg.name, msg.name_len as usize) {
         Ok(dest) => dest,
-        Err(_) => {
+        Err(errno) => {
+            if existing.is_some() {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+            }
+            return;
+        }
+    };
+    let route = match udp_route_for(&cfg, dest) {
+        Some(route) => route,
+        None if existing.is_some() => UdpRouteKind::Direct,
+        None => {
             seccomp::send_continue(listener_fd, notif.id);
             return;
         }
     };
-    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest)
-    else {
-        seccomp::send_continue(listener_fd, notif.id);
+    let domain = existing
+        .as_ref()
+        .map(|handle| handle.domain)
+        .or_else(|| remote_udp_domain(notif.pid, target_fd));
+    if domain.is_some_and(|domain| !udp_domain_accepts_destination(domain, dest)) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
         return;
-    };
+    }
 
     let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
@@ -2329,10 +2328,6 @@ fn handle_sendmsg(
         Some(handle) => handle,
         None => return,
     };
-    if !handle.accepts_destination(dest) {
-        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
-        return;
-    }
     let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     match handle.send(dest, payload, route, nonblocking) {
@@ -2392,12 +2387,12 @@ fn handle_sendmmsg(
             }
         };
         let (dest, route) = if msg.name != 0 && msg.name_len != 0 {
-            let dest = read_sockaddr(notif.pid, msg.name, msg.name_len as usize)
-                .ok()
-                .and_then(|raw| parse_sockaddr(&raw).ok());
-            let Some(dest) = dest else {
-                send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EINVAL);
-                return;
+            let dest = match read_send_destination(notif.pid, msg.name, msg.name_len as usize) {
+                Ok(dest) => dest,
+                Err(errno) => {
+                    send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+                    return;
+                }
             };
             (
                 dest,
@@ -3769,10 +3764,7 @@ impl UdpRelayHandle {
     }
 
     fn accepts_destination(&self, dest: Destination) -> bool {
-        matches!(
-            (self.domain, dest.ip),
-            (libc::AF_INET, IpAddr::V4(_)) | (libc::AF_INET6, IpAddr::V6(_))
-        )
+        udp_domain_accepts_destination(self.domain, dest)
     }
 
     fn set_local_bind(&self, bind: Destination) -> bool {
@@ -3835,6 +3827,13 @@ impl UdpRelayHandle {
             let _ = unsafe { libc::shutdown(self.relay_fd.as_raw_fd(), libc::SHUT_RDWR) };
         }
     }
+}
+
+fn udp_domain_accepts_destination(domain: i32, dest: Destination) -> bool {
+    matches!(
+        (domain, dest.ip),
+        (libc::AF_INET, IpAddr::V4(_)) | (libc::AF_INET6, _)
+    )
 }
 
 fn start_udp_relay(
@@ -4169,9 +4168,70 @@ fn make_relay_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
-fn read_send_destination(pid: u32, addr: u64, addr_len: usize) -> Option<Destination> {
-    let raw_addr = read_sockaddr(pid, addr, addr_len).ok()?;
-    parse_sockaddr(&raw_addr).ok()
+fn read_send_destination(
+    pid: u32,
+    addr: u64,
+    addr_len: usize,
+) -> std::result::Result<Destination, i32> {
+    let raw_addr = read_sockaddr(pid, addr, addr_len).map_err(|_| libc::EFAULT)?;
+    if raw_addr.len() < 2 {
+        return Err(libc::EINVAL);
+    }
+    let family = u16::from_ne_bytes([raw_addr[0], raw_addr[1]]) as i32;
+    let dest = match family {
+        libc::AF_INET | libc::AF_INET6 => parse_sockaddr(&raw_addr).map_err(|_| libc::EINVAL)?,
+        _ => return Err(libc::EAFNOSUPPORT),
+    };
+    if dest.port == 0 {
+        return Err(libc::EINVAL);
+    }
+    Ok(dest)
+}
+
+fn read_bind_destination(
+    pid: u32,
+    addr: u64,
+    addr_len: usize,
+    domain: i32,
+) -> std::result::Result<Destination, i32> {
+    let minimum_len = match domain {
+        libc::AF_INET => SOCKADDR_IN_SIZE,
+        libc::AF_INET6 => SOCKADDR_IN6_MIN_SIZE,
+        _ => return Err(libc::EAFNOSUPPORT),
+    };
+    if addr_len < minimum_len {
+        return Err(libc::EINVAL);
+    }
+
+    let family_raw = read_proc_bytes(pid, addr, 2).map_err(|_| libc::EFAULT)?;
+    let family = u16::from_ne_bytes(family_raw.try_into().unwrap()) as i32;
+    if family == libc::AF_UNSPEC {
+        if domain != libc::AF_INET {
+            return Err(libc::EAFNOSUPPORT);
+        }
+        let mut raw = read_proc_bytes(pid, addr, SOCKADDR_IN_SIZE).map_err(|_| libc::EFAULT)?;
+        raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        let destination = parse_sockaddr_in(&raw).map_err(|_| libc::EINVAL)?;
+        return destination
+            .ip
+            .is_unspecified()
+            .then_some(destination)
+            .ok_or(libc::EAFNOSUPPORT);
+    }
+    if family != domain {
+        return Err(libc::EAFNOSUPPORT);
+    }
+
+    let raw = read_sockaddr(pid, addr, addr_len).map_err(|_| libc::EFAULT)?;
+    parse_sockaddr(&raw).map_err(|_| libc::EINVAL)
+}
+
+fn remote_udp_domain(pid: u32, fd: RawFd) -> Option<i32> {
+    let target = duplicate_remote_fd(pid, fd).ok()?;
+    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM) {
+        return None;
+    }
+    socket_domain_from_fd(target.as_raw_fd())
 }
 
 #[derive(Debug)]
@@ -4978,7 +5038,7 @@ fn read_sockaddr(pid: u32, addr: u64, addr_len: usize) -> io::Result<Vec<u8>> {
 
     let family = u16::from_ne_bytes([family_raw[0], family_raw[1]]) as i32;
     let needed_len = match family {
-        libc::AF_INET => 8,
+        libc::AF_INET => SOCKADDR_IN_SIZE,
         libc::AF_INET6 => 28,
         _ => return Ok(family_raw),
     };
@@ -5169,7 +5229,7 @@ fn parse_sockaddr(raw: &[u8]) -> Result<Destination> {
 }
 
 fn parse_sockaddr_in(raw: &[u8]) -> Result<Destination> {
-    if raw.len() < 8 {
+    if raw.len() < SOCKADDR_IN_SIZE {
         bail!("sockaddr_in too short");
     }
     let port = u16::from_be_bytes([raw[2], raw[3]]);
@@ -5181,7 +5241,7 @@ fn parse_sockaddr_in(raw: &[u8]) -> Result<Destination> {
 }
 
 fn parse_sockaddr_in6(raw: &[u8]) -> Result<Destination> {
-    if raw.len() < 28 {
+    if raw.len() < SOCKADDR_IN6_MIN_SIZE {
         bail!("sockaddr_in6 too short");
     }
     let port = u16::from_be_bytes([raw[2], raw[3]]);
