@@ -991,6 +991,58 @@ fn stable_udp_proxy_recvmmsg_preserves_sources_and_queue_order() {
 }
 
 #[test]
+fn direct_kernel_udp_dual_stack_address_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_dual_stack_address_probe();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "dual-stack-address-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_reports_dual_stack_addresses_as_v4_mapped() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_dual_stack_address_probe();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .arg(response_source.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "dual-stack-address-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn stable_udp_direct_receive_reports_actual_response_source() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -2090,6 +2142,137 @@ int main(int argc, char **argv) {
     .unwrap();
     let status = Command::new("cc")
         .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_dual_stack_address_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_dual_stack_address_probe.c");
+    let bin = dir.path().join("udp_dual_stack_address_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static const char query[] = "receive-metadata-query";
+static const char response[] = "receive-metadata-response";
+
+static int split_address(const char *value, struct in_addr *ip, unsigned short *port) {
+    char copy[64];
+    if (snprintf(copy, sizeof(copy), "%s", value) >= (int)sizeof(copy)) return -1;
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    *port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, copy, ip) == 1 ? 0 : -1;
+}
+
+static int parse_ipv4(const char *value, struct sockaddr_in *address) {
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    return split_address(value, &address->sin_addr, &address->sin_port);
+}
+
+/* Linux renders an IPv4 peer of a dual-stack socket as ::ffff:a.b.c.d. */
+static int parse_v4_mapped(const char *value, struct sockaddr_in6 *address) {
+    struct in_addr ipv4;
+    unsigned short port;
+    if (split_address(value, &ipv4, &port) != 0) return -1;
+    memset(address, 0, sizeof(*address));
+    address->sin6_family = AF_INET6;
+    address->sin6_port = port;
+    address->sin6_addr.s6_addr[10] = 0xff;
+    address->sin6_addr.s6_addr[11] = 0xff;
+    memcpy(&address->sin6_addr.s6_addr[12], &ipv4, sizeof(ipv4));
+    return 0;
+}
+
+static int same_address(const struct sockaddr_in6 *left,
+                        const struct sockaddr_in6 *right) {
+    return left->sin6_family == right->sin6_family &&
+           left->sin6_port == right->sin6_port &&
+           memcmp(&left->sin6_addr, &right->sin6_addr, sizeof(left->sin6_addr)) == 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    struct sockaddr_in destination;
+    struct sockaddr_in6 expected_peer;
+    struct sockaddr_in6 expected_source;
+    if (parse_ipv4(argv[1], &destination) != 0 ||
+        parse_v4_mapped(argv[1], &expected_peer) != 0 ||
+        parse_v4_mapped(argv[2], &expected_source) != 0) return 3;
+
+    int peer_fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (peer_fd < 0) return 4;
+    if (connect(peer_fd, (struct sockaddr *)&destination, sizeof(destination)) != 0) return 5;
+    struct sockaddr_in6 peer;
+    socklen_t peer_len = sizeof(peer);
+    memset(&peer, 0, sizeof(peer));
+    if (getpeername(peer_fd, (struct sockaddr *)&peer, &peer_len) != 0) return 6;
+    if (peer_len != sizeof(peer) || !same_address(&peer, &expected_peer)) return 7;
+    if (close(peer_fd) != 0) return 8;
+
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 9;
+    struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 10;
+    if (sendto(fd, query, sizeof(query) - 1, MSG_NOSIGNAL,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(query) - 1)) return 11;
+
+    char peek[7];
+    struct sockaddr_in6 peek_source;
+    socklen_t peek_source_len = sizeof(peek_source);
+    memset(&peek_source, 0, sizeof(peek_source));
+    ssize_t peeked = recvfrom(fd, peek, sizeof(peek), MSG_PEEK | MSG_TRUNC,
+                              (struct sockaddr *)&peek_source, &peek_source_len);
+    if (peeked != (ssize_t)(sizeof(response) - 1)) return 12;
+    if (peek_source_len != sizeof(peek_source) ||
+        !same_address(&peek_source, &expected_source)) return 13;
+
+    char received[sizeof(response)];
+    struct iovec iov = { .iov_base = received, .iov_len = sizeof(received) };
+    struct sockaddr_in6 msg_source;
+    struct msghdr msg;
+    memset(&msg_source, 0, sizeof(msg_source));
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &msg_source;
+    msg.msg_namelen = sizeof(msg_source);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    ssize_t received_len = recvmsg(fd, &msg, 0);
+    if (received_len != (ssize_t)(sizeof(response) - 1)) return 14;
+    if (msg.msg_namelen != sizeof(msg_source) ||
+        !same_address(&msg_source, &expected_source)) return 15;
+    if (memcmp(received, response, sizeof(response) - 1) != 0) return 16;
+    if (close(fd) != 0) return 17;
+
+    if (write(STDOUT_FILENO, "dual-stack-address-ok", 21) != 21) return 18;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
         .arg("-o")
         .arg(&bin)
         .status()

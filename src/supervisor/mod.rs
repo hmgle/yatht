@@ -1606,7 +1606,16 @@ fn handle_getsockname(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRe
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    if write_sockaddr_result(notif.pid, addr, addr_len_ptr, addr_len, local).is_err() {
+    if write_sockaddr_result(
+        notif.pid,
+        addr,
+        addr_len_ptr,
+        addr_len,
+        handle.domain,
+        local,
+    )
+    .is_err()
+    {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
@@ -1643,7 +1652,8 @@ fn handle_getpeername(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRe
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    if write_sockaddr_result(notif.pid, addr, addr_len_ptr, addr_len, peer).is_err() {
+    if write_sockaddr_result(notif.pid, addr, addr_len_ptr, addr_len, handle.domain, peer).is_err()
+    {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
@@ -2605,8 +2615,15 @@ fn handle_recvfrom_once(
             }
             if let Some(addr_len) = addr_len {
                 if let Some(source) = source {
-                    if write_sockaddr_result(notif.pid, src_addr, addr_len_ptr, addr_len, source)
-                        .is_err()
+                    if write_sockaddr_result(
+                        notif.pid,
+                        src_addr,
+                        addr_len_ptr,
+                        addr_len,
+                        handle.domain,
+                        source,
+                    )
+                    .is_err()
                     {
                         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                         return RecvHandling::Completed;
@@ -2714,7 +2731,9 @@ fn handle_recvmsg_once(
         wait_for_readable,
     ) {
         Ok(received) => {
-            if write_recvmsg_result(notif.pid, msg_ptr, &msg, &iovecs, &received).is_err() {
+            if write_recvmsg_result(notif.pid, msg_ptr, &msg, &iovecs, handle.domain, &received)
+                .is_err()
+            {
                 seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                 return RecvHandling::Completed;
             }
@@ -2866,7 +2885,15 @@ fn handle_recvmmsg_once(
             false,
         ) {
             Ok(received) => {
-                if write_recvmsg_result(notif.pid, entry_ptr, &msg, &iovecs, &received).is_err()
+                if write_recvmsg_result(
+                    notif.pid,
+                    entry_ptr,
+                    &msg,
+                    &iovecs,
+                    handle.domain,
+                    &received,
+                )
+                .is_err()
                     || write_proc_bytes(
                         notif.pid,
                         entry_ptr + X86_64_MMSGHDR_LEN_OFFSET,
@@ -3843,6 +3870,19 @@ fn udp_domain_accepts_destination(domain: i32, dest: Destination) -> bool {
     )
 }
 
+/// Renders `dest` in the socket's logical address family. A dual-stack AF_INET6
+/// socket reaches IPv4 peers, and Linux reports those peers as v4-mapped IPv6
+/// addresses, so `getpeername(2)` and every receive source must do the same.
+fn udp_domain_logical_address(domain: i32, dest: Destination) -> Destination {
+    match (domain, dest.ip) {
+        (libc::AF_INET6, IpAddr::V4(ip)) => Destination {
+            ip: IpAddr::V6(ip.to_ipv6_mapped()),
+            port: dest.port,
+        },
+        _ => dest,
+    }
+}
+
 fn start_udp_relay(
     cfg: UdpRelayConfig,
     relay_socket: OwnedFd,
@@ -4684,6 +4724,7 @@ fn write_recvmsg_result(
     msg_ptr: u64,
     msg: &TargetMsghdr,
     iovecs: &[TargetIovec],
+    domain: i32,
     received: &RelayRecvmsg,
 ) -> io::Result<()> {
     write_iovec_payload(pid, iovecs, &received.payload)?;
@@ -4694,7 +4735,7 @@ fn write_recvmsg_result(
     )?;
     if msg.name != 0 {
         if let Some(source) = received.source {
-            write_sockaddr_to_msghdr(pid, msg_ptr, msg.name, msg.name_len, source)?;
+            write_sockaddr_to_msghdr(pid, msg_ptr, msg.name, msg.name_len, domain, source)?;
         }
     }
     Ok(())
@@ -4715,9 +4756,10 @@ fn write_sockaddr_result(
     addr: u64,
     addr_len_ptr: u64,
     addr_len: u32,
+    domain: i32,
     source: Destination,
 ) -> io::Result<()> {
-    let (raw, raw_len) = sockaddr_bytes(source);
+    let (raw, raw_len) = sockaddr_bytes(udp_domain_logical_address(domain, source));
     let write_len = (addr_len as usize).min(raw_len);
     write_proc_bytes(pid, addr, &raw[..write_len])?;
     write_proc_bytes(pid, addr_len_ptr, &(raw_len as u32).to_ne_bytes())
@@ -4728,9 +4770,10 @@ fn write_sockaddr_to_msghdr(
     msg_ptr: u64,
     addr: u64,
     addr_len: u32,
+    domain: i32,
     source: Destination,
 ) -> io::Result<()> {
-    let (raw, raw_len) = sockaddr_bytes(source);
+    let (raw, raw_len) = sockaddr_bytes(udp_domain_logical_address(domain, source));
     let write_len = (addr_len as usize).min(raw_len);
     write_proc_bytes(pid, addr, &raw[..write_len])?;
     write_proc_bytes(
