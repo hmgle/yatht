@@ -495,7 +495,11 @@ fn direct_kernel_udp_send_destination_baseline() {
     }
 
     let (_probe_dir, probe) = build_udp_send_destination_probe();
-    let output = Command::new(&probe).output().unwrap();
+    let peer = UdpSocket::bind("[::1]:0").unwrap();
+    let output = Command::new(&probe)
+        .arg(peer.local_addr().unwrap().port().to_string())
+        .output()
+        .unwrap();
 
     assert_success(&output);
     assert_eq!(
@@ -511,6 +515,7 @@ fn stable_udp_matches_send_destination_semantics() {
     }
 
     let (_probe_dir, probe) = build_udp_send_destination_probe();
+    let peer = UdpSocket::bind("[::1]:0").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .env("SUP_UDP_SOCKET_MODE", "stable")
         .arg("--proxy")
@@ -518,6 +523,7 @@ fn stable_udp_matches_send_destination_semantics() {
         .arg("--enable-udp")
         .arg("--")
         .arg(&probe)
+        .arg(peer.local_addr().unwrap().port().to_string())
         .output()
         .unwrap();
 
@@ -2520,6 +2526,7 @@ fn build_udp_send_destination_probe() -> (TempDir, PathBuf) {
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -2617,11 +2624,35 @@ static int check_socket_relative_names(void) {
     return close(fd);
 }
 
-int main(void) {
-    if (check_empty_name(AF_INET) != 0) return 2;
-    if (check_empty_name(AF_INET6) != 0) return 3;
-    if (check_socket_relative_names() != 0) return 4;
-    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 5;
+/* A dropped AF_UNSPEC name hands the datagram to the connected peer. Linux
+ * only reaches a v4-mapped peer from the IPv4 fast path, which this call
+ * bypasses, so the peer here is IPv6 to keep the check portable. */
+static int check_connected_unspecified_name(const char *port) {
+    struct sockaddr_in6 address;
+    memset(&address, 0, sizeof(address));
+    address.sin6_family = AF_INET6;
+    address.sin6_port = htons((unsigned short)strtoul(port, NULL, 10));
+    if (inet_pton(AF_INET6, "::1", &address.sin6_addr) != 1) return -1;
+
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) { close(fd); return -1; }
+
+    struct sockaddr_in6 unspecified;
+    memset(&unspecified, 0, sizeof(unspecified));
+    unspecified.sin6_family = AF_UNSPEC;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&unspecified,
+               sizeof(unspecified)) != 1) { close(fd); return -1; }
+    return close(fd);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    if (check_empty_name(AF_INET) != 0) return 3;
+    if (check_empty_name(AF_INET6) != 0) return 4;
+    if (check_socket_relative_names() != 0) return 5;
+    if (check_connected_unspecified_name(argv[1]) != 0) return 6;
+    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 7;
     return 0;
 }
 "#,

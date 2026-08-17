@@ -2138,12 +2138,37 @@ fn handle_sendto(
         send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
-    let dest = match resolve_send_destination(notif.pid, addr, addr_len, existing.as_ref()) {
-        SendDestination::Explicit(dest) => dest,
-        SendDestination::ConnectedPeer => {
-            send_without_destination(listener_fd, &notif, existing.as_ref());
-            return;
+    let (dest, route) = match resolve_send_destination(notif.pid, addr, addr_len, existing.as_ref())
+    {
+        SendDestination::Explicit(dest) => {
+            let route = match udp_route_for(&cfg, dest) {
+                Some(route) => route,
+                None if existing.is_some() => UdpRouteKind::Direct,
+                // Direct destination on a plain (non-relay) fd: the kernel
+                // socket is a real UDP socket, so let the syscall run
+                // unmodified.
+                None => {
+                    seccomp::send_continue(listener_fd, notif.id);
+                    return;
+                }
+            };
+            let domain = existing
+                .as_ref()
+                .map(|handle| handle.domain)
+                .or_else(|| remote_udp_domain(notif.pid, target_fd));
+            if let Some(domain) = domain {
+                if let Err(errno) = validate_send_destination(domain, dest) {
+                    seccomp::send_errno(listener_fd, notif.id, errno);
+                    return;
+                }
+            }
+            (dest, route)
         }
+        SendDestination::ConnectedPeer => match connected_send_peer(listener_fd, &notif, &existing)
+        {
+            Some(peer) => peer,
+            None => return,
+        },
         SendDestination::Continue => {
             seccomp::send_continue(listener_fd, notif.id);
             return;
@@ -2153,26 +2178,6 @@ fn handle_sendto(
             return;
         }
     };
-    let route = match udp_route_for(&cfg, dest) {
-        Some(route) => route,
-        None if existing.is_some() => UdpRouteKind::Direct,
-        // Direct destination on a plain (non-relay) fd: the kernel socket is a
-        // real UDP socket, so let the syscall run unmodified.
-        None => {
-            seccomp::send_continue(listener_fd, notif.id);
-            return;
-        }
-    };
-    let domain = existing
-        .as_ref()
-        .map(|handle| handle.domain)
-        .or_else(|| remote_udp_domain(notif.pid, target_fd));
-    if let Some(domain) = domain {
-        if let Err(errno) = validate_send_destination(domain, dest) {
-            seccomp::send_errno(listener_fd, notif.id, errno);
-            return;
-        }
-    }
     if len > MAX_UDP_PAYLOAD {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
         return;
@@ -2200,9 +2205,10 @@ fn handle_sendto(
     }
 }
 
-/// Answers a send whose call carries no explicit destination. A relayed socket
-/// forwards the datagram over its connected peer, and an unconnected one fails
-/// with `EDESTADDRREQ`; a plain fd is left to the kernel.
+/// Answers a send whose call carries no destination pointer at all. The kernel
+/// drops such a name before the injected AF_UNIX endpoint sees it, so a relayed
+/// socket can simply continue and let its connected peer carry the datagram;
+/// an unconnected one fails with `EDESTADDRREQ`.
 fn send_without_destination(
     listener_fd: RawFd,
     notif: &SeccompNotif,
@@ -2214,6 +2220,24 @@ fn send_without_destination(
         }
         _ => seccomp::send_continue(listener_fd, notif.id),
     }
+}
+
+/// Resolves the peer that carries a send whose supplied name Linux drops. The
+/// relay must perform this send itself: continuing would hand the dropped name
+/// to the injected AF_UNIX endpoint, which rejects any non-AF_UNIX address.
+/// Answers the notification and returns `None` when the socket is unconnected.
+fn connected_send_peer(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    handle: &Option<UdpRelayHandle>,
+) -> Option<(Destination, UdpRouteKind)> {
+    let peer = handle
+        .as_ref()
+        .and_then(|handle| handle.default_destination());
+    if peer.is_none() {
+        seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+    }
+    peer
 }
 
 /// If `fd` already has a relay, records `dest` as the relay's default direct
@@ -2298,17 +2322,38 @@ fn handle_sendmsg(
         return;
     }
 
-    let dest = match resolve_send_destination(
+    let (dest, route) = match resolve_send_destination(
         notif.pid,
         msg.name,
         msg.name_len as usize,
         existing.as_ref(),
     ) {
-        SendDestination::Explicit(dest) => dest,
-        SendDestination::ConnectedPeer => {
-            send_without_destination(listener_fd, &notif, existing.as_ref());
-            return;
+        SendDestination::Explicit(dest) => {
+            let route = match udp_route_for(&cfg, dest) {
+                Some(route) => route,
+                None if existing.is_some() => UdpRouteKind::Direct,
+                None => {
+                    seccomp::send_continue(listener_fd, notif.id);
+                    return;
+                }
+            };
+            let domain = existing
+                .as_ref()
+                .map(|handle| handle.domain)
+                .or_else(|| remote_udp_domain(notif.pid, target_fd));
+            if let Some(domain) = domain {
+                if let Err(errno) = validate_send_destination(domain, dest) {
+                    seccomp::send_errno(listener_fd, notif.id, errno);
+                    return;
+                }
+            }
+            (dest, route)
         }
+        SendDestination::ConnectedPeer => match connected_send_peer(listener_fd, &notif, &existing)
+        {
+            Some(peer) => peer,
+            None => return,
+        },
         SendDestination::Continue => {
             seccomp::send_continue(listener_fd, notif.id);
             return;
@@ -2318,24 +2363,6 @@ fn handle_sendmsg(
             return;
         }
     };
-    let route = match udp_route_for(&cfg, dest) {
-        Some(route) => route,
-        None if existing.is_some() => UdpRouteKind::Direct,
-        None => {
-            seccomp::send_continue(listener_fd, notif.id);
-            return;
-        }
-    };
-    let domain = existing
-        .as_ref()
-        .map(|handle| handle.domain)
-        .or_else(|| remote_udp_domain(notif.pid, target_fd));
-    if let Some(domain) = domain {
-        if let Err(errno) = validate_send_destination(domain, dest) {
-            seccomp::send_errno(listener_fd, notif.id, errno);
-            return;
-        }
-    }
 
     let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
