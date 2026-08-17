@@ -88,17 +88,19 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    to the lazy path after the first failed atomic addfd attempt.
 3. [x] Key relay state by the injected socket's `SO_COOKIE`, with `(tgid, fd)`
    only as a lookup cache. This naturally follows dup and fork aliases. Stable
-   admission reclaims closed relays by confirming that their AF_UNIX
-   socket-number/inode identity has disappeared from `/proc/net/unix`, which
-   happens only after the final target alias closes. Capacity-bound admission
-   retries briefly to tolerate delayed procfs visibility after close.
+   cleanup confirms that an AF_UNIX inode has disappeared from
+   `/proc/net/unix`, which happens only after the final target alias closes. A
+   low-frequency reactor sweep releases idle workers; capacity-bound admission
+   performs one best-effort sweep. Normal creation does not scan procfs, and
+   procfs read failures defer cleanup rather than failing below-capacity calls.
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
 5. [x] Stable mode rewrites `sendmmsg(2)` and virtualizes `getsockname(2)`,
    `getpeername(2)`, and the common `SOL_SOCKET` identity options for the
    logical AF_INET/AF_INET6 UDP socket. Logical operations preserve native
-   address-family errors, disconnected sends, `AF_UNSPEC` disconnects, and
-   short `getsockopt(2)` buffer truncation.
+   destination and bind family rules, default IPv6 dual-stack destinations,
+   disconnected sends, `AF_UNSPEC` connect/bind cases, invalid port errors,
+   and short or negative `getsockopt(2)` lengths.
 6. [x] Preserve numeric response sources for unconnected `recvfrom(2)` and
    `recvmsg(2)`. SOCKS5 replies use the UDP response header and direct replies
    use the kernel peer. A direct-kernel probe covers changed-source responses,
@@ -113,7 +115,8 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    deadline; an empty queue returns zero at expiry instead of preserving the
    documented Linux timeout bug. Successful progress writes the remaining
    interval back to the caller's explicit timeout, while the deliberate
-   empty-queue expiry writes zero.
+   empty-queue expiry writes zero. A writeback fault overrides completed batch
+   progress with `EFAULT`, matching the final kernel `put_timespec64` step.
 8. [x] Honor `SO_RCVTIMEO` for blocking relayed receives. The supervisor
    samples the timeout from its duplicate of the injected endpoint, expires a
    quiet `recvfrom(2)`/`recvmsg(2)` with `EAGAIN`, bounds each `recvmmsg(2)`
@@ -122,7 +125,9 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    direct-kernel probe anchors the semantics and runs unchanged against stable
    direct and stable SOCKS5 relays; lazy coverage verifies option transfer
    across replacement as well as a timeout set after replacement.
-9. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
+9. [ ] Virtualize `IPV6_V6ONLY` so stable IPv6 sockets can opt out of the
+   currently modeled default dual-stack destination policy.
+10. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
    unsolicited datagrams, error queues, and multi-response ordering remain open
    compatibility work. These need explicit support or an unsupported policy;
    the batch source-queue consistency issue is closed.

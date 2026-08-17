@@ -151,11 +151,11 @@ with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key.
 Active UDP relay creation is capped at 128, with a bounded 16-datagram input
-queue per relay. Before admitting another stable socket, the supervisor reclaims
-relays whose AF_UNIX socket-number/inode identity no longer has an open
-target-side alias. Capacity-bound admission retries briefly when procfs
-visibility lags a close, so closed sockets do not consume the cumulative relay
-budget.
+queue per relay. A low-frequency supervisor sweep reclaims relays whose AF_UNIX
+inode no longer has an open target-side alias; capacity-bound admission also
+performs one best-effort sweep. Normal socket creation does not scan procfs, and
+an unavailable `/proc/net/unix` delays cleanup instead of breaking creation
+while capacity remains.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`
@@ -166,9 +166,14 @@ virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 addresses are logical relay state; an unbound socket reports its family's
 wildcard address with port zero, and an explicitly bound port zero is not
 replaced with a kernel-assigned ephemeral port. Logical operations reject
-cross-family addresses with `EAFNOSUPPORT`; an `AF_UNSPEC` connect clears the
-peer, after which destination-free sends fail with `EDESTADDRREQ`. Virtualized
-integer socket options preserve Linux's short-buffer truncation rules. For
+invalid destination ports and unsupported families before creating a relay.
+AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
+Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations.
+Bind remains strict-family, including Linux's IPv6 length checks and IPv4
+`AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
+`AF_UNSPEC` connect clears the peer, after which destination-free sends fail
+with `EDESTADDRREQ`. Virtualized integer socket options preserve Linux's
+short-buffer truncation and negative-length rejection rules. For
 unconnected request/response traffic, `recvfrom(2)`, `recvmsg(2)`, and each
 `recvmmsg(2)` entry report the numeric source from the SOCKS5 UDP response header
 or the direct worker's kernel peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`,
@@ -178,7 +183,8 @@ honor `SO_RCVTIMEO` read from the injected endpoint: a quiet
 `recvfrom(2)`/`recvmsg(2)` fails with `EAGAIN` at the deadline, while
 `recvmmsg(2)` re-arms the socket timeout after each delivered entry and returns
 the completed count once it expires with progress. Successful batches write the
-remaining explicit interval back to the caller's timespec. Stable `recvmmsg(2)`
+remaining explicit interval back to the caller's timespec; a failed writeback
+returns `EFAULT` even after batch progress. Stable `recvmmsg(2)`
 uses an absolute reactor deadline and returns zero with a zero remaining interval
 when an empty-queue explicit timeout expires, instead of reproducing Linux's
 documented timeout hang; when both the socket timeout and an explicit timespec

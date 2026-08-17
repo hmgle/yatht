@@ -148,15 +148,19 @@ is `socks5://127.0.0.1:1080`.
   type, protocol, and a zero socket error.
   Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
   `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
-  descriptor-number change. The stable admission path checks the endpoint's
-  socket-number/inode identity in `/proc/net/unix` and reclaims a relay only
-  after its last target-side open file description has disappeared. Admission
-  performs a bounded retry when procfs visibility briefly lags a close.
+  descriptor-number change. A low-frequency reactor sweep checks AF_UNIX
+  inodes in `/proc/net/unix` and reclaims a relay only after its last target-side
+  open file description has disappeared. Capacity-bound admission performs one
+  best-effort sweep; normal socket creation avoids procfs, and read failures
+  defer cleanup instead of failing creation while capacity remains.
   Explicit `sendto(2)`/`sendmsg(2)`
   destinations are forwarded by the notification handler; connected UDP sends
-  are read by the relay socket. Logical operations enforce the socket's address
-  family, reject destination-free sends while disconnected, and emulate
-  `AF_UNSPEC` disconnect without altering the AF_UNIX transport. `close(2)`,
+  are read by the relay socket. Logical sends reject invalid ports and unknown
+  families before relay creation. AF_INET6 sockets model the default dual-stack
+  policy for destinations, while bind stays strict-family and preserves native
+  length errors. `IPV6_V6ONLY` remains unvirtualized. Disconnected sends fail,
+  and `AF_UNSPEC` disconnect is emulated without altering the AF_UNIX transport.
+  `close(2)`,
   closing `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay
   creation so a concurrent descriptor change cannot cross the injection window.
 - UDP relay admission is globally capped at 128. Each relay uses two fallible
@@ -182,7 +186,8 @@ is `socks5://127.0.0.1:1080`.
   `recvmmsg(2)` bounds each inter-datagram gap, re-arms after every delivered
   entry, and returns the completed count when the timeout expires with
   progress. Successful batch progress writes the remaining explicit timeout
-  back to the target timespec; the earlier of the socket timeout and the
+  back to the target timespec, and a failed writeback overrides progress with
+  `EFAULT`; the earlier of the socket timeout and the
   explicit timespec keeps its own expiry result. SOCKS5 domain-name response
   sources, error queues, and ancillary/control data remain deferred.
 
