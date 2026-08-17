@@ -152,8 +152,10 @@ the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key.
 Active UDP relay creation is capped at 128, with a bounded 16-datagram input
 queue per relay. Before admitting another stable socket, the supervisor reclaims
-relays whose AF_UNIX endpoint no longer has an open target-side alias, so closed
-sockets do not consume the cumulative relay budget.
+relays whose AF_UNIX socket-number/inode identity no longer has an open
+target-side alias. Capacity-bound admission retries briefly when procfs
+visibility lags a close, so closed sockets do not consume the cumulative relay
+budget.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`

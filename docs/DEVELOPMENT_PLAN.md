@@ -148,9 +148,11 @@ is `socks5://127.0.0.1:1080`.
   type, protocol, and a zero socket error.
   Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
   `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
-  descriptor-number change. The stable admission path checks `/proc/net/unix`
-  and reclaims a relay only after the injected endpoint's last target-side open
-  file description has disappeared. Explicit `sendto(2)`/`sendmsg(2)`
+  descriptor-number change. The stable admission path checks the endpoint's
+  socket-number/inode identity in `/proc/net/unix` and reclaims a relay only
+  after its last target-side open file description has disappeared. Admission
+  performs a bounded retry when procfs visibility briefly lags a close.
+  Explicit `sendto(2)`/`sendmsg(2)`
   destinations are forwarded by the notification handler; connected UDP sends
   are read by the relay socket. Logical operations enforce the socket's address
   family, reject destination-free sends while disconnected, and emulate

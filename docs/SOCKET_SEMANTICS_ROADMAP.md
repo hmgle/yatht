@@ -88,9 +88,10 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    to the lazy path after the first failed atomic addfd attempt.
 3. [x] Key relay state by the injected socket's `SO_COOKIE`, with `(tgid, fd)`
    only as a lookup cache. This naturally follows dup and fork aliases. Stable
-   admission reclaims closed relays by confirming that their AF_UNIX inode has
-   disappeared from `/proc/net/unix`, which happens only after the final target
-   alias closes.
+   admission reclaims closed relays by confirming that their AF_UNIX
+   socket-number/inode identity has disappeared from `/proc/net/unix`, which
+   happens only after the final target alias closes. Capacity-bound admission
+   retries briefly to tolerate delayed procfs visibility after close.
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
 5. [x] Stable mode rewrites `sendmmsg(2)` and virtualizes `getsockname(2)`,
