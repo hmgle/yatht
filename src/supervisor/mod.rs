@@ -3068,6 +3068,43 @@ fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
 }
 
 impl UdpRelayRegistry {
+    fn reap_closed_stable(&self) -> io::Result<usize> {
+        if self.stable_by_cookie.lock().unwrap().is_empty() {
+            return Ok(0);
+        }
+
+        let live_inodes = unix_socket_inodes()?;
+        let removed = {
+            let mut stable = self.stable_by_cookie.lock().unwrap();
+            let closed = stable
+                .iter()
+                .filter(|(_, handle)| !live_inodes.contains(&handle.target_identity.ino))
+                .map(|(cookie, handle)| (*cookie, handle.clone()))
+                .collect::<Vec<_>>();
+            for (cookie, _) in &closed {
+                stable.remove(cookie);
+            }
+            closed
+        };
+        if removed.is_empty() {
+            return Ok(0);
+        }
+
+        let identities = removed
+            .iter()
+            .map(|(_, handle)| handle.target_identity)
+            .collect::<HashSet<_>>();
+        self.inner.lock().unwrap().retain(|_, state| {
+            !matches!(state, RelayState::Ready(handle) if identities.contains(&handle.target_identity))
+        });
+        self.created.notify_all();
+        for (_, handle) in &removed {
+            handle.shutdown();
+            self.release_relay_slot();
+        }
+        Ok(removed.len())
+    }
+
     fn reserve_relay_slot(&self) -> Result<RelaySlotGuard<'_>> {
         let reserved = self
             .active
@@ -3110,6 +3147,8 @@ impl UdpRelayRegistry {
             return Ok(StableSocketCreation::Unsupported);
         }
 
+        self.reap_closed_stable()
+            .context("reap closed stable UDP relays")?;
         let mut slot = self.reserve_relay_slot()?;
         let (relay_socket, target_fd) =
             make_relay_pair().context("create stable UDP relay datagram socketpair")?;
@@ -3458,6 +3497,20 @@ impl UdpRelayRegistry {
             self.release_relay_slot();
         }
     }
+}
+
+fn unix_socket_inodes() -> io::Result<HashSet<libc::ino_t>> {
+    let raw = fs::read_to_string("/proc/net/unix")?;
+    let mut inodes = HashSet::new();
+    for line in raw.lines().skip(1) {
+        let Some(raw_inode) = line.split_whitespace().nth(6) else {
+            continue;
+        };
+        if let Ok(inode) = raw_inode.parse::<libc::ino_t>() {
+            inodes.insert(inode);
+        }
+    }
+    Ok(inodes)
 }
 
 fn fd_in_close_range(fd: RawFd, first: u32, last: u32) -> bool {
@@ -5298,6 +5351,44 @@ mod tests {
 
         drop(slots.pop());
         registry.reserve_relay_slot().unwrap();
+    }
+
+    #[test]
+    fn stable_relay_reaping_waits_for_the_last_target_alias() {
+        let registry = UdpRelayRegistry::default();
+        let (relay, target) = make_relay_pair().unwrap();
+        let alias_fd = unsafe { libc::dup(target.as_raw_fd()) };
+        assert!(alias_fd >= 0);
+        let alias = unsafe { OwnedFd::from_raw_fd(alias_fd) };
+        let (tx, _rx) = channel::bounded(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = UdpRelayHandle {
+            tx,
+            default_dest: Arc::new(Mutex::new(None)),
+            local_bind: Arc::new(Mutex::new(None)),
+            pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+            relay_fd: Arc::new(relay),
+            target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
+            domain: libc::AF_INET,
+            stable: true,
+            shutdown: Arc::clone(&shutdown),
+        };
+        registry.active.store(1, Ordering::Release);
+        registry
+            .stable_by_cookie
+            .lock()
+            .unwrap()
+            .insert(handle.target_cookie, handle);
+
+        drop(target);
+        assert_eq!(registry.reap_closed_stable().unwrap(), 0);
+        assert_eq!(registry.active.load(Ordering::Acquire), 1);
+
+        drop(alias);
+        assert_eq!(registry.reap_closed_stable().unwrap(), 1);
+        assert_eq!(registry.active.load(Ordering::Acquire), 0);
+        assert!(shutdown.load(Ordering::SeqCst));
     }
 
     #[test]

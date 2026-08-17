@@ -979,6 +979,30 @@ fn stable_udp_socket_survives_bind_dup_close_and_fork() {
 }
 
 #[test]
+fn stable_udp_reclaims_closed_socket_capacity() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_stable_udp_lifetime_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "stable-lifetime-ok"
+    );
+}
+
+#[test]
 fn stable_udp_connected_socket_reports_logical_peer() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1362,6 +1386,42 @@ int main(int argc, char **argv) {
     int status = 0;
     if (waitpid(child, &status, 0) != child) return 22;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 23;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_stable_udp_lifetime_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("stable_udp_lifetime_probe.c");
+    let bin = dir.path().join("stable_udp_lifetime_probe");
+    fs::write(
+        &src,
+        r#"
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    for (int index = 0; index < 160; ++index) {
+        int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return 2;
+        if (close(fd) != 0) return 3;
+    }
+    if (write(STDOUT_FILENO, "stable-lifetime-ok", 18) != 18) return 4;
     return 0;
 }
 "#,
