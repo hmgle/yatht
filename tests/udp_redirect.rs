@@ -1,11 +1,11 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -1159,6 +1159,54 @@ fn stable_udp_reclaims_closed_socket_capacity() {
 }
 
 #[test]
+fn stable_udp_reaps_idle_closed_relay_workers() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    const SOCKET_COUNT: usize = 24;
+    let (_probe_dir, probe) = build_stable_udp_idle_reap_probe();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "open\n");
+    let open_threads = process_thread_count(child.id());
+
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "closed\n");
+    assert!(open_threads >= SOCKET_COUNT * 2);
+    let expected_max = open_threads - SOCKET_COUNT * 2;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let closed_threads = loop {
+        let threads = process_thread_count(child.id());
+        if threads <= expected_max || Instant::now() >= deadline {
+            break threads;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status:?}");
+    assert!(
+        closed_threads <= expected_max,
+        "relay workers were not reaped: open={open_threads}, closed={closed_threads}"
+    );
+}
+
+#[test]
 fn stable_udp_connected_socket_reports_logical_peer() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1578,6 +1626,48 @@ int main(void) {
         if (close(fd) != 0) return 3;
     }
     if (write(STDOUT_FILENO, "stable-lifetime-ok", 18) != 18) return 4;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_stable_udp_idle_reap_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("stable_udp_idle_reap_probe.c");
+    let bin = dir.path().join("stable_udp_idle_reap_probe");
+    fs::write(
+        &src,
+        r#"
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int sockets[24];
+    for (int index = 0; index < 24; ++index) {
+        sockets[index] = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (sockets[index] < 0) return 2;
+    }
+    if (write(STDOUT_FILENO, "open\n", 5) != 5) return 3;
+    for (int index = 0; index < 24; ++index) {
+        if (close(sockets[index]) != 0) return 4;
+    }
+    if (write(STDOUT_FILENO, "closed\n", 7) != 7) return 5;
+    char done;
+    if (read(STDIN_FILENO, &done, 1) != 1) return 6;
     return 0;
 }
 "#,
@@ -3495,6 +3585,17 @@ fn encode_udp_packet(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&dest.port().to_be_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+fn process_thread_count(pid: u32) -> usize {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 fn assert_success(output: &std::process::Output) {

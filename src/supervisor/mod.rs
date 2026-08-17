@@ -39,8 +39,7 @@ const SOCKADDR_IN6_MIN_SIZE: usize = 24;
 // without limit; once full, further responses are dropped rather than enqueued.
 const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_UDP_RELAYS: usize = 128;
-const STABLE_RELAY_REAP_TIMEOUT: Duration = Duration::from_millis(20);
-const STABLE_RELAY_REAP_INTERVAL: Duration = Duration::from_millis(1);
+const STABLE_RELAY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_RELAY_THREAD_STACK_SIZE: usize = 512 * 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
@@ -731,6 +730,7 @@ fn notification_loop(
         let reactor_failure = Arc::clone(&failure);
         let loop_failure = Arc::clone(&failure);
         let reactor_wake_fd = Arc::clone(&wake_fd);
+        let reactor_debug = cfg.debug;
         blocking_thread = Some(thread::spawn(move || {
             if std::panic::catch_unwind(|| {
                 blocking_recv_reactor(
@@ -740,6 +740,7 @@ fn notification_loop(
                     reactor_relays,
                     reactor_failure,
                     worker_count,
+                    reactor_debug,
                 )
             })
             .is_err()
@@ -1203,6 +1204,7 @@ fn blocking_recv_reactor(
     relays: Arc<UdpRelayRegistry>,
     failure: Arc<NotificationFailure>,
     worker_count: usize,
+    debug: bool,
 ) {
     let (work_tx, work_rx) = channel::bounded::<BlockingRecvWork>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
@@ -1234,6 +1236,7 @@ fn blocking_recv_reactor(
     let mut in_flight = HashSet::<FdIdentity>::new();
     let validity_interval = Duration::from_millis(BLOCKING_RECV_POLL_INTERVAL_MS as u64);
     let mut last_validity_sweep = Instant::now();
+    let mut last_relay_sweep = Instant::now();
     let mut channels_may_have_more = false;
     let mut pollfds = Vec::<libc::pollfd>::new();
 
@@ -1297,6 +1300,11 @@ fn blocking_recv_reactor(
                 }
             }
             last_validity_sweep = Instant::now();
+        }
+
+        if last_relay_sweep.elapsed() >= STABLE_RELAY_SWEEP_INTERVAL {
+            relays.reap_closed_stable_best_effort(debug);
+            last_relay_sweep = Instant::now();
         }
 
         let mut completed = 0;
@@ -2999,12 +3007,6 @@ struct FdIdentity {
     ino: libc::ino_t,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct UnixSocketIdentity {
-    number: u64,
-    inode: libc::ino_t,
-}
-
 struct UdpTargetSnapshot {
     identity: FdIdentity,
     domain: i32,
@@ -3040,6 +3042,7 @@ struct UdpRelayRegistry {
     created: Condvar,
     active: AtomicUsize,
     stable_addfd_unsupported: AtomicBool,
+    stable_reap_warning_reported: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -3050,7 +3053,6 @@ struct UdpRelayHandle {
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     relay_fd: Arc<OwnedFd>,
     target_identity: FdIdentity,
-    target_unix_identity: Option<UnixSocketIdentity>,
     target_cookie: u64,
     domain: i32,
     stable: bool,
@@ -3206,16 +3208,12 @@ impl UdpRelayRegistry {
             return Ok(0);
         }
 
-        let live_sockets = unix_socket_identities()?;
+        let live_inodes = unix_socket_inodes()?;
         let removed = {
             let mut stable = self.stable_by_cookie.lock().unwrap();
             let closed = stable
                 .iter()
-                .filter(|(_, handle)| {
-                    handle
-                        .target_unix_identity
-                        .is_some_and(|identity| !live_sockets.contains(&identity))
-                })
+                .filter(|(_, handle)| !live_inodes.contains(&handle.target_identity.ino))
                 .map(|(cookie, handle)| (*cookie, handle.clone()))
                 .collect::<Vec<_>>();
             for (cookie, _) in &closed {
@@ -3257,17 +3255,29 @@ impl UdpRelayRegistry {
         })
     }
 
-    fn reserve_stable_relay_slot(&self) -> Result<RelaySlotGuard<'_>> {
-        let deadline = Instant::now() + STABLE_RELAY_REAP_TIMEOUT;
-        loop {
-            self.reap_closed_stable()
-                .context("reap closed stable UDP relays")?;
-            match self.reserve_relay_slot() {
-                Ok(slot) => return Ok(slot),
-                Err(err) if Instant::now() >= deadline => return Err(err),
-                Err(_) => thread::sleep(STABLE_RELAY_REAP_INTERVAL),
+    fn reap_closed_stable_best_effort(&self, debug: bool) {
+        match self.reap_closed_stable() {
+            Ok(_) => self
+                .stable_reap_warning_reported
+                .store(false, Ordering::Release),
+            Err(err)
+                if debug
+                    && !self
+                        .stable_reap_warning_reported
+                        .swap(true, Ordering::AcqRel) =>
+            {
+                eprintln!("yatht: stable UDP relay cleanup skipped: {err}");
             }
+            Err(_) => {}
         }
+    }
+
+    fn reserve_stable_relay_slot(&self, debug: bool) -> Result<RelaySlotGuard<'_>> {
+        if let Ok(slot) = self.reserve_relay_slot() {
+            return Ok(slot);
+        }
+        self.reap_closed_stable_best_effort(debug);
+        self.reserve_relay_slot()
     }
 
     fn release_relay_slot(&self) {
@@ -3297,7 +3307,7 @@ impl UdpRelayRegistry {
             return Ok(StableSocketCreation::Unsupported);
         }
 
-        let mut slot = self.reserve_stable_relay_slot()?;
+        let mut slot = self.reserve_stable_relay_slot(cfg.debug)?;
         let (relay_socket, target_fd) =
             make_relay_pair().context("create stable UDP relay datagram socketpair")?;
         if socket_type & libc::SOCK_NONBLOCK != 0 {
@@ -3647,33 +3657,22 @@ impl UdpRelayRegistry {
     }
 }
 
-fn unix_socket_identities() -> io::Result<HashSet<UnixSocketIdentity>> {
+// `/proc/net/unix`'s Num column is rendered through `%pK` and can be zeroed by
+// kptr_restrict, so it is not a portable identity component. Inode reuse can
+// conservatively delay cleanup while the reused inode remains present, but it
+// cannot reclaim a live relay.
+fn unix_socket_inodes() -> io::Result<HashSet<libc::ino_t>> {
     let raw = fs::read_to_string("/proc/net/unix")?;
-    let mut identities = HashSet::new();
+    let mut inodes = HashSet::new();
     for line in raw.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let (Some(raw_number), Some(raw_inode)) = (fields.next(), fields.nth(5)) else {
+        let Some(raw_inode) = line.split_whitespace().nth(6) else {
             continue;
         };
-        let number = u64::from_str_radix(raw_number.trim_end_matches(':'), 16);
-        let inode = raw_inode.parse::<libc::ino_t>();
-        if let (Ok(number), Ok(inode)) = (number, inode) {
-            identities.insert(UnixSocketIdentity { number, inode });
+        if let Ok(inode) = raw_inode.parse::<libc::ino_t>() {
+            inodes.insert(inode);
         }
     }
-    Ok(identities)
-}
-
-fn unix_socket_identity(inode: libc::ino_t) -> io::Result<UnixSocketIdentity> {
-    unix_socket_identities()?
-        .into_iter()
-        .find(|identity| identity.inode == inode)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("AF_UNIX socket inode {inode} is absent from /proc/net/unix"),
-            )
-        })
+    Ok(inodes)
 }
 
 fn fd_in_close_range(fd: RawFd, first: u32, last: u32) -> bool {
@@ -3853,9 +3852,6 @@ fn start_udp_relay(
     domain: i32,
     stable: bool,
 ) -> io::Result<UdpRelayHandle> {
-    let target_unix_identity = stable
-        .then(|| unix_socket_identity(target_identity.ino))
-        .transpose()?;
     let relay_fd = Arc::new(relay_socket);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
@@ -3969,7 +3965,6 @@ fn start_udp_relay(
         pending_sources,
         relay_fd,
         target_identity,
-        target_unix_identity,
         target_cookie,
         domain,
         stable,
@@ -5641,7 +5636,6 @@ mod tests {
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity,
-            target_unix_identity: Some(unix_socket_identity(target_identity.ino).unwrap()),
             target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
             domain: libc::AF_INET,
             stable: true,
@@ -5668,7 +5662,7 @@ mod tests {
                 Instant::now() < deadline,
                 "closed AF_UNIX socket remained visible in /proc/net/unix"
             );
-            thread::sleep(STABLE_RELAY_REAP_INTERVAL);
+            thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(registry.active.load(Ordering::Acquire), 0);
         assert!(shutdown.load(Ordering::SeqCst));
@@ -5731,7 +5725,6 @@ mod tests {
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
-            target_unix_identity: None,
             target_cookie,
             domain: libc::AF_INET,
             stable: false,
@@ -5846,7 +5839,6 @@ mod tests {
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
-            target_unix_identity: None,
             target_cookie,
             domain: libc::AF_INET,
             stable: false,
@@ -6200,7 +6192,6 @@ mod tests {
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
-            target_unix_identity: None,
             target_cookie,
             domain: libc::AF_INET,
             stable: false,
