@@ -148,11 +148,15 @@ is `socks5://127.0.0.1:1080`.
   type, protocol, and a zero socket error.
   Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
   `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
-  descriptor-number change. Explicit `sendto(2)`/`sendmsg(2)` destinations are
-  forwarded by the notification handler; connected UDP sends are read by the
-  relay socket. `close(2)`, closing `close_range(2)`, `dup2(2)`, and `dup3(2)`
-  synchronize with relay creation so a concurrent descriptor change cannot
-  cross the injection window.
+  descriptor-number change. The stable admission path checks `/proc/net/unix`
+  and reclaims a relay only after the injected endpoint's last target-side open
+  file description has disappeared. Explicit `sendto(2)`/`sendmsg(2)`
+  destinations are forwarded by the notification handler; connected UDP sends
+  are read by the relay socket. Logical operations enforce the socket's address
+  family, reject destination-free sends while disconnected, and emulate
+  `AF_UNSPEC` disconnect without altering the AF_UNIX transport. `close(2)`,
+  closing `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay
+  creation so a concurrent descriptor change cannot cross the injection window.
 - UDP relay admission is globally capped at 128. Each relay uses two fallible
   workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
   sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
@@ -175,9 +179,10 @@ is `socks5://127.0.0.1:1080`.
   `EAGAIN` at the syscall-relative deadline, and
   `recvmmsg(2)` bounds each inter-datagram gap, re-arms after every delivered
   entry, and returns the completed count when the timeout expires with
-  progress; the earlier of the socket timeout and the explicit timespec keeps
-  its own expiry result. SOCKS5 domain-name response sources, error
-  queues, and ancillary/control data remain deferred.
+  progress. Successful batch progress writes the remaining explicit timeout
+  back to the target timespec; the earlier of the socket timeout and the
+  explicit timespec keeps its own expiry result. SOCKS5 domain-name response
+  sources, error queues, and ancillary/control data remain deferred.
 
 ## Routing Rules
 

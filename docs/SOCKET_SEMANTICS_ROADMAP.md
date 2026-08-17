@@ -87,12 +87,17 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    available on the current Linux 6.9 baseline. Unsupported kernels fall back
    to the lazy path after the first failed atomic addfd attempt.
 3. [x] Key relay state by the injected socket's `SO_COOKIE`, with `(tgid, fd)`
-   only as a lookup cache. This naturally follows dup and fork aliases.
+   only as a lookup cache. This naturally follows dup and fork aliases. Stable
+   admission reclaims closed relays by confirming that their AF_UNIX inode has
+   disappeared from `/proc/net/unix`, which happens only after the final target
+   alias closes.
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
 5. [x] Stable mode rewrites `sendmmsg(2)` and virtualizes `getsockname(2)`,
    `getpeername(2)`, and the common `SOL_SOCKET` identity options for the
-   logical AF_INET/AF_INET6 UDP socket.
+   logical AF_INET/AF_INET6 UDP socket. Logical operations preserve native
+   address-family errors, disconnected sends, `AF_UNSPEC` disconnects, and
+   short `getsockopt(2)` buffer truncation.
 6. [x] Preserve numeric response sources for unconnected `recvfrom(2)` and
    `recvmsg(2)`. SOCKS5 replies use the UDP response header and direct replies
    use the kernel peer. A direct-kernel probe covers changed-source responses,
@@ -105,7 +110,9 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    completion, and mixing batches with later `recvfrom(2)`/`recvmsg(2)` calls.
    Blocking batches retain progress in the receive reactor and use an absolute
    deadline; an empty queue returns zero at expiry instead of preserving the
-   documented Linux timeout bug.
+   documented Linux timeout bug. Successful progress writes the remaining
+   interval back to the caller's explicit timeout, while the deliberate
+   empty-queue expiry writes zero.
 8. [x] Honor `SO_RCVTIMEO` for blocking relayed receives. The supervisor
    samples the timeout from its duplicate of the injected endpoint, expires a
    quiet `recvfrom(2)`/`recvmsg(2)` with `EAGAIN`, bounds each `recvmmsg(2)`

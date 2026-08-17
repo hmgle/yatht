@@ -151,9 +151,9 @@ with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key.
 Active UDP relay creation is capped at 128, with a bounded 16-datagram input
-queue per relay. Stable aliases remain registered until the supervisor exits,
-so applications that create and discard hundreds of UDP sockets in one target
-process should stay on lazy mode for now.
+queue per relay. Before admitting another stable socket, the supervisor reclaims
+relays whose AF_UNIX endpoint no longer has an open target-side alias, so closed
+sockets do not consume the cumulative relay budget.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`
@@ -163,22 +163,27 @@ virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
 wildcard address with port zero, and an explicitly bound port zero is not
-replaced with a kernel-assigned ephemeral port. For unconnected request/response
-traffic, `recvfrom(2)`, `recvmsg(2)`, and each `recvmmsg(2)` entry report the
-numeric source from the SOCKS5 UDP response header or the direct worker's kernel
-peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, partial completion, and mixed
-receive calls preserve payload/source queue order. Blocking relayed receives
+replaced with a kernel-assigned ephemeral port. Logical operations reject
+cross-family addresses with `EAFNOSUPPORT`; an `AF_UNSPEC` connect clears the
+peer, after which destination-free sends fail with `EDESTADDRREQ`. Virtualized
+integer socket options preserve Linux's short-buffer truncation rules. For
+unconnected request/response traffic, `recvfrom(2)`, `recvmsg(2)`, and each
+`recvmmsg(2)` entry report the numeric source from the SOCKS5 UDP response header
+or the direct worker's kernel peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`,
+partial completion, and mixed receive calls preserve payload/source queue order.
+Blocking relayed receives
 honor `SO_RCVTIMEO` read from the injected endpoint: a quiet
 `recvfrom(2)`/`recvmsg(2)` fails with `EAGAIN` at the deadline, while
 `recvmmsg(2)` re-arms the socket timeout after each delivered entry and returns
-the completed count once it expires with progress. Stable `recvmmsg(2)` uses an
-absolute reactor deadline and returns zero when an empty-queue explicit timeout
-expires, instead of reproducing Linux's documented timeout hang; when both the
-socket timeout and an explicit timespec are armed, the earlier deadline keeps
-its own expiry result. Lazy replacement transfers a pre-existing
-`SO_RCVTIMEO` to the injected endpoint. SOCKS5 domain-name
-response sources, `msg_control` data, error queues, and other IP-level option
-semantics remain limited.
+the completed count once it expires with progress. Successful batches write the
+remaining explicit interval back to the caller's timespec. Stable `recvmmsg(2)`
+uses an absolute reactor deadline and returns zero with a zero remaining interval
+when an empty-queue explicit timeout expires, instead of reproducing Linux's
+documented timeout hang; when both the socket timeout and an explicit timespec
+are armed, the earlier deadline keeps its own expiry result. Lazy replacement
+transfers a pre-existing `SO_RCVTIMEO` to the injected endpoint. SOCKS5
+domain-name response sources, `msg_control` data, error queues, and other
+IP-level option semantics remain limited.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.
