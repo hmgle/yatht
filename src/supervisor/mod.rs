@@ -41,6 +41,10 @@ const SOCKADDR_IN6_SIZE: usize = 28;
 const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_UDP_RELAYS: usize = 128;
 const STABLE_RELAY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+// Admission only waits when the relay budget is exhausted, so a short retry
+// tolerates procfs lagging a concurrent close without slowing normal creation.
+const STABLE_RELAY_REAP_ATTEMPTS: u32 = 3;
+const STABLE_RELAY_REAP_INTERVAL: Duration = Duration::from_millis(1);
 const UDP_RELAY_THREAD_STACK_SIZE: usize = 512 * 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
@@ -3318,24 +3322,38 @@ impl UdpRelayRegistry {
             Ok(_) => self
                 .stable_reap_warning_reported
                 .store(false, Ordering::Release),
-            Err(err)
-                if debug
-                    && !self
-                        .stable_reap_warning_reported
-                        .swap(true, Ordering::AcqRel) =>
-            {
-                eprintln!("yatht: stable UDP relay cleanup skipped: {err}");
+            Err(err) => {
+                let first = !self
+                    .stable_reap_warning_reported
+                    .swap(true, Ordering::AcqRel);
+                if debug && first {
+                    eprintln!("yatht: stable UDP relay cleanup skipped: {err}");
+                }
             }
-            Err(_) => {}
         }
     }
 
+    /// Reserves an admission slot for a stable socket. The common path never
+    /// scans procfs; only an exhausted budget sweeps, and it then retries
+    /// briefly because `/proc/net/unix` can lag the final close of a
+    /// target-side alias performed by another thread. The wait sits entirely
+    /// on the already-slow path.
     fn reserve_stable_relay_slot(&self, debug: bool) -> Result<RelaySlotGuard<'_>> {
-        if let Ok(slot) = self.reserve_relay_slot() {
-            return Ok(slot);
+        let mut last = match self.reserve_relay_slot() {
+            Ok(slot) => return Ok(slot),
+            Err(err) => err,
+        };
+        for attempt in 0..STABLE_RELAY_REAP_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(STABLE_RELAY_REAP_INTERVAL);
+            }
+            self.reap_closed_stable_best_effort(debug);
+            match self.reserve_relay_slot() {
+                Ok(slot) => return Ok(slot),
+                Err(err) => last = err,
+            }
         }
-        self.reap_closed_stable_best_effort(debug);
-        self.reserve_relay_slot()
+        Err(last)
     }
 
     fn release_relay_slot(&self) {
