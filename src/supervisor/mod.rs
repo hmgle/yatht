@@ -4381,13 +4381,16 @@ fn read_bind_destination(
         return Err(libc::EINVAL);
     }
 
-    let family_raw = read_proc_bytes(pid, addr, 2).map_err(|_| libc::EFAULT)?;
-    let family = u16::from_ne_bytes(family_raw.try_into().unwrap()) as i32;
+    // The length check above guarantees at least a family and an IPv4 payload.
+    let mut raw =
+        read_proc_bytes(pid, addr, addr_len.min(SOCKADDR_IN6_SIZE)).map_err(|_| libc::EFAULT)?;
+    let family = u16::from_ne_bytes([raw[0], raw[1]]) as i32;
     if family == libc::AF_UNSPEC {
+        // Linux keeps an AF_UNSPEC bind working on AF_INET sockets, but only
+        // for the wildcard address.
         if domain != libc::AF_INET {
             return Err(libc::EAFNOSUPPORT);
         }
-        let mut raw = read_proc_bytes(pid, addr, SOCKADDR_IN_SIZE).map_err(|_| libc::EFAULT)?;
         raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
         let destination = parse_sockaddr_in(&raw).map_err(|_| libc::EINVAL)?;
         return destination
@@ -4400,7 +4403,6 @@ fn read_bind_destination(
         return Err(libc::EAFNOSUPPORT);
     }
 
-    let raw = read_sockaddr(pid, addr, addr_len).map_err(|_| libc::EFAULT)?;
     parse_sockaddr(&raw).map_err(|_| libc::EINVAL)
 }
 
