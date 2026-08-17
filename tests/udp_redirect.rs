@@ -583,6 +583,54 @@ fn stable_udp_recvmmsg_matches_error_and_nonblocking_baseline() {
 }
 
 #[test]
+fn direct_kernel_recvmmsg_timeout_write_fault_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_timeout_fault_probe();
+    let (destination, server_thread) = spawn_udp_recvmmsg_timeout_fault_exchange();
+    let output = Command::new(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-timeout-fault-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stable_udp_recvmmsg_timeout_write_fault_overrides_batch_count() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_recvmmsg_timeout_fault_probe();
+    let (destination, server_thread) = spawn_udp_recvmmsg_timeout_fault_exchange();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(destination.to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recvmmsg-timeout-fault-ok"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn stable_udp_recvmmsg_honors_an_empty_queue_deadline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -2532,6 +2580,97 @@ int main(void) {
     (dir, bin)
 }
 
+fn build_udp_recvmmsg_timeout_fault_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_recvmmsg_timeout_fault_probe.c");
+    let bin = dir.path().join("udp_recvmmsg_timeout_fault_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+static int parse_address(char *value, struct sockaddr_in *address) {
+    char *colon = strrchr(value, ':');
+    if (colon == NULL) return -1;
+    *colon = '\0';
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    return inet_pton(AF_INET, value, &address->sin_addr) == 1 ? 0 : -1;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    struct sockaddr_in destination;
+    if (parse_address(argv[1], &destination) != 0) return 3;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 4;
+    const char *queries[2] = { "timeout-fault-one", "timeout-fault-two" };
+    for (int index = 0; index < 2; ++index) {
+        size_t length = strlen(queries[index]);
+        if (sendto(fd, queries[index], length, 0,
+                   (struct sockaddr *)&destination, sizeof(destination)) !=
+            (ssize_t)length) return 5;
+    }
+
+    char buffers[2][32];
+    struct iovec iovecs[2];
+    struct mmsghdr messages[2];
+    memset(messages, 0, sizeof(messages));
+    for (int index = 0; index < 2; ++index) {
+        iovecs[index].iov_base = buffers[index];
+        iovecs[index].iov_len = sizeof(buffers[index]);
+        messages[index].msg_hdr.msg_iov = &iovecs[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 6;
+    struct timespec *timeout = mmap(NULL, (size_t)page_size,
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (timeout == MAP_FAILED) return 7;
+    timeout->tv_sec = 5;
+    timeout->tv_nsec = 0;
+    if (mprotect(timeout, (size_t)page_size, PROT_READ) != 0) return 8;
+
+    errno = 0;
+    int received = recvmmsg(fd, messages, 2, 0, timeout);
+    if (received != -1 || errno != EFAULT) {
+        dprintf(STDERR_FILENO, "recvmmsg rc=%d errno=%d\n", received, errno);
+        return 9;
+    }
+    if (munmap(timeout, (size_t)page_size) != 0) return 10;
+    if (write(STDOUT_FILENO, "recvmmsg-timeout-fault-ok", 25) != 25) return 11;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
 fn build_udp_recvmmsg_deadline_probe() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("udp_recvmmsg_deadline_probe.c");
@@ -3190,6 +3329,23 @@ fn spawn_changed_source_udp_batch_exchange() -> (SocketAddr, [SocketAddr; 4], th
         }
     });
     (destination, response_sources, server_thread)
+}
+
+fn spawn_udp_recvmmsg_timeout_fault_exchange() -> (SocketAddr, thread::JoinHandle<()>) {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = server.local_addr().unwrap();
+    let server_thread = thread::spawn(move || {
+        for (expected, response) in [
+            (b"timeout-fault-one".as_slice(), b"response-one".as_slice()),
+            (b"timeout-fault-two".as_slice(), b"response-two".as_slice()),
+        ] {
+            let mut query = [0_u8; 32];
+            let (length, peer) = server.recv_from(&mut query).unwrap();
+            assert_eq!(&query[..length], expected);
+            server.send_to(response, peer).unwrap();
+        }
+    });
+    (destination, server_thread)
 }
 
 fn spawn_udp_recvmmsg_flag_exchange() -> (SocketAddr, [SocketAddr; 3], thread::JoinHandle<()>) {

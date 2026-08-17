@@ -2957,12 +2957,16 @@ fn send_recvmmsg_result_or_errno(
     errno: Option<i32>,
     explicit_timeout_expired: bool,
 ) {
-    let update_failed = (state.completed > 0 || explicit_timeout_expired)
-        && write_recvmmsg_remaining_timeout(notif.pid, notif.data.args[4], state.deadline).is_err();
+    // Linux writes the remaining explicit timeout after both a nonempty batch
+    // and an explicit expiry. A failed final write overrides any batch count.
+    if (state.completed > 0 || explicit_timeout_expired)
+        && write_recvmmsg_remaining_timeout(notif.pid, notif.data.args[4], state.deadline).is_err()
+    {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
     if state.completed > 0 {
         seccomp::send_value(listener_fd, notif.id, state.completed as i64);
-    } else if update_failed {
-        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
     } else if let Some(errno) = errno {
         seccomp::send_errno(listener_fd, notif.id, errno);
     } else {
