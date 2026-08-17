@@ -1669,15 +1669,19 @@ fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRel
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
-    let optlen = match read_socklen(notif.pid, optlen_ptr) {
+    let optlen = match read_signed_socklen(notif.pid, optlen_ptr) {
         Ok(optlen) => optlen,
         Err(_) => {
             seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
             return;
         }
     };
+    if optlen < 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return;
+    }
     let value_len = std::mem::size_of::<libc::c_int>() as u32;
-    let write_len = optlen.min(value_len);
+    let write_len = (optlen as u32).min(value_len);
     if write_len > 0 && optval == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
@@ -4700,6 +4704,11 @@ fn write_recvmsg_result(
 fn read_socklen(pid: u32, addr: u64) -> io::Result<u32> {
     let raw = read_proc_bytes(pid, addr, std::mem::size_of::<libc::socklen_t>())?;
     Ok(u32::from_ne_bytes(raw.try_into().unwrap()))
+}
+
+fn read_signed_socklen(pid: u32, addr: u64) -> io::Result<i32> {
+    let raw = read_proc_bytes(pid, addr, std::mem::size_of::<libc::socklen_t>())?;
+    Ok(i32::from_ne_bytes(raw.try_into().unwrap()))
 }
 
 fn write_sockaddr_result(

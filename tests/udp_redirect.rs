@@ -2281,7 +2281,17 @@ int main(void) {
     if (getsockopt(fd, SOL_SOCKET, SO_TYPE, NULL, &one) != -1 ||
         errno != EFAULT || one != 1) return 8;
 
-    if (write(STDOUT_FILENO, "getsockopt-ok", 13) != 13) return 9;
+    unsigned char unchanged[sizeof(int)];
+    memset(unchanged, 0xaa, sizeof(unchanged));
+    socklen_t negative = (socklen_t)-4;
+    errno = 0;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, unchanged, &negative) != -1 ||
+        errno != EINVAL || negative != (socklen_t)-4) return 9;
+    for (size_t index = 0; index < sizeof(unchanged); ++index) {
+        if (unchanged[index] != 0xaa) return 10;
+    }
+
+    if (write(STDOUT_FILENO, "getsockopt-ok", 13) != 13) return 11;
     return 0;
 }
 "#,
