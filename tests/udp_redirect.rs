@@ -489,6 +489,46 @@ fn stable_udp_matches_address_semantics() {
 }
 
 #[test]
+fn direct_kernel_udp_send_destination_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_send_destination_probe();
+    let output = Command::new(&probe).output().unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "send-destination-ok"
+    );
+}
+
+#[test]
+fn stable_udp_matches_send_destination_semantics() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_send_destination_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "send-destination-ok"
+    );
+}
+
+#[test]
 fn direct_kernel_udp_getsockopt_truncation_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -2451,6 +2491,91 @@ int main(void) {
     if (send(fd, "x", 1, 0) != -1 || errno != EDESTADDRREQ) return 12;
 
     if (write(STDOUT_FILENO, "socket-errors-ok", 16) != 16) return 13;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_send_destination_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_send_destination_probe.c");
+    let bin = dir.path().join("udp_send_destination_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+/* `sendto(2)` keeps msg_name set, so a zero length fails the destination
+ * length check; `sendmsg(2)` drops the name and reports the unconnected
+ * socket instead. */
+static int check_empty_name(int domain) {
+    struct sockaddr_storage address;
+    socklen_t short_len;
+    memset(&address, 0, sizeof(address));
+    if (domain == AF_INET) {
+        struct sockaddr_in *ipv4 = (struct sockaddr_in *)&address;
+        ipv4->sin_family = AF_INET;
+        ipv4->sin_port = htons(9);
+        if (inet_pton(AF_INET, "203.0.113.1", &ipv4->sin_addr) != 1) return -1;
+        short_len = sizeof(*ipv4) - 1;
+    } else {
+        struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)&address;
+        ipv6->sin6_family = AF_INET6;
+        ipv6->sin6_port = htons(9);
+        if (inet_pton(AF_INET6, "2001:db8::1", &ipv6->sin6_addr) != 1) return -1;
+        /* IPv6 destinations only need SIN6_LEN_RFC2133 bytes. */
+        short_len = 23;
+    }
+
+    int fd = socket(domain, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&address, 0) != -1 ||
+        errno != EINVAL) { close(fd); return -1; }
+
+    char payload = 'x';
+    struct iovec iov = { .iov_base = &payload, .iov_len = 1 };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &address;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    errno = 0;
+    if (sendmsg(fd, &msg, 0) != -1 || errno != EDESTADDRREQ) { close(fd); return -1; }
+
+    /* A named send over the same socket still reaches the length check. */
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&address, short_len) != -1 ||
+        errno != EINVAL) { close(fd); return -1; }
+
+    return close(fd);
+}
+
+int main(void) {
+    if (check_empty_name(AF_INET) != 0) return 2;
+    if (check_empty_name(AF_INET6) != 0) return 3;
+    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 4;
     return 0;
 }
 "#,

@@ -2125,23 +2125,14 @@ fn handle_sendto(
     let addr = notif.data.args[4];
     let addr_len = notif.data.args[5] as usize;
 
-    if addr == 0 {
-        if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
-            if handle.default_destination().is_none() {
-                seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
-            } else {
-                seccomp::send_continue(listener_fd, notif.id);
-            }
-        } else {
-            seccomp::send_continue(listener_fd, notif.id);
-        }
-        return;
-    }
-    if addr_len == 0 {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
-    }
     let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    // A null address leaves `msg_name` unset, so the kernel falls back to the
+    // connected peer. A zero length keeps `msg_name` set and fails the
+    // destination-length check below instead.
+    if addr == 0 {
+        send_without_destination(listener_fd, &notif, existing.as_ref());
+        return;
+    }
     let dest = match read_send_destination(notif.pid, addr, addr_len) {
         Ok(dest) => dest,
         Err(errno) => {
@@ -2195,6 +2186,22 @@ fn handle_sendto(
             seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
         }
         Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
+    }
+}
+
+/// Answers a send whose call carries no explicit destination. A relayed socket
+/// forwards the datagram over its connected peer, and an unconnected one fails
+/// with `EDESTADDRREQ`; a plain fd is left to the kernel.
+fn send_without_destination(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    handle: Option<&UdpRelayHandle>,
+) {
+    match handle {
+        Some(handle) if handle.default_destination().is_none() => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+        }
+        _ => seccomp::send_continue(listener_fd, notif.id),
     }
 }
 
@@ -2272,24 +2279,14 @@ fn handle_sendmsg(
             return;
         }
     };
-    if msg.name == 0 {
-        if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
-            if handle.default_destination().is_none() {
-                seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
-            } else {
-                seccomp::send_continue(listener_fd, notif.id);
-            }
-        } else {
-            seccomp::send_continue(listener_fd, notif.id);
-        }
-        return;
-    }
-    if msg.name_len == 0 {
-        seccomp::send_continue(listener_fd, notif.id);
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    // `sendmsg(2)` drops a zero-length name, so both cases leave the datagram
+    // without an explicit destination.
+    if msg.name == 0 || msg.name_len == 0 {
+        send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
 
-    let existing = relays.lookup_handle(notif.pid, target_fd, true);
     let dest = match read_send_destination(notif.pid, msg.name, msg.name_len as usize) {
         Ok(dest) => dest,
         Err(errno) => {
