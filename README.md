@@ -153,7 +153,7 @@ using `SO_COOKIE` as the primary relay key.
 Active UDP relay creation is capped at 128, with a bounded 16-datagram input
 queue per relay. A low-frequency supervisor sweep reclaims relays whose AF_UNIX
 inode no longer has an open target-side alias; capacity-bound admission also
-performs one best-effort sweep. Normal socket creation does not scan procfs, and
+sweeps and retries briefly. Normal socket creation does not scan procfs, and
 an unavailable `/proc/net/unix` delays cleanup instead of breaking creation
 while capacity remains.
 
@@ -168,7 +168,13 @@ wildcard address with port zero, and an explicitly bound port zero is not
 replaced with a kernel-assigned ephemeral port. Logical operations reject
 invalid destination ports and unsupported families before creating a relay.
 AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
-Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations.
+Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations;
+their logical addresses are reported in the socket's own family, so a
+dual-stack peer or response source appears as a v4-mapped IPv6 address.
+Destination names are read the way the target socket reads them: a zero-length
+name fails `sendto(2)` and falls back to the connected peer in `sendmsg(2)`, an
+`AF_UNSPEC` name is an AF_INET address on AF_INET sockets and no name at all on
+AF_INET6 ones, and any other family is rejected with that socket's error.
 Bind remains strict-family, including Linux's IPv6 length checks and IPv4
 `AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
 `AF_UNSPEC` connect clears the peer, after which destination-free sends fail

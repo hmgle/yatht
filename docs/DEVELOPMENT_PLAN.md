@@ -150,16 +150,24 @@ is `socks5://127.0.0.1:1080`.
   `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
   descriptor-number change. A low-frequency reactor sweep checks AF_UNIX
   inodes in `/proc/net/unix` and reclaims a relay only after its last target-side
-  open file description has disappeared. Capacity-bound admission performs one
-  best-effort sweep; normal socket creation avoids procfs, and read failures
+  open file description has disappeared. Capacity-bound admission sweeps and
+  retries briefly; normal socket creation avoids procfs, and read failures
   defer cleanup instead of failing creation while capacity remains.
   Explicit `sendto(2)`/`sendmsg(2)`
   destinations are forwarded by the notification handler; connected UDP sends
-  are read by the relay socket. Logical sends reject invalid ports and unknown
-  families before relay creation. AF_INET6 sockets model the default dual-stack
-  policy for destinations, while bind stays strict-family and preserves native
+  are read by the relay socket. Destination names are resolved against the
+  target socket's own address family: a zero-length name fails `sendto(2)` and
+  falls back to the connected peer in `sendmsg(2)`, an `AF_UNSPEC` name is an
+  AF_INET address on AF_INET sockets and no name at all on AF_INET6 ones, and
+  other families take that socket's error. Ports and family compatibility are
+  checked once the family is settled, so a peer recorded by `connect(2)` keeps
+  whatever that call accepted. AF_INET6 sockets model the default dual-stack
+  policy for destinations and report logical addresses in their own family,
+  while bind stays strict-family and preserves native
   length errors. `IPV6_V6ONLY` remains unvirtualized. Disconnected sends fail,
   and `AF_UNSPEC` disconnect is emulated without altering the AF_UNIX transport.
+  A send whose name the kernel drops is relayed by the supervisor rather than
+  continued, so the AF_UNIX endpoint never sees an address it would reject.
   `close(2)`,
   closing `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay
   creation so a concurrent descriptor change cannot cross the injection window.
@@ -176,7 +184,9 @@ is `socks5://127.0.0.1:1080`.
   waits, and writes each entry's payload length, flags, and numeric source.
   `recvfrom(2)`, `recvmsg(2)`, and `recvmmsg(2)` atomically pair responses with
   the SOCKS5 UDP header source or the direct worker's kernel peer across
-  `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, and mixed receive calls. Empty-queue
+  `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, and mixed receive calls. Sources
+  and peers are rendered in the socket's own family, so a dual-stack AF_INET6
+  socket sees v4-mapped IPv4 addresses. Empty-queue
   batch timeouts use an absolute reactor deadline rather than reproducing the
   documented Linux timeout hang. Blocking receives sample `SO_RCVTIMEO` from
   the supervisor's duplicate of the injected endpoint (one open file

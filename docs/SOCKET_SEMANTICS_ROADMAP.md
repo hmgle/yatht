@@ -91,7 +91,7 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    cleanup confirms that an AF_UNIX inode has disappeared from
    `/proc/net/unix`, which happens only after the final target alias closes. A
    low-frequency reactor sweep releases idle workers; capacity-bound admission
-   performs one best-effort sweep. Normal creation does not scan procfs, and
+   sweeps and retries briefly. Normal creation does not scan procfs, and
    procfs read failures defer cleanup rather than failing below-capacity calls.
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
@@ -100,10 +100,19 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    logical AF_INET/AF_INET6 UDP socket. Logical operations preserve native
    destination and bind family rules, default IPv6 dual-stack destinations,
    disconnected sends, `AF_UNSPEC` connect/bind cases, invalid port errors,
-   and short or negative `getsockopt(2)` lengths.
+   and short or negative `getsockopt(2)` lengths. Destination names follow the
+   socket's own family, including empty names, the AF_INET `AF_UNSPEC`
+   compatibility case, and the AF_INET6 rule that drops an `AF_UNSPEC` name in
+   favor of the connected peer. Logical addresses are reported in the socket's
+   family, so dual-stack peers and sources appear as v4-mapped IPv6 addresses.
+   One deliberate divergence remains: Linux only reaches a v4-mapped peer from
+   its IPv4 send path, so a dropped `AF_UNSPEC` name on such a socket fails
+   with `ENETUNREACH` even though a plain `send(2)` succeeds. The relay carries
+   the datagram instead, matching `send(2)` rather than reproducing the wart.
 6. [x] Preserve numeric response sources for unconnected `recvfrom(2)` and
    `recvmsg(2)`. SOCKS5 replies use the UDP response header and direct replies
-   use the kernel peer. A direct-kernel probe covers changed-source responses,
+   use the kernel peer, both rendered in the socket's own address family. A
+   direct-kernel probe covers changed-source responses,
    `MSG_PEEK`, payload truncation, and `MSG_TRUNC` before running the same
    assertions through stable relays.
 7. [x] Trap stable `recvmmsg(2)` and preserve per-entry payload length, flags,
