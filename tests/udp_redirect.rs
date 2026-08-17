@@ -415,6 +415,40 @@ fn direct_kernel_udp_receive_metadata_baseline() {
 }
 
 #[test]
+fn direct_kernel_udp_socket_error_semantics_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_socket_error_probe();
+    let output = Command::new(&probe).output().unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "socket-errors-ok");
+}
+
+#[test]
+fn stable_udp_matches_socket_error_semantics() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_socket_error_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "socket-errors-ok");
+}
+
+#[test]
 fn direct_kernel_recvmmsg_source_and_mixed_receive_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1934,6 +1968,94 @@ int main(int argc, char **argv) {
         !same_address(&msg_source, &expected_source)) return 12;
     if (memcmp(received, response, sizeof(received)) != 0) return 13;
     if (write(STDOUT_FILENO, "receive-metadata-ok", 19) != 19) return 14;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_socket_error_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_socket_error_probe.c");
+    let bin = dir.path().join("udp_socket_error_probe");
+    fs::write(
+        &src,
+        r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 2;
+
+    errno = 0;
+    if (send(fd, "x", 1, 0) != -1 || errno != EDESTADDRREQ) return 3;
+
+    char payload = 'x';
+    struct iovec iov = { .iov_base = &payload, .iov_len = 1 };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    errno = 0;
+    if (sendmsg(fd, &msg, 0) != -1 || errno != EDESTADDRREQ) return 4;
+
+    struct sockaddr_in6 ipv6;
+    memset(&ipv6, 0, sizeof(ipv6));
+    ipv6.sin6_family = AF_INET6;
+    ipv6.sin6_port = htons(9);
+    ipv6.sin6_addr = in6addr_loopback;
+    errno = 0;
+    if (bind(fd, (struct sockaddr *)&ipv6, sizeof(ipv6)) != -1 ||
+        errno != EAFNOSUPPORT) return 5;
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&ipv6, sizeof(ipv6)) != -1 ||
+        errno != EAFNOSUPPORT) return 6;
+    errno = 0;
+    if (connect(fd, (struct sockaddr *)&ipv6, sizeof(ipv6)) != -1 ||
+        errno != EAFNOSUPPORT) return 7;
+
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    ipv4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&ipv4, sizeof(ipv4)) != 0) return 8;
+
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != 0 ||
+        peer.sin_family != AF_INET || peer.sin_port != ipv4.sin_port ||
+        peer.sin_addr.s_addr != ipv4.sin_addr.s_addr) return 9;
+
+    struct sockaddr disconnected;
+    memset(&disconnected, 0, sizeof(disconnected));
+    disconnected.sa_family = AF_UNSPEC;
+    if (connect(fd, &disconnected, sizeof(disconnected)) != 0) return 10;
+    peer_len = sizeof(peer);
+    errno = 0;
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != -1 ||
+        errno != ENOTCONN) return 11;
+    errno = 0;
+    if (send(fd, "x", 1, 0) != -1 || errno != EDESTADDRREQ) return 12;
+
+    if (write(STDOUT_FILENO, "socket-errors-ok", 16) != 16) return 13;
     return 0;
 }
 "#,

@@ -1545,6 +1545,10 @@ fn handle_bind(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegi
         seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
         return;
     };
+    if !handle.accepts_destination(destination) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
+        return;
+    }
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
@@ -1744,6 +1748,17 @@ fn handle_connect(
         return;
     }
 
+    let family = u16::from_ne_bytes(raw[0..2].try_into().unwrap()) as i32;
+    if family == libc::AF_UNSPEC {
+        if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
+            handle.clear_default_dest();
+            seccomp::send_success(listener_fd, notif.id);
+        } else {
+            seccomp::send_continue(listener_fd, notif.id);
+        }
+        return;
+    }
+
     let dest = match parse_sockaddr(&raw) {
         Ok(dest) => dest,
         Err(_) => {
@@ -1751,6 +1766,12 @@ fn handle_connect(
             return;
         }
     };
+    if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
+        if !handle.accepts_destination(dest) {
+            seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
+            return;
+        }
+    }
 
     if direct_connect_can_continue_before_socket_type(&cfg, dest) {
         // A direct route normally just continues, but if this fd was already
@@ -2069,7 +2090,19 @@ fn handle_sendto(
     let addr = notif.data.args[4];
     let addr_len = notif.data.args[5] as usize;
 
-    if addr == 0 || addr_len == 0 {
+    if addr == 0 {
+        if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
+            if handle.default_destination().is_none() {
+                seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+            }
+        } else {
+            seccomp::send_continue(listener_fd, notif.id);
+        }
+        return;
+    }
+    if addr_len == 0 {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
@@ -2100,6 +2133,10 @@ fn handle_sendto(
         Some(handle) => handle,
         None => return,
     };
+    if !handle.accepts_destination(dest) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
+        return;
+    }
     let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     match handle.send(dest, payload, route, nonblocking) {
@@ -2208,7 +2245,19 @@ fn handle_sendmsg(
             return;
         }
     };
-    if msg.name == 0 || msg.name_len == 0 {
+    if msg.name == 0 {
+        if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
+            if handle.default_destination().is_none() {
+                seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+            }
+        } else {
+            seccomp::send_continue(listener_fd, notif.id);
+        }
+        return;
+    }
+    if msg.name_len == 0 {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
@@ -2265,6 +2314,10 @@ fn handle_sendmsg(
         Some(handle) => handle,
         None => return,
     };
+    if !handle.accepts_destination(dest) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
+        return;
+    }
     let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     match handle.send(dest, payload, route, nonblocking) {
@@ -2343,6 +2396,10 @@ fn handle_sendmmsg(
             };
             default
         };
+        if !handle.accepts_destination(dest) {
+            send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EAFNOSUPPORT);
+            return;
+        }
         let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
             Ok(iovecs) => iovecs,
             Err(_) => {
@@ -3602,6 +3659,17 @@ impl UdpRelayHandle {
 
     fn set_default_dest(&self, dest: Destination, route: UdpRouteKind) {
         *self.default_dest.lock().unwrap() = Some((dest, route));
+    }
+
+    fn clear_default_dest(&self) {
+        *self.default_dest.lock().unwrap() = None;
+    }
+
+    fn accepts_destination(&self, dest: Destination) -> bool {
+        matches!(
+            (self.domain, dest.ip),
+            (libc::AF_INET, IpAddr::V4(_)) | (libc::AF_INET6, IpAddr::V6(_))
+        )
     }
 
     fn set_local_bind(&self, bind: Destination) -> bool {
