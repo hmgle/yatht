@@ -2572,10 +2572,56 @@ static int check_empty_name(int domain) {
     return close(fd);
 }
 
+/* AF_UNSPEC and unsupported families only mean something relative to the
+ * socket: an AF_INET socket reads AF_UNSPEC as AF_INET and rejects the rest
+ * with EAFNOSUPPORT, while an AF_INET6 socket drops an AF_UNSPEC name and
+ * rejects the rest with EINVAL. */
+static int check_socket_relative_names(void) {
+    struct sockaddr_in unspecified;
+    memset(&unspecified, 0, sizeof(unspecified));
+    unspecified.sin_family = AF_UNSPEC;
+    unspecified.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &unspecified.sin_addr) != 1) return -1;
+    struct sockaddr_in unknown = unspecified;
+    unknown.sin_family = 1234;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&unspecified,
+               sizeof(unspecified)) != 1) { close(fd); return -1; }
+    struct sockaddr_in zero_port = unspecified;
+    zero_port.sin_port = 0;
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&zero_port,
+               sizeof(zero_port)) != -1 || errno != EINVAL) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&unknown, sizeof(unknown)) != -1 ||
+        errno != EAFNOSUPPORT) { close(fd); return -1; }
+    if (close(fd) != 0) return -1;
+
+    struct sockaddr_in6 unspecified6;
+    memset(&unspecified6, 0, sizeof(unspecified6));
+    unspecified6.sin6_family = AF_UNSPEC;
+    struct sockaddr_in6 unknown6 = unspecified6;
+    unknown6.sin6_family = 1234;
+
+    fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&unspecified6,
+               sizeof(unspecified6)) != -1 ||
+        errno != EDESTADDRREQ) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, "x", 1, 0, (struct sockaddr *)&unknown6, sizeof(unknown6)) != -1 ||
+        errno != EINVAL) { close(fd); return -1; }
+    return close(fd);
+}
+
 int main(void) {
     if (check_empty_name(AF_INET) != 0) return 2;
     if (check_empty_name(AF_INET6) != 0) return 3;
-    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 4;
+    if (check_socket_relative_names() != 0) return 4;
+    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 5;
     return 0;
 }
 "#,

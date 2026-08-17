@@ -34,6 +34,7 @@ const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
 const SOCKADDR_IN_SIZE: usize = 16;
 const SOCKADDR_IN6_MIN_SIZE: usize = 24;
+const SOCKADDR_IN6_SIZE: usize = 28;
 // Upper bound on relay responses buffered ahead of the target's recv. Caps
 // memory when the target stops reading and keeps the source queue from growing
 // without limit; once full, further responses are dropped rather than enqueued.
@@ -2133,14 +2134,18 @@ fn handle_sendto(
         send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
-    let dest = match read_send_destination(notif.pid, addr, addr_len) {
-        Ok(dest) => dest,
-        Err(errno) => {
-            if existing.is_some() {
-                seccomp::send_errno(listener_fd, notif.id, errno);
-            } else {
-                seccomp::send_continue(listener_fd, notif.id);
-            }
+    let dest = match resolve_send_destination(notif.pid, addr, addr_len, existing.as_ref()) {
+        SendDestination::Explicit(dest) => dest,
+        SendDestination::ConnectedPeer => {
+            send_without_destination(listener_fd, &notif, existing.as_ref());
+            return;
+        }
+        SendDestination::Continue => {
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        SendDestination::Errno(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
             return;
         }
     };
@@ -2158,9 +2163,11 @@ fn handle_sendto(
         .as_ref()
         .map(|handle| handle.domain)
         .or_else(|| remote_udp_domain(notif.pid, target_fd));
-    if domain.is_some_and(|domain| !udp_domain_accepts_destination(domain, dest)) {
-        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
-        return;
+    if let Some(domain) = domain {
+        if let Err(errno) = validate_send_destination(domain, dest) {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
     }
     if len > MAX_UDP_PAYLOAD {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
@@ -2287,14 +2294,23 @@ fn handle_sendmsg(
         return;
     }
 
-    let dest = match read_send_destination(notif.pid, msg.name, msg.name_len as usize) {
-        Ok(dest) => dest,
-        Err(errno) => {
-            if existing.is_some() {
-                seccomp::send_errno(listener_fd, notif.id, errno);
-            } else {
-                seccomp::send_continue(listener_fd, notif.id);
-            }
+    let dest = match resolve_send_destination(
+        notif.pid,
+        msg.name,
+        msg.name_len as usize,
+        existing.as_ref(),
+    ) {
+        SendDestination::Explicit(dest) => dest,
+        SendDestination::ConnectedPeer => {
+            send_without_destination(listener_fd, &notif, existing.as_ref());
+            return;
+        }
+        SendDestination::Continue => {
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        SendDestination::Errno(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
             return;
         }
     };
@@ -2310,9 +2326,11 @@ fn handle_sendmsg(
         .as_ref()
         .map(|handle| handle.domain)
         .or_else(|| remote_udp_domain(notif.pid, target_fd));
-    if domain.is_some_and(|domain| !udp_domain_accepts_destination(domain, dest)) {
-        seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
-        return;
+    if let Some(domain) = domain {
+        if let Err(errno) = validate_send_destination(domain, dest) {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
     }
 
     let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
@@ -2405,30 +2423,46 @@ fn handle_sendmmsg(
                 return;
             }
         };
-        let (dest, route) = if msg.name != 0 && msg.name_len != 0 {
-            let dest = match read_send_destination(notif.pid, msg.name, msg.name_len as usize) {
-                Ok(dest) => dest,
-                Err(errno) => {
+        let named = if msg.name != 0 && msg.name_len != 0 {
+            match resolve_send_destination(
+                notif.pid,
+                msg.name,
+                msg.name_len as usize,
+                Some(&handle),
+            ) {
+                SendDestination::Explicit(dest) => {
+                    if let Err(errno) = validate_send_destination(handle.domain, dest) {
+                        send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+                        return;
+                    }
+                    Some((
+                        dest,
+                        udp_route_for(&cfg, dest).unwrap_or(UdpRouteKind::Direct),
+                    ))
+                }
+                // A dropped name falls back to the connected peer, exactly as
+                // an unnamed entry does. `Continue` needs a plain fd, which
+                // this stable-only path never sees.
+                SendDestination::ConnectedPeer | SendDestination::Continue => None,
+                SendDestination::Errno(errno) => {
                     send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
                     return;
                 }
-            };
-            (
-                dest,
-                udp_route_for(&cfg, dest).unwrap_or(UdpRouteKind::Direct),
-            )
+            }
         } else {
-            let default = *handle.default_dest.lock().unwrap();
-            let Some(default) = default else {
-                send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EDESTADDRREQ);
-                return;
-            };
-            default
+            None
         };
-        if !handle.accepts_destination(dest) {
-            send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EAFNOSUPPORT);
-            return;
-        }
+        let (dest, route) = match named {
+            Some(target) => target,
+            None => {
+                let default = *handle.default_dest.lock().unwrap();
+                let Some(default) = default else {
+                    send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EDESTADDRREQ);
+                    return;
+                };
+                default
+            }
+        };
         let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
             Ok(iovecs) => iovecs,
             Err(_) => {
@@ -4208,24 +4242,110 @@ fn make_relay_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
-fn read_send_destination(
+/// Destination named by a send call, before the socket's own address family is
+/// taken into account.
+enum SendName {
+    /// A parsed AF_INET or AF_INET6 destination.
+    Explicit(Destination),
+    /// A family that only means something relative to the socket.
+    /// [`resolve_send_name`] finishes it once the domain is known.
+    SocketRelative { family: i32, raw: Vec<u8> },
+}
+
+/// Resolved destination for one send notification.
+enum SendDestination {
+    /// Forward the datagram to this destination.
+    Explicit(Destination),
+    /// Linux drops the supplied name, so the connected peer carries the
+    /// datagram and an unconnected socket fails with `EDESTADDRREQ`.
+    ConnectedPeer,
+    /// Nothing here depends on relay state; run the original syscall.
+    Continue,
+    /// Reject the call with this errno.
+    Errno(i32),
+}
+
+/// Reads the destination named by `addr`/`addr_len`, applying only the checks
+/// Linux performs before it looks at the socket: a truncated name is `EINVAL`,
+/// and any other family is deferred to [`resolve_send_name`].
+fn read_send_name(pid: u32, addr: u64, addr_len: usize) -> std::result::Result<SendName, i32> {
+    let raw =
+        read_proc_bytes(pid, addr, addr_len.min(SOCKADDR_IN6_SIZE)).map_err(|_| libc::EFAULT)?;
+    if raw.len() < 2 {
+        return Err(libc::EINVAL);
+    }
+    let family = u16::from_ne_bytes([raw[0], raw[1]]) as i32;
+    if !matches!(family, libc::AF_INET | libc::AF_INET6) {
+        return Ok(SendName::SocketRelative { family, raw });
+    }
+    parse_sockaddr(&raw)
+        .map(SendName::Explicit)
+        .map_err(|_| libc::EINVAL)
+}
+
+/// Resolves a name whose family Linux reads relative to the socket. `Ok(None)`
+/// means the name is dropped and the connected peer takes over.
+///
+/// An AF_INET socket accepts an `AF_UNSPEC` name as AF_INET for compatibility
+/// and rejects every other family with `EAFNOSUPPORT`. An AF_INET6 socket
+/// treats an `AF_UNSPEC` name as no name at all and rejects every other family
+/// with `EINVAL`.
+fn resolve_send_name(
+    raw: &[u8],
+    family: i32,
+    domain: i32,
+) -> std::result::Result<Option<Destination>, i32> {
+    match (domain, family) {
+        (libc::AF_INET, libc::AF_UNSPEC) => {
+            let mut compat = raw.to_vec();
+            compat[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+            parse_sockaddr_in(&compat)
+                .map(Some)
+                .map_err(|_| libc::EINVAL)
+        }
+        (libc::AF_INET6, libc::AF_UNSPEC) => Ok(None),
+        (libc::AF_INET6, _) => Err(libc::EINVAL),
+        _ => Err(libc::EAFNOSUPPORT),
+    }
+}
+
+/// Resolves the destination named by a send on a socket whose relay is
+/// `handle`. Without a relay the fd is still a plain UDP socket, so anything
+/// that depends on its address family is left to the kernel.
+fn resolve_send_destination(
     pid: u32,
     addr: u64,
     addr_len: usize,
-) -> std::result::Result<Destination, i32> {
-    let raw_addr = read_sockaddr(pid, addr, addr_len).map_err(|_| libc::EFAULT)?;
-    if raw_addr.len() < 2 {
-        return Err(libc::EINVAL);
+    handle: Option<&UdpRelayHandle>,
+) -> SendDestination {
+    match read_send_name(pid, addr, addr_len) {
+        Ok(SendName::Explicit(dest)) => SendDestination::Explicit(dest),
+        Ok(SendName::SocketRelative { family, raw }) => {
+            let Some(domain) = handle.map(|handle| handle.domain) else {
+                return SendDestination::Continue;
+            };
+            match resolve_send_name(&raw, family, domain) {
+                Ok(Some(dest)) => SendDestination::Explicit(dest),
+                Ok(None) => SendDestination::ConnectedPeer,
+                Err(errno) => SendDestination::Errno(errno),
+            }
+        }
+        Err(errno) if handle.is_some() => SendDestination::Errno(errno),
+        Err(_) => SendDestination::Continue,
     }
-    let family = u16::from_ne_bytes([raw_addr[0], raw_addr[1]]) as i32;
-    let dest = match family {
-        libc::AF_INET | libc::AF_INET6 => parse_sockaddr(&raw_addr).map_err(|_| libc::EINVAL)?,
-        _ => return Err(libc::EAFNOSUPPORT),
-    };
+}
+
+/// Applies the checks Linux defers until it knows both the named destination
+/// and the socket's address family. Only explicit names reach these: a peer
+/// recorded by `connect(2)` keeps whatever that call accepted.
+fn validate_send_destination(domain: i32, dest: Destination) -> std::result::Result<(), i32> {
+    if !udp_domain_accepts_destination(domain, dest) {
+        return Err(libc::EAFNOSUPPORT);
+    }
     if dest.port == 0 {
         return Err(libc::EINVAL);
     }
-    Ok(dest)
+    Ok(())
 }
 
 fn read_bind_destination(
@@ -4780,20 +4900,20 @@ fn write_sockaddr_to_msghdr(
     )
 }
 
-fn sockaddr_bytes(dest: Destination) -> ([u8; 28], usize) {
-    let mut raw = [0_u8; 28];
+fn sockaddr_bytes(dest: Destination) -> ([u8; SOCKADDR_IN6_SIZE], usize) {
+    let mut raw = [0_u8; SOCKADDR_IN6_SIZE];
     match dest.ip {
         IpAddr::V4(ip) => {
             raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
             raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
             raw[4..8].copy_from_slice(&ip.octets());
-            (raw, 16)
+            (raw, SOCKADDR_IN_SIZE)
         }
         IpAddr::V6(ip) => {
             raw[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
             raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
             raw[8..24].copy_from_slice(&ip.octets());
-            (raw, 28)
+            (raw, SOCKADDR_IN6_SIZE)
         }
     }
 }
@@ -5087,7 +5207,7 @@ fn read_sockaddr(pid: u32, addr: u64, addr_len: usize) -> io::Result<Vec<u8>> {
     let family = u16::from_ne_bytes([family_raw[0], family_raw[1]]) as i32;
     let needed_len = match family {
         libc::AF_INET => SOCKADDR_IN_SIZE,
-        libc::AF_INET6 => 28,
+        libc::AF_INET6 => SOCKADDR_IN6_SIZE,
         _ => return Ok(family_raw),
     };
     read_proc_bytes(pid, addr, addr_len.min(needed_len).min(128))
