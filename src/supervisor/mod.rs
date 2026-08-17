@@ -1655,7 +1655,7 @@ fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRel
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
-    if optval == 0 || optlen_ptr == 0 {
+    if optlen_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
@@ -1666,8 +1666,10 @@ fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRel
             return;
         }
     };
-    if optlen < std::mem::size_of::<libc::c_int>() as u32 {
-        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+    let value_len = std::mem::size_of::<libc::c_int>() as u32;
+    let write_len = optlen.min(value_len);
+    if write_len > 0 && optval == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
     let value = match option {
@@ -1680,13 +1682,14 @@ fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRel
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    if write_proc_bytes(notif.pid, optval, &value.to_ne_bytes()).is_err()
-        || write_proc_bytes(
+    if (write_len > 0
+        && write_proc_bytes(
             notif.pid,
-            optlen_ptr,
-            &(std::mem::size_of::<libc::c_int>() as u32).to_ne_bytes(),
+            optval,
+            &value.to_ne_bytes()[..write_len as usize],
         )
-        .is_err()
+        .is_err())
+        || write_proc_bytes(notif.pid, optlen_ptr, &write_len.to_ne_bytes()).is_err()
     {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;

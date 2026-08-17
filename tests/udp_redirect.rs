@@ -449,6 +449,40 @@ fn stable_udp_matches_socket_error_semantics() {
 }
 
 #[test]
+fn direct_kernel_udp_getsockopt_truncation_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_getsockopt_probe();
+    let output = Command::new(&probe).output().unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "getsockopt-ok");
+}
+
+#[test]
+fn stable_udp_preserves_getsockopt_truncation() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_getsockopt_probe();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "getsockopt-ok");
+}
+
+#[test]
 fn direct_kernel_recvmmsg_source_and_mixed_receive_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -2056,6 +2090,63 @@ int main(void) {
     if (send(fd, "x", 1, 0) != -1 || errno != EDESTADDRREQ) return 12;
 
     if (write(STDOUT_FILENO, "socket-errors-ok", 16) != 16) return 13;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_getsockopt_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_getsockopt_probe.c");
+    let bin = dir.path().join("udp_getsockopt_probe");
+    fs::write(
+        &src,
+        r#"
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 2;
+
+    for (socklen_t input_len = 0; input_len <= sizeof(int) + 1; ++input_len) {
+        unsigned char value[sizeof(int) + 1];
+        memset(value, 0xaa, sizeof(value));
+        socklen_t output_len = input_len;
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, value, &output_len) != 0) return 3;
+        socklen_t expected_len = input_len < sizeof(int) ? input_len : sizeof(int);
+        if (output_len != expected_len) return 4;
+        int expected = SOCK_DGRAM;
+        if (memcmp(value, &expected, expected_len) != 0) return 5;
+        for (socklen_t index = expected_len; index < sizeof(value); ++index) {
+            if (value[index] != 0xaa) return 6;
+        }
+    }
+
+    socklen_t zero = 0;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, NULL, &zero) != 0 || zero != 0) return 7;
+    socklen_t one = 1;
+    errno = 0;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, NULL, &one) != -1 ||
+        errno != EFAULT || one != 1) return 8;
+
+    if (write(STDOUT_FILENO, "getsockopt-ok", 13) != 13) return 9;
     return 0;
 }
 "#,
