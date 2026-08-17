@@ -1331,11 +1331,21 @@ fn blocking_recv_reactor(
                                 completion.work.terminal_revents,
                             );
                         } else {
-                            seccomp::send_value(
-                                listener_fd.as_raw_fd(),
-                                completion.work.notif.id,
-                                state.completed as i64,
-                            );
+                            if completion.work.notif.data.nr as libc::c_long == libc::SYS_recvmmsg {
+                                send_recvmmsg_result_or_errno(
+                                    listener_fd.as_raw_fd(),
+                                    &completion.work.notif,
+                                    &state,
+                                    None,
+                                    false,
+                                );
+                            } else {
+                                seccomp::send_value(
+                                    listener_fd.as_raw_fd(),
+                                    completion.work.notif.id,
+                                    state.completed as i64,
+                                );
+                            }
                         }
                     } else {
                         pending.push(PendingBlockingRecv {
@@ -2794,24 +2804,36 @@ fn handle_recvmmsg_once(
             return RecvHandling::Completed;
         }
         let Some(entry_offset) = state.completed.checked_mul(X86_64_MMSGHDR_SIZE) else {
-            send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+            send_recvmmsg_result_or_errno(listener_fd, &notif, &state, Some(libc::EFAULT), false);
             return RecvHandling::Completed;
         };
         let Some(entry_ptr) = msgvec.checked_add(entry_offset as u64) else {
-            send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+            send_recvmmsg_result_or_errno(listener_fd, &notif, &state, Some(libc::EFAULT), false);
             return RecvHandling::Completed;
         };
         let msg = match read_msghdr(notif.pid, entry_ptr) {
             Ok(msg) => msg,
             Err(_) => {
-                send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+                send_recvmmsg_result_or_errno(
+                    listener_fd,
+                    &notif,
+                    &state,
+                    Some(libc::EFAULT),
+                    false,
+                );
                 return RecvHandling::Completed;
             }
         };
         let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
             Ok(iovecs) => iovecs,
             Err(_) => {
-                send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+                send_recvmmsg_result_or_errno(
+                    listener_fd,
+                    &notif,
+                    &state,
+                    Some(libc::EFAULT),
+                    false,
+                );
                 return RecvHandling::Completed;
             }
         };
@@ -2843,7 +2865,13 @@ fn handle_recvmmsg_once(
                     )
                     .is_err()
                 {
-                    send_mmsg_result_or_errno(listener_fd, notif.id, state.completed, libc::EFAULT);
+                    send_recvmmsg_result_or_errno(
+                        listener_fd,
+                        &notif,
+                        &state,
+                        Some(libc::EFAULT),
+                        false,
+                    );
                     return RecvHandling::Completed;
                 }
                 state.completed += 1;
@@ -2861,7 +2889,7 @@ fn handle_recvmmsg_once(
                         || deadline_expired
                         || rcvtimeo_expired)
                 {
-                    seccomp::send_value(listener_fd, notif.id, state.completed as i64);
+                    send_recvmmsg_result_or_errno(listener_fd, &notif, &state, None, false);
                     return RecvHandling::Completed;
                 }
                 // When both timers are expired the earlier one keeps its own
@@ -2875,15 +2903,27 @@ fn handle_recvmmsg_once(
                             .is_none_or(|rcvtimeo| explicit <= rcvtimeo)
                     });
                 if explicit_governs {
-                    seccomp::send_success(listener_fd, notif.id);
+                    send_recvmmsg_result_or_errno(listener_fd, &notif, &state, None, true);
                     return RecvHandling::Completed;
                 }
                 if rcvtimeo_expired {
-                    seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+                    send_recvmmsg_result_or_errno(
+                        listener_fd,
+                        &notif,
+                        &state,
+                        Some(libc::EAGAIN),
+                        false,
+                    );
                     return RecvHandling::Completed;
                 }
                 if nonblocking {
-                    seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
+                    send_recvmmsg_result_or_errno(
+                        listener_fd,
+                        &notif,
+                        &state,
+                        Some(libc::EAGAIN),
+                        false,
+                    );
                     return RecvHandling::Completed;
                 }
                 return RecvHandling::Deferred {
@@ -2893,19 +2933,40 @@ fn handle_recvmmsg_once(
                 };
             }
             Err(err) => {
-                send_mmsg_result_or_errno(
+                send_recvmmsg_result_or_errno(
                     listener_fd,
-                    notif.id,
-                    state.completed,
-                    errno_from_io(&err),
+                    &notif,
+                    &state,
+                    Some(errno_from_io(&err)),
+                    false,
                 );
                 return RecvHandling::Completed;
             }
         }
     }
 
-    seccomp::send_value(listener_fd, notif.id, state.completed as i64);
+    send_recvmmsg_result_or_errno(listener_fd, &notif, &state, None, false);
     RecvHandling::Completed
+}
+
+fn send_recvmmsg_result_or_errno(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    state: &BlockingRecvState,
+    errno: Option<i32>,
+    explicit_timeout_expired: bool,
+) {
+    let update_failed = (state.completed > 0 || explicit_timeout_expired)
+        && write_recvmmsg_remaining_timeout(notif.pid, notif.data.args[4], state.deadline).is_err();
+    if state.completed > 0 {
+        seccomp::send_value(listener_fd, notif.id, state.completed as i64);
+    } else if update_failed {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+    } else if let Some(errno) = errno {
+        seccomp::send_errno(listener_fd, notif.id, errno);
+    } else {
+        seccomp::send_success(listener_fd, notif.id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4442,6 +4503,29 @@ fn read_recvmmsg_deadline(
         .checked_add(duration)
         .map(Some)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recvmmsg timeout overflow"))
+}
+
+fn write_recvmmsg_remaining_timeout(
+    pid: u32,
+    timeout_ptr: u64,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    debug_assert_ne!(timeout_ptr, 0);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let seconds = i64::try_from(remaining.as_secs()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recvmmsg remaining timeout does not fit timespec",
+        )
+    })?;
+    let nanos = i64::from(remaining.subsec_nanos());
+    let mut raw = [0_u8; X86_64_TIMESPEC_SIZE];
+    raw[0..8].copy_from_slice(&seconds.to_ne_bytes());
+    raw[8..16].copy_from_slice(&nanos.to_ne_bytes());
+    write_proc_bytes(pid, timeout_ptr, &raw)
 }
 
 fn parse_recvmmsg_timeout(raw: &[u8]) -> io::Result<Duration> {

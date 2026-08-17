@@ -2256,7 +2256,10 @@ int main(int argc, char **argv) {
         recv_msgs[i].msg_hdr.msg_iov = &recv_iov[i];
         recv_msgs[i].msg_hdr.msg_iovlen = 1;
     }
-    if (recvmmsg(fd, recv_msgs, 2, MSG_TRUNC, NULL) != 2) return 8;
+    struct timespec batch_timeout = { .tv_sec = 5, .tv_nsec = 0 };
+    if (recvmmsg(fd, recv_msgs, 2, MSG_TRUNC, &batch_timeout) != 2) return 8;
+    if (batch_timeout.tv_sec < 0 || batch_timeout.tv_sec >= 5 ||
+        batch_timeout.tv_nsec < 0 || batch_timeout.tv_nsec >= 1000000000) return 17;
     if (recv_msgs[0].msg_len != strlen(responses[0]) ||
         (recv_msgs[0].msg_hdr.msg_flags & MSG_TRUNC) == 0 ||
         memcmp(first, responses[0], sizeof(first)) != 0) return 9;
@@ -2410,6 +2413,7 @@ int main(void) {
     msg.msg_hdr.msg_iovlen = 1;
     struct timespec timeout = { .tv_sec = 0, .tv_nsec = 50000000 };
     if (recvmmsg(fd, &msg, 1, 0, &timeout) != 0) return 3;
+    if (timeout.tv_sec != 0 || timeout.tv_nsec != 0) return 11;
     errno = 0;
     if (recvmmsg(fd, &msg, 1025, MSG_DONTWAIT, NULL) != -1 ||
         errno != EINVAL) return 4;
@@ -2421,7 +2425,9 @@ int main(void) {
                    sizeof(socket_timeout)) != 0) return 5;
     struct timespec start;
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 6;
+    timeout.tv_nsec = 50000000;
     if (recvmmsg(fd, &msg, 1, 0, &timeout) != 0) return 7;
+    if (timeout.tv_sec != 0 || timeout.tv_nsec != 0) return 12;
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 8;
     long waited = (now.tv_sec - start.tv_sec) * 1000L +
@@ -2840,6 +2846,7 @@ int main(int argc, char **argv) {
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 25;
     errno = 0;
     if (recvmmsg(fd, batch, 2, 0, &explicit_timeout) != -1 || errno != EAGAIN) return 26;
+    if (explicit_timeout.tv_sec != 3 || explicit_timeout.tv_nsec != 0) return 43;
     waited = elapsed_ms(&start);
     if (waited < 450 || waited > 2000) return 27;
 
