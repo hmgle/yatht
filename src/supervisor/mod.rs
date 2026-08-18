@@ -2138,6 +2138,10 @@ fn handle_sendto(
         send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
+    let Some(domain) = internet_udp_domain(notif.pid, target_fd, existing.as_ref()) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
     let (dest, route) = match resolve_send_destination(notif.pid, addr, addr_len, existing.as_ref())
     {
         SendDestination::Explicit(dest) => {
@@ -2152,15 +2156,9 @@ fn handle_sendto(
                     return;
                 }
             };
-            let domain = existing
-                .as_ref()
-                .map(|handle| handle.domain)
-                .or_else(|| remote_udp_domain(notif.pid, target_fd));
-            if let Some(domain) = domain {
-                if let Err(errno) = validate_send_destination(domain, dest) {
-                    seccomp::send_errno(listener_fd, notif.id, errno);
-                    return;
-                }
+            if let Err(errno) = validate_send_destination(domain, dest) {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return;
             }
             (dest, route)
         }
@@ -2214,9 +2212,9 @@ fn handle_sendto(
 /// `EMSGSIZE`. Reading the buffers themselves must stay after the destination
 /// verdict, which is where the kernel copies them.
 ///
-/// The UDP payload limit makes this valid only once the fd is known to be a
-/// UDP socket yatht answers for; callers must not apply it to a TCP or
-/// AF_UNIX fd that merely tripped the same syscall filter.
+/// The UDP payload limit makes this valid only once the fd is known to be an
+/// Internet UDP socket; callers must not apply it to a TCP or AF_UNIX fd that
+/// merely tripped the same syscall filter.
 fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>, usize), i32> {
     let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
@@ -2346,20 +2344,20 @@ fn handle_sendmsg(
     };
     let existing = relays.lookup_handle(notif.pid, target_fd, true);
     // The filter traps the syscall, not the socket, so TCP, AF_UNIX and stale
-    // fds arrive here too. Only an fd yatht already relays is known to be a UDP
-    // socket, so only that one takes the UDP-shaped import ahead of the
-    // destination verdict. Every other fd keeps reaching the kernel below,
-    // which answers with its own limits.
-    let relayed_import = if existing.is_some() {
-        match import_send_iovecs(notif.pid, &msg) {
-            Ok(imported) => Some(imported),
-            Err(errno) => {
-                seccomp::send_errno(listener_fd, notif.id, errno);
-                return;
-            }
+    // fds arrive here too. Classify an unrelayed fd before applying UDP's
+    // datagram limits: an explicit, routable name does not prove the fd is
+    // UDP, while a lazy UDP socket still needs the kernel's iovec-import order
+    // on its first send.
+    let Some(domain) = internet_udp_domain(notif.pid, target_fd, existing.as_ref()) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    let (iovecs, total) = match import_send_iovecs(notif.pid, &msg) {
+        Ok(imported) => imported,
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
         }
-    } else {
-        None
     };
     // `sendmsg(2)` drops a zero-length name, so both cases leave the datagram
     // without an explicit destination.
@@ -2383,15 +2381,9 @@ fn handle_sendmsg(
                     return;
                 }
             };
-            let domain = existing
-                .as_ref()
-                .map(|handle| handle.domain)
-                .or_else(|| remote_udp_domain(notif.pid, target_fd));
-            if let Some(domain) = domain {
-                if let Err(errno) = validate_send_destination(domain, dest) {
-                    seccomp::send_errno(listener_fd, notif.id, errno);
-                    return;
-                }
+            if let Err(errno) = validate_send_destination(domain, dest) {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return;
             }
             (dest, route)
         }
@@ -2410,18 +2402,6 @@ fn handle_sendmsg(
         }
     };
 
-    // A plain fd reaches here only once an explicit name proved this is a
-    // routable UDP send, so the UDP limits finally apply to it as well.
-    let (iovecs, total) = match relayed_import {
-        Some(imported) => imported,
-        None => match import_send_iovecs(notif.pid, &msg) {
-            Ok(imported) => imported,
-            Err(errno) => {
-                seccomp::send_errno(listener_fd, notif.id, errno);
-                return;
-            }
-        },
-    };
     let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
         Ok(payload) => payload,
         Err(_) => {
@@ -4498,6 +4478,13 @@ fn remote_udp_domain(pid: u32, fd: RawFd) -> Option<i32> {
         return None;
     }
     socket_domain_from_fd(target.as_raw_fd())
+}
+
+fn internet_udp_domain(pid: u32, fd: RawFd, existing: Option<&UdpRelayHandle>) -> Option<i32> {
+    let domain = existing
+        .map(|handle| handle.domain)
+        .or_else(|| remote_udp_domain(pid, fd))?;
+    matches!(domain, libc::AF_INET | libc::AF_INET6).then_some(domain)
 }
 
 #[derive(Debug)]

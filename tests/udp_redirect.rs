@@ -534,8 +534,34 @@ fn stable_udp_matches_send_destination_semantics() {
     );
 }
 
-/// The UDP filter traps `sendmsg` for every fd, so a TCP, AF_UNIX or stale fd
-/// must keep the kernel's own limits rather than the 65535-byte datagram cap.
+#[test]
+fn lazy_udp_matches_send_destination_semantics() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let (_probe_dir, probe) = build_udp_send_destination_probe();
+    let peer = UdpSocket::bind("[::1]:0").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .env("SUP_UDP_SOCKET_MODE", "lazy")
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(&probe)
+        .arg(peer.local_addr().unwrap().port().to_string())
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "send-destination-ok"
+    );
+}
+
+/// The UDP filters trap send syscalls for every fd, so a TCP, AF_UNIX or stale
+/// fd must keep the kernel's own limits rather than the UDP datagram cap.
 fn assert_cross_protocol_sends_reach_the_kernel(socket_mode: Option<&str>) {
     let (_probe_dir, probe) = build_cross_protocol_send_probe();
     let output = match socket_mode {
@@ -2608,16 +2634,24 @@ fn build_cross_protocol_send_probe() -> (TempDir, PathBuf) {
 /* Comfortably past the 65535-byte UDP datagram limit. */
 static char bulk[70000];
 
+enum tcp_send_operation {
+    TCP_SENDMSG_UNNAMED,
+    TCP_SENDMSG_NAMED,
+    TCP_SENDTO_NAMED,
+};
+
 static int widen(int fd) {
     int size = 400000;
     if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) != 0) return -1;
     return setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 }
 
-static ssize_t send_bulk(int fd) {
+static ssize_t send_bulk(int fd, void *name, socklen_t name_len) {
     struct iovec iov = { .iov_base = bulk, .iov_len = sizeof(bulk) };
     struct msghdr msg;
     memset(&msg, 0, sizeof(msg));
+    msg.msg_name = name;
+    msg.msg_namelen = name_len;
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     errno = 0;
@@ -2630,10 +2664,44 @@ static int check_unix_pair(int type, int atomic) {
     int fds[2];
     if (socketpair(AF_UNIX, type | SOCK_CLOEXEC, 0, fds) != 0) return -1;
     if (widen(fds[0]) != 0 || widen(fds[1]) != 0) { close(fds[0]); close(fds[1]); return -1; }
-    ssize_t sent = send_bulk(fds[0]);
+    ssize_t sent = send_bulk(fds[0], NULL, 0);
     close(fds[0]);
     close(fds[1]);
     if (atomic) return sent == (ssize_t)sizeof(bulk) ? 0 : -1;
+    return sent > 0 ? 0 : -1;
+}
+
+static int check_tcp_send(int listener, struct sockaddr_in *address,
+                          enum tcp_send_operation operation) {
+    int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0) return -1;
+    if (connect(client, (struct sockaddr *)address, sizeof(*address)) != 0) {
+        close(client);
+        return -1;
+    }
+    int served = accept(listener, NULL, NULL);
+    if (served < 0) { close(client); return -1; }
+    if (widen(client) != 0 || widen(served) != 0) { close(client); close(served); return -1; }
+
+    struct sockaddr_in explicit_name;
+    memset(&explicit_name, 0, sizeof(explicit_name));
+    explicit_name.sin_family = AF_INET;
+    explicit_name.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &explicit_name.sin_addr) != 1) {
+        close(client);
+        close(served);
+        return -1;
+    }
+    ssize_t sent;
+    if (operation == TCP_SENDTO_NAMED) {
+        sent = sendto(client, bulk, sizeof(bulk), MSG_DONTWAIT,
+                      (struct sockaddr *)&explicit_name, sizeof(explicit_name));
+    } else {
+        sent = send_bulk(client, operation == TCP_SENDMSG_NAMED ? &explicit_name : NULL,
+                         operation == TCP_SENDMSG_NAMED ? sizeof(explicit_name) : 0);
+    }
+    close(client);
+    close(served);
     return sent > 0 ? 0 : -1;
 }
 
@@ -2647,28 +2715,17 @@ static int check_tcp(void) {
     if (listener < 0) return -1;
     socklen_t length = sizeof(address);
     if (bind(listener, (struct sockaddr *)&address, length) != 0 ||
-        listen(listener, 1) != 0 ||
+        listen(listener, 2) != 0 ||
         getsockname(listener, (struct sockaddr *)&address, &length) != 0) {
         close(listener);
         return -1;
     }
 
-    int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (client < 0) { close(listener); return -1; }
-    if (connect(client, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        close(client);
-        close(listener);
-        return -1;
-    }
-    int served = accept(listener, NULL, NULL);
+    int result = check_tcp_send(listener, &address, TCP_SENDMSG_UNNAMED);
+    if (result == 0) result = check_tcp_send(listener, &address, TCP_SENDMSG_NAMED);
+    if (result == 0) result = check_tcp_send(listener, &address, TCP_SENDTO_NAMED);
     close(listener);
-    if (served < 0) { close(client); return -1; }
-    if (widen(client) != 0 || widen(served) != 0) { close(client); close(served); return -1; }
-
-    ssize_t sent = send_bulk(client);
-    close(client);
-    close(served);
-    return sent > 0 ? 0 : -1;
+    return result;
 }
 
 /* A closed fd outranks anything the message itself might be wrong about. */
@@ -2838,6 +2895,12 @@ static int check_iovec_import_order(void) {
     ipv4.sin_port = htons(9);
     if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
 
+    struct sockaddr_in6 ipv6;
+    memset(&ipv6, 0, sizeof(ipv6));
+    ipv6.sin6_family = AF_INET6;
+    ipv6.sin6_port = htons(9);
+    if (inet_pton(AF_INET6, "2001:db8::1", &ipv6.sin6_addr) != 1) return -1;
+
     /* An AF_INET6 socket drops an AF_UNSPEC name, reaching the same
      * unconnected-peer verdict by a different route. */
     struct sockaddr_in6 unspecified;
@@ -2868,6 +2931,10 @@ static int check_iovec_import_order(void) {
         errno != EINVAL) { close(fd); return -1; }
     if (SEND_MSG(&ipv4, 0, &bad_base, 1) != -1 ||
         errno != EDESTADDRREQ) { close(fd); return -1; }
+    /* A lazy socket must import the iovec array before rejecting a destination
+     * from the wrong family, just as a socket with an existing relay does. */
+    if (SEND_MSG(&ipv6, sizeof(ipv6), (struct iovec *)1, 1) != -1 ||
+        errno != EFAULT) { close(fd); return -1; }
 
     struct mmsghdr batch;
     memset(&batch, 0, sizeof(batch));
