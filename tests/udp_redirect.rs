@@ -3713,11 +3713,28 @@ fn build_udp_recvmmsg_error_probe() -> (TempDir, PathBuf) {
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+static int check_oversized_iovec(int fd, size_t length) {
+    char buffer[1];
+    struct iovec iov = { .iov_base = buffer, .iov_len = length };
+    struct mmsghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_hdr.msg_iov = &iov;
+    msg.msg_hdr.msg_iovlen = 1;
+
+    errno = 0;
+    if (recvmsg(fd, &msg.msg_hdr, MSG_DONTWAIT) != -1 || errno != EINVAL) return -1;
+    errno = 0;
+    if (recvmmsg(fd, &msg, 1, MSG_DONTWAIT, NULL) != -1 || errno != EINVAL) return -1;
+    return 0;
+}
 
 int main(void) {
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -3748,20 +3765,23 @@ int main(void) {
     if (recvmmsg(fd, NULL, 0, MSG_DONTWAIT,
                  (struct timespec *)1) != -1 || errno != EFAULT) return 7;
 
+    if (check_oversized_iovec(fd, (size_t)SSIZE_MAX + 1) != 0) return 8;
+    if (check_oversized_iovec(fd, SIZE_MAX) != 0) return 9;
+
     msg.msg_hdr.msg_iovlen = 1025;
     errno = 0;
-    if (recvmsg(fd, &msg.msg_hdr, MSG_DONTWAIT) != -1 || errno != EMSGSIZE) return 8;
+    if (recvmsg(fd, &msg.msg_hdr, MSG_DONTWAIT) != -1 || errno != EMSGSIZE) return 10;
     errno = 0;
-    if (recvmmsg(fd, &msg, 1, MSG_DONTWAIT, NULL) != -1 || errno != EMSGSIZE) return 9;
+    if (recvmmsg(fd, &msg, 1, MSG_DONTWAIT, NULL) != -1 || errno != EMSGSIZE) return 11;
     msg.msg_hdr.msg_iovlen = 1;
 
     int status = fcntl(fd, F_GETFL, 0);
-    if (status < 0 || fcntl(fd, F_SETFL, status | O_NONBLOCK) != 0) return 10;
+    if (status < 0 || fcntl(fd, F_SETFL, status | O_NONBLOCK) != 0) return 12;
     errno = 0;
     if (recvmmsg(fd, &msg, 1, 0, NULL) != -1 ||
-        (errno != EAGAIN && errno != EWOULDBLOCK)) return 11;
+        (errno != EAGAIN && errno != EWOULDBLOCK)) return 13;
 
-    if (write(STDOUT_FILENO, "recvmmsg-errors-ok", 18) != 18) return 12;
+    if (write(STDOUT_FILENO, "recvmmsg-errors-ok", 18) != 18) return 14;
     return 0;
 }
 "#,

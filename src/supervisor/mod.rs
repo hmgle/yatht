@@ -2251,11 +2251,7 @@ fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>,
         Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Err(libc::EMSGSIZE),
         Err(_) => return Err(libc::EFAULT),
     };
-    // Linux reads each `iov_len` as a signed length and rejects one that does
-    // not fit before it ever sums them.
-    if iovecs.iter().any(|iov| iov.len > isize::MAX as usize) {
-        return Err(libc::EINVAL);
-    }
+    validate_iovec_segment_lengths(&iovecs)?;
     // Match the sendto path: an oversized datagram cannot be sent, so report
     // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
     let total = iovec_total_len(&iovecs).map_err(|_| libc::EMSGSIZE)?;
@@ -2265,10 +2261,22 @@ fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>,
 /// Imports a receive message's target segments with Linux's distinct errors
 /// for an excessive segment count and an unreadable iovec array.
 fn import_recv_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<Vec<TargetIovec>, i32> {
-    match read_iovec_targets(pid, msg.iov, msg.iov_len) {
-        Ok(iovecs) => Ok(iovecs),
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Err(libc::EMSGSIZE),
-        Err(_) => Err(libc::EFAULT),
+    let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => iovecs,
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Err(libc::EMSGSIZE),
+        Err(_) => return Err(libc::EFAULT),
+    };
+    validate_iovec_segment_lengths(&iovecs)?;
+    Ok(iovecs)
+}
+
+/// Linux imports each `iov_len` as a signed length and rejects one that does
+/// not fit before summing segments or waiting for socket data.
+fn validate_iovec_segment_lengths(iovecs: &[TargetIovec]) -> Result<(), i32> {
+    if iovecs.iter().any(|iov| iov.len > isize::MAX as usize) {
+        Err(libc::EINVAL)
+    } else {
+        Ok(())
     }
 }
 
