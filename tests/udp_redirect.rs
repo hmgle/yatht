@@ -488,6 +488,43 @@ fn stable_udp_matches_address_semantics() {
     );
 }
 
+fn assert_udp_name_length_semantics(socket_mode: Option<&str>) {
+    let (_probe_dir, probe) = build_udp_name_length_probe();
+    let output = match socket_mode {
+        Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--proxy")
+            .arg("socks5://127.0.0.1:9")
+            .arg("--enable-udp")
+            .arg("--")
+            .arg(&probe)
+            .output()
+            .unwrap(),
+        None => Command::new(&probe).output().unwrap(),
+    };
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "name-lengths-ok");
+}
+
+#[test]
+fn direct_kernel_udp_name_length_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_udp_name_length_semantics(None);
+}
+
+#[test]
+fn stable_udp_preserves_name_length_semantics() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_udp_name_length_semantics(Some("stable"));
+}
+
 #[test]
 fn direct_kernel_udp_send_destination_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -3230,6 +3267,82 @@ int main(void) {
 
     if (write(STDOUT_FILENO, "address-semantics-ok", 20) != 20) return 20;
     return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_name_length_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_name_length_probe.c");
+    let bin = dir.path().join("udp_name_length_probe");
+    fs::write(
+        &src,
+        r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int check_getsockname(int fd) {
+    socklen_t zero = 0;
+    if (getsockname(fd, NULL, &zero) != 0 || zero != sizeof(struct sockaddr_in)) return -1;
+
+    struct sockaddr_in address;
+    memset(&address, 0xaa, sizeof(address));
+    struct sockaddr_in unchanged = address;
+    socklen_t negative = (socklen_t)-1;
+    errno = 0;
+    if (getsockname(fd, (struct sockaddr *)&address, &negative) != -1 ||
+        errno != EINVAL || negative != (socklen_t)-1 ||
+        memcmp(&address, &unchanged, sizeof(address)) != 0) return -1;
+    return 0;
+}
+
+static int check_getpeername(int fd) {
+    socklen_t zero = 0;
+    if (getpeername(fd, NULL, &zero) != 0 || zero != sizeof(struct sockaddr_in)) return -1;
+
+    struct sockaddr_in address;
+    memset(&address, 0xaa, sizeof(address));
+    struct sockaddr_in unchanged = address;
+    socklen_t negative = (socklen_t)-1;
+    errno = 0;
+    if (getpeername(fd, (struct sockaddr *)&address, &negative) != -1 ||
+        errno != EINVAL || negative != (socklen_t)-1 ||
+        memcmp(&address, &unchanged, sizeof(address)) != 0) return -1;
+    return 0;
+}
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 2;
+    if (check_getsockname(fd) != 0) return 3;
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(9);
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != 0) return 4;
+    if (check_getpeername(fd) != 0) return 5;
+
+    if (write(STDOUT_FILENO, "name-lengths-ok", 15) != 15) return 6;
+    return close(fd);
 }
 "#,
     )

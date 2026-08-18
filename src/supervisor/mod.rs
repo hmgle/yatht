@@ -1594,17 +1594,25 @@ fn handle_getsockname(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRe
         seccomp::send_continue(listener_fd, notif.id);
         return;
     }
-    if addr == 0 || addr_len_ptr == 0 {
+    if addr_len_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
-    let addr_len = match read_socklen(notif.pid, addr_len_ptr) {
-        Ok(addr_len) => addr_len,
+    let addr_len = match read_signed_socklen(notif.pid, addr_len_ptr) {
+        Ok(addr_len) if addr_len >= 0 => addr_len as u32,
+        Ok(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+            return;
+        }
         Err(_) => {
             seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
             return;
         }
     };
+    if addr_len > 0 && addr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
     let local = handle
         .local_bind()
         .unwrap_or_else(|| handle.unspecified_destination());
@@ -1643,17 +1651,25 @@ fn handle_getpeername(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRe
         seccomp::send_errno(listener_fd, notif.id, libc::ENOTCONN);
         return;
     };
-    if addr == 0 || addr_len_ptr == 0 {
+    if addr_len_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
-    let addr_len = match read_socklen(notif.pid, addr_len_ptr) {
-        Ok(addr_len) => addr_len,
+    let addr_len = match read_signed_socklen(notif.pid, addr_len_ptr) {
+        Ok(addr_len) if addr_len >= 0 => addr_len as u32,
+        Ok(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+            return;
+        }
         Err(_) => {
             seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
             return;
         }
     };
+    if addr_len > 0 && addr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
@@ -4972,7 +4988,9 @@ fn write_sockaddr_result(
 ) -> io::Result<()> {
     let (raw, raw_len) = sockaddr_bytes(udp_domain_logical_address(domain, source));
     let write_len = (addr_len as usize).min(raw_len);
-    write_proc_bytes(pid, addr, &raw[..write_len])?;
+    if write_len > 0 {
+        write_proc_bytes(pid, addr, &raw[..write_len])?;
+    }
     write_proc_bytes(pid, addr_len_ptr, &(raw_len as u32).to_ne_bytes())
 }
 
