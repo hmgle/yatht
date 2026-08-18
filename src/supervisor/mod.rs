@@ -4495,7 +4495,9 @@ fn read_bind_destination(
 
 fn remote_udp_domain(pid: u32, fd: RawFd) -> Option<i32> {
     let target = duplicate_remote_fd(pid, fd).ok()?;
-    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM) {
+    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
+        || socket_protocol_from_fd(target.as_raw_fd()) != Some(libc::IPPROTO_UDP)
+    {
         return None;
     }
     socket_domain_from_fd(target.as_raw_fd())
@@ -5085,6 +5087,25 @@ fn socket_domain_from_fd(fd: RawFd) -> Option<i32> {
         None
     } else {
         Some(domain)
+    }
+}
+
+fn socket_protocol_from_fd(fd: RawFd) -> Option<i32> {
+    let mut protocol: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&protocol) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PROTOCOL,
+            (&mut protocol as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        None
+    } else {
+        Some(protocol)
     }
 }
 

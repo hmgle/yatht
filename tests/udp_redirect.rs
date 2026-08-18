@@ -2913,12 +2913,49 @@ static int check_stale_fd(void) {
     return 0;
 }
 
+static int check_udplite_send(int use_sendmsg) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDPLITE);
+    if (fd < 0) return -1;
+    struct sockaddr_in destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &destination.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+
+    if (use_sendmsg) {
+        char payload = 'x';
+        struct iovec iov = { .iov_base = &payload, .iov_len = 1 };
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_name = &destination;
+        msg.msg_namelen = sizeof(destination);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        (void)sendmsg(fd, &msg, MSG_DONTWAIT);
+    } else {
+        (void)sendto(fd, "x", 1, MSG_DONTWAIT,
+                     (struct sockaddr *)&destination, sizeof(destination));
+    }
+
+    int protocol = 0;
+    socklen_t length = sizeof(protocol);
+    int result = getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &length);
+    close(fd);
+    return result == 0 && length == sizeof(protocol) &&
+           protocol == IPPROTO_UDPLITE ? 0 : -1;
+}
+
 int main(void) {
     if (check_unix_pair(SOCK_STREAM, 0) != 0) return 2;
     if (check_unix_pair(SOCK_DGRAM, 1) != 0) return 3;
     if (check_tcp() != 0) return 4;
     if (check_stale_fd() != 0) return 5;
-    if (write(STDOUT_FILENO, "cross-protocol-send-ok", 22) != 22) return 6;
+    if (check_udplite_send(0) != 0) return 6;
+    if (check_udplite_send(1) != 0) return 7;
+    if (write(STDOUT_FILENO, "cross-protocol-send-ok", 22) != 22) return 8;
     return 0;
 }
 "#,
