@@ -108,9 +108,9 @@ immediately. Resource exhaustion is fail-closed and classified in the summary.
 
 ### Runtime environment selectors
 
-The TCP broker data plane exposes environment selectors. The defaults are the
-supported configuration; the alternates exist for rollback and for opt-in
-experiments. Unsupported values fail startup instead of being ignored.
+The data plane exposes environment selectors. The defaults are the supported
+configuration; the alternates exist for rollback and for opt-in experiments.
+Unsupported values fail startup instead of being ignored.
 
 - `SUP_TCP_REACTOR=epoll|poll`: readiness backend. Default `epoll`; `poll` is
   the explicit rollback path.
@@ -126,6 +126,12 @@ experiments. Unsupported values fail startup instead of being ignored.
   a 30 s idle timeout; each warm session serves exactly one flow and misses
   fall back to cold dials. It mainly benefits short-connection bursts against
   proxies with non-trivial RTT.
+- `SUP_UDP_SOCKET_MODE=lazy|stable`: UDP socket identity model, applied only
+  with `--enable-udp`. Default `lazy` replaces the descriptor on the first
+  proxied send. `stable` is experimental and injects the relay endpoint at
+  `socket(2)` time, which keeps the open file description stable across
+  `dup(2)`, `fork(2)`, and close races and enables the virtualized
+  `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
 
 ## Compatibility and Limitations
 
