@@ -3292,19 +3292,43 @@ fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
 }
 
 impl UdpRelayRegistry {
+    /// Closes stable relays whose target socket is gone. Only relays that were
+    /// already published when the sweep started are eligible: `/proc/net/unix`
+    /// is generated as it is read, so a socket that a concurrent
+    /// `create_stable` opens while the read is in flight can be missing from
+    /// the snapshot even though it is alive. Taking the candidate list before
+    /// the read keeps such a relay from being shut down at birth and from
+    /// releasing an admission slot its creator still holds.
     fn reap_closed_stable(&self) -> io::Result<usize> {
-        if self.stable_by_cookie.lock().unwrap().is_empty() {
+        let candidates = self
+            .stable_by_cookie
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(cookie, handle)| (*cookie, handle.target_identity))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
             return Ok(0);
         }
 
         let live_inodes = unix_socket_inodes()?;
         let removed = {
             let mut stable = self.stable_by_cookie.lock().unwrap();
-            let closed = stable
-                .iter()
-                .filter(|(_, handle)| !live_inodes.contains(&handle.target_identity.ino))
-                .map(|(cookie, handle)| (*cookie, handle.clone()))
-                .collect::<Vec<_>>();
+            let mut closed = Vec::new();
+            for (cookie, identity) in &candidates {
+                if live_inodes.contains(&identity.ino) {
+                    continue;
+                }
+                // Reap only the handle the candidate list saw. A replacement
+                // published under the same cookie since then has its own
+                // socket and must not inherit this verdict.
+                match stable.get(cookie) {
+                    Some(handle) if handle.target_identity == *identity => {
+                        closed.push((*cookie, handle.clone()));
+                    }
+                    _ => continue,
+                }
+            }
             for (cookie, _) in &closed {
                 stable.remove(cookie);
             }
@@ -5873,6 +5897,87 @@ mod tests {
         }
         assert_eq!(registry.active.load(Ordering::Acquire), 0);
         assert!(shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
+        // Mirrors `create_stable`'s publish order against a sweep running in
+        // parallel. Every target socket stays open for its whole batch, so a
+        // relay that gets shut down or loses its admission slot was reaped
+        // purely because the sweep's snapshot predates it.
+        let registry = Arc::new(UdpRelayRegistry::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let reaper_registry = Arc::clone(&registry);
+        let reaper_stop = Arc::clone(&stop);
+        let reaper = thread::spawn(move || {
+            while !reaper_stop.load(Ordering::Relaxed) {
+                reaper_registry.reap_closed_stable().unwrap();
+            }
+        });
+
+        for batch in 0..20_usize {
+            let mut live = Vec::new();
+            for index in 0..32_usize {
+                let mut slot = registry.reserve_relay_slot().unwrap();
+                let (relay, target) = make_relay_pair().unwrap();
+                let (tx, _rx) = channel::bounded(1);
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
+                let key = relay_key(1, (batch * 32 + index) as RawFd);
+                let handle = UdpRelayHandle {
+                    tx,
+                    default_dest: Arc::new(Mutex::new(None)),
+                    local_bind: Arc::new(Mutex::new(None)),
+                    pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+                    relay_fd: Arc::new(relay),
+                    target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+                    target_cookie,
+                    domain: libc::AF_INET,
+                    stable: true,
+                    shutdown: Arc::clone(&shutdown),
+                };
+                registry
+                    .stable_by_cookie
+                    .lock()
+                    .unwrap()
+                    .insert(target_cookie, handle.clone());
+                // Stands in for the ADDFD round trip inside `create_stable`.
+                thread::yield_now();
+                registry
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .insert(key, RelayState::Ready(handle));
+                slot.commit();
+                live.push((target, shutdown, target_cookie, key));
+            }
+
+            thread::sleep(Duration::from_millis(5));
+            for (_, shutdown, cookie, _) in &live {
+                assert!(
+                    !shutdown.load(Ordering::SeqCst),
+                    "sweep closed a live stable relay"
+                );
+                assert!(
+                    registry
+                        .stable_by_cookie
+                        .lock()
+                        .unwrap()
+                        .contains_key(cookie),
+                    "sweep dropped a live stable relay"
+                );
+            }
+            assert_eq!(registry.active.load(Ordering::Acquire), live.len());
+
+            for (_, _, cookie, key) in &live {
+                registry.stable_by_cookie.lock().unwrap().remove(cookie);
+                registry.inner.lock().unwrap().remove(key);
+                registry.release_relay_slot();
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        reaper.join().unwrap();
     }
 
     #[test]
