@@ -40,6 +40,15 @@ const SOCKADDR_IN6_SIZE: usize = 28;
 const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_UDP_RELAYS: usize = 128;
 const STABLE_RELAY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+// `/proc/net/unix` is host-wide, so re-reading it costs work proportional to
+// the machine rather than to the relays this supervisor owns. Sweeps that
+// reclaim nothing back off geometrically once the grace window passes; a
+// reclaim or a newly published relay restores the base cadence.
+const STABLE_RELAY_SWEEP_MAX_INTERVAL: Duration = Duration::from_secs(30);
+const STABLE_RELAY_SWEEP_IDLE_GRACE: u32 = 5;
+// Reclaiming a relay is never latency critical, so the sweep yields to the
+// notification workers and the receive reactor on a busy host.
+const STABLE_RELAY_REAPER_NICE: libc::c_int = 5;
 // Admission only waits when the relay budget is exhausted, so a short retry
 // tolerates procfs lagging a concurrent close without slowing normal creation.
 const STABLE_RELAY_REAP_ATTEMPTS: u32 = 3;
@@ -694,6 +703,24 @@ fn notification_loop(
             )
         }));
     }
+    let mut reaper_thread = None;
+    if cfg.enable_udp && cfg.udp_socket_mode == UdpSocketMode::Stable {
+        let reaper_relays = Arc::clone(&relays);
+        let reaper_debug = cfg.debug;
+        match thread::Builder::new()
+            .name("yatht-udp-reap".to_string())
+            .spawn(move || stable_relay_reaper(reaper_relays, reaper_debug))
+        {
+            Ok(thread) => reaper_thread = Some(thread),
+            Err(err) => {
+                failure.report("spawn stable UDP relay reaper", err);
+                drop(tx);
+                join_notification_workers(worker_threads, &failure);
+                return;
+            }
+        }
+    }
+
     let mut blocking_thread = None;
     let blocking_queue = if cfg.enable_dns || cfg.enable_udp {
         let (blocking_tx, blocking_rx) = channel::unbounded::<BlockingRecvNotification>();
@@ -702,7 +729,9 @@ fn notification_loop(
             Err(err) => {
                 failure.report("create blocking receive wake fd", err);
                 drop(tx);
+                relays.stop_stable_relay_reaper();
                 join_notification_workers(worker_threads, &failure);
+                join_stable_relay_reaper(reaper_thread, &failure);
                 return;
             }
         };
@@ -711,7 +740,6 @@ fn notification_loop(
         let reactor_failure = Arc::clone(&failure);
         let loop_failure = Arc::clone(&failure);
         let reactor_wake_fd = Arc::clone(&wake_fd);
-        let reactor_debug = cfg.debug;
         blocking_thread = Some(thread::spawn(move || {
             if std::panic::catch_unwind(|| {
                 blocking_recv_reactor(
@@ -721,7 +749,6 @@ fn notification_loop(
                     reactor_relays,
                     reactor_failure,
                     worker_count,
-                    reactor_debug,
                 )
             })
             .is_err()
@@ -814,11 +841,25 @@ fn notification_loop(
     }
     drop(tx);
     drop(blocking_queue);
+    relays.stop_stable_relay_reaper();
     join_notification_workers(worker_threads, &failure);
     if blocking_thread.is_some_and(|thread| thread.join().is_err()) {
         failure.report(
             "blocking receive reactor panicked",
             io::Error::other("blocking receive reactor panicked"),
+        );
+    }
+    join_stable_relay_reaper(reaper_thread, &failure);
+}
+
+fn join_stable_relay_reaper(
+    reaper_thread: Option<thread::JoinHandle<()>>,
+    failure: &NotificationFailure,
+) {
+    if reaper_thread.is_some_and(|thread| thread.join().is_err()) {
+        failure.report(
+            "stable UDP relay reaper panicked",
+            io::Error::other("stable UDP relay reaper panicked"),
         );
     }
 }
@@ -1185,7 +1226,6 @@ fn blocking_recv_reactor(
     relays: Arc<UdpRelayRegistry>,
     failure: Arc<NotificationFailure>,
     worker_count: usize,
-    debug: bool,
 ) {
     let (work_tx, work_rx) = channel::bounded::<BlockingRecvWork>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
@@ -1217,7 +1257,6 @@ fn blocking_recv_reactor(
     let mut in_flight = HashSet::<FdIdentity>::new();
     let validity_interval = Duration::from_millis(BLOCKING_RECV_POLL_INTERVAL_MS as u64);
     let mut last_validity_sweep = Instant::now();
-    let mut last_relay_sweep = Instant::now();
     let mut channels_may_have_more = false;
     let mut pollfds = Vec::<libc::pollfd>::new();
 
@@ -1281,11 +1320,6 @@ fn blocking_recv_reactor(
                 }
             }
             last_validity_sweep = Instant::now();
-        }
-
-        if last_relay_sweep.elapsed() >= STABLE_RELAY_SWEEP_INTERVAL {
-            relays.reap_closed_stable_best_effort(debug);
-            last_relay_sweep = Instant::now();
         }
 
         let mut completed = 0;
@@ -3164,6 +3198,52 @@ struct UdpRelayRegistry {
     active: AtomicUsize,
     stable_addfd_unsupported: AtomicBool,
     stable_reap_warning_reported: AtomicBool,
+    reaper: StableRelayReaper,
+}
+
+#[derive(Default)]
+struct StableRelayReaper {
+    state: Mutex<StableRelayReaperState>,
+    signal: Condvar,
+}
+
+#[derive(Default)]
+struct StableRelayReaperState {
+    stop: bool,
+    published: bool,
+}
+
+/// Sweep cadence for the stable relay reaper. Consecutive sweeps that reclaim
+/// nothing extend the wait geometrically once the grace window passes, so a
+/// quiet supervisor stops re-reading the host-wide `/proc/net/unix`. Capacity
+/// is never lost to a long interval: exhausted admission sweeps on demand.
+#[derive(Clone, Copy, Default)]
+struct StableSweepCadence {
+    idle_sweeps: u32,
+}
+
+impl StableSweepCadence {
+    fn interval(self) -> Duration {
+        let steps = self
+            .idle_sweeps
+            .saturating_sub(STABLE_RELAY_SWEEP_IDLE_GRACE);
+        let factor = 1_u32.checked_shl(steps).unwrap_or(u32::MAX);
+        STABLE_RELAY_SWEEP_INTERVAL
+            .saturating_mul(factor)
+            .min(STABLE_RELAY_SWEEP_MAX_INTERVAL)
+    }
+
+    fn record_sweep(&mut self, reclaimed: usize) {
+        if reclaimed > 0 {
+            self.restart();
+        } else {
+            self.idle_sweeps = self.idle_sweeps.saturating_add(1);
+        }
+    }
+
+    fn restart(&mut self) {
+        self.idle_sweeps = 0;
+    }
 }
 
 #[derive(Clone)]
@@ -3400,11 +3480,13 @@ impl UdpRelayRegistry {
         })
     }
 
-    fn reap_closed_stable_best_effort(&self, debug: bool) {
+    fn reap_closed_stable_best_effort(&self, debug: bool) -> usize {
         match self.reap_closed_stable() {
-            Ok(_) => self
-                .stable_reap_warning_reported
-                .store(false, Ordering::Release),
+            Ok(reclaimed) => {
+                self.stable_reap_warning_reported
+                    .store(false, Ordering::Release);
+                reclaimed
+            }
             Err(err) => {
                 let first = !self
                     .stable_reap_warning_reported
@@ -3412,7 +3494,44 @@ impl UdpRelayRegistry {
                 if debug && first {
                     eprintln!("yatht: stable UDP relay cleanup skipped: {err}");
                 }
+                0
             }
+        }
+    }
+
+    /// Restores the base sweep cadence. A newly published stable relay is the
+    /// only event the supervisor can observe that makes a quiet process worth
+    /// sweeping often again; the target-side close the sweep looks for happens
+    /// entirely outside its view.
+    fn notify_stable_relay_published(&self) {
+        self.reaper.state.lock().unwrap().published = true;
+        self.reaper.signal.notify_all();
+    }
+
+    fn stop_stable_relay_reaper(&self) {
+        self.reaper.state.lock().unwrap().stop = true;
+        self.reaper.signal.notify_all();
+    }
+
+    /// Sleeps until the next sweep is due, returning false once shutdown has
+    /// been requested. The remaining wait is always measured from the same
+    /// start, so a steady stream of newly published relays can only shorten
+    /// it and can never postpone a sweep indefinitely.
+    fn wait_for_next_stable_sweep(&self, cadence: &mut StableSweepCadence) -> bool {
+        let start = Instant::now();
+        let mut state = self.reaper.state.lock().unwrap();
+        loop {
+            if state.stop {
+                return false;
+            }
+            if state.published {
+                state.published = false;
+                cadence.restart();
+            }
+            let Some(remaining) = cadence.interval().checked_sub(start.elapsed()) else {
+                return true;
+            };
+            state = self.reaper.signal.wait_timeout(state, remaining).unwrap().0;
         }
     }
 
@@ -3495,6 +3614,7 @@ impl UdpRelayRegistry {
             .lock()
             .unwrap()
             .insert(target_cookie, handle.clone());
+        self.notify_stable_relay_published();
         let mut addfd = SeccompNotifAddfd {
             id: notif.id,
             flags: seccomp::ADDFD_FLAG_SEND,
@@ -3813,6 +3933,31 @@ impl UdpRelayRegistry {
             handle.shutdown();
             self.release_relay_slot();
         }
+    }
+}
+
+/// Reclaims stable relays whose target socket is gone. The scan reads the
+/// host-wide `/proc/net/unix`, whose size and parse cost track the machine
+/// rather than the relays this supervisor owns, so it runs on its own thread
+/// instead of on the blocking-receive reactor where a multi-millisecond stall
+/// would delay already-ready receives and armed `SO_RCVTIMEO`/`recvmmsg`
+/// deadlines.
+fn stable_relay_reaper(relays: Arc<UdpRelayRegistry>, debug: bool) {
+    lower_current_thread_priority(STABLE_RELAY_REAPER_NICE);
+    let mut cadence = StableSweepCadence::default();
+    while relays.wait_for_next_stable_sweep(&mut cadence) {
+        cadence.record_sweep(relays.reap_closed_stable_best_effort(debug));
+    }
+}
+
+/// Best-effort `nice` for the calling thread only. Linux scopes `PRIO_PROCESS`
+/// to a single task when given a tid, so the notification workers and the
+/// receive reactor keep their original priority. Failure only means the sweep
+/// competes for CPU on equal terms.
+fn lower_current_thread_priority(nice: libc::c_int) {
+    let tid = unsafe { libc::gettid() };
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS as _, tid as libc::id_t, nice);
     }
 }
 
@@ -6046,6 +6191,104 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         reaper.join().unwrap();
+    }
+
+    #[test]
+    fn stable_sweep_cadence_backs_off_only_after_the_grace_window() {
+        let mut cadence = StableSweepCadence::default();
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_INTERVAL);
+
+        for _ in 0..STABLE_RELAY_SWEEP_IDLE_GRACE {
+            cadence.record_sweep(0);
+            assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_INTERVAL);
+        }
+
+        cadence.record_sweep(0);
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_INTERVAL * 2);
+        cadence.record_sweep(0);
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_INTERVAL * 4);
+    }
+
+    #[test]
+    fn stable_sweep_cadence_caps_and_restarts() {
+        let mut cadence = StableSweepCadence::default();
+        for _ in 0..64 {
+            cadence.record_sweep(0);
+        }
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_MAX_INTERVAL);
+
+        cadence.record_sweep(1);
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_INTERVAL);
+    }
+
+    #[test]
+    fn stable_relay_reaper_stops_without_waiting_out_its_interval() {
+        let registry = Arc::new(UdpRelayRegistry::default());
+        let reaper_registry = Arc::clone(&registry);
+        let reaper = thread::spawn(move || stable_relay_reaper(reaper_registry, false));
+
+        registry.stop_stable_relay_reaper();
+        let start = Instant::now();
+        reaper.join().unwrap();
+
+        assert!(
+            start.elapsed() < STABLE_RELAY_SWEEP_INTERVAL,
+            "reaper did not observe the stop request: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn publishing_a_relay_shortens_a_backed_off_sweep_wait() {
+        let registry = Arc::new(UdpRelayRegistry::default());
+        let mut cadence = StableSweepCadence::default();
+        for _ in 0..64 {
+            cadence.record_sweep(0);
+        }
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_MAX_INTERVAL);
+
+        let publisher_registry = Arc::clone(&registry);
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            publisher_registry.notify_stable_relay_published();
+        });
+
+        let start = Instant::now();
+        assert!(registry.wait_for_next_stable_sweep(&mut cadence));
+        let waited = start.elapsed();
+        publisher.join().unwrap();
+
+        assert_eq!(cadence.interval(), STABLE_RELAY_SWEEP_INTERVAL);
+        assert!(
+            waited < STABLE_RELAY_SWEEP_INTERVAL * 2,
+            "a published relay did not shorten the backed-off wait: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_steady_publish_rate_cannot_postpone_a_sweep() {
+        let registry = Arc::new(UdpRelayRegistry::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let publisher_registry = Arc::clone(&registry);
+        let publisher_stop = Arc::clone(&stop);
+        let publisher = thread::spawn(move || {
+            while !publisher_stop.load(Ordering::Relaxed) {
+                publisher_registry.notify_stable_relay_published();
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let mut cadence = StableSweepCadence::default();
+        let start = Instant::now();
+        assert!(registry.wait_for_next_stable_sweep(&mut cadence));
+        let waited = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        publisher.join().unwrap();
+
+        assert!(
+            waited < STABLE_RELAY_SWEEP_INTERVAL * 2,
+            "a steady publish rate postponed the sweep: {waited:?}"
+        );
     }
 
     #[test]

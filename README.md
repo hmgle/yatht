@@ -162,11 +162,15 @@ the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Stable mode also enables the
 virtualized `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
 Active UDP relay creation is capped at 128, with a bounded 16-datagram input
-queue per relay. A low-frequency supervisor sweep reclaims relays whose AF_UNIX
-inode no longer has an open target-side alias; capacity-bound admission also
-sweeps and retries briefly. Normal socket creation does not scan procfs, and
-an unavailable `/proc/net/unix` delays cleanup instead of breaking creation
-while capacity remains.
+queue per relay. A dedicated low-priority supervisor thread reclaims relays
+whose AF_UNIX inode no longer has an open target-side alias, so its host-wide
+`/proc/net/unix` read never stalls the receive reactor. It sweeps every second
+and, after five consecutive sweeps that reclaim nothing, backs off up to 30
+seconds; reclaiming a relay or creating a new one restores the base cadence.
+Capacity-bound admission also sweeps and retries briefly, so a long backoff
+delays cleanup without costing capacity. Normal socket creation does not scan
+procfs, and an unavailable `/proc/net/unix` delays cleanup instead of breaking
+creation while capacity remains.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Sweep closed stable UDP relays on a dedicated low-priority thread instead of
+  the blocking-receive reactor, so the host-wide `/proc/net/unix` read no
+  longer delays ready receives or armed `SO_RCVTIMEO`/`recvmmsg` deadlines.
+  Sweeps that reclaim nothing back off from one second to at most 30.
 - Select the UDP socket identity model with `--udp-socket-mode=lazy|stable` or
   the `udp_socket_mode` configuration key, and reject `stable` without
   `--enable-udp` at startup. `SUP_UDP_SOCKET_MODE` remains a deprecated,
