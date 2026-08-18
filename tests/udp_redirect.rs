@@ -3623,13 +3623,20 @@ int main(void) {
     if (recvmmsg(fd, NULL, 0, MSG_DONTWAIT,
                  (struct timespec *)1) != -1 || errno != EFAULT) return 7;
 
+    msg.msg_hdr.msg_iovlen = 1025;
+    errno = 0;
+    if (recvmsg(fd, &msg.msg_hdr, MSG_DONTWAIT) != -1 || errno != EMSGSIZE) return 8;
+    errno = 0;
+    if (recvmmsg(fd, &msg, 1, MSG_DONTWAIT, NULL) != -1 || errno != EMSGSIZE) return 9;
+    msg.msg_hdr.msg_iovlen = 1;
+
     int status = fcntl(fd, F_GETFL, 0);
-    if (status < 0 || fcntl(fd, F_SETFL, status | O_NONBLOCK) != 0) return 8;
+    if (status < 0 || fcntl(fd, F_SETFL, status | O_NONBLOCK) != 0) return 10;
     errno = 0;
     if (recvmmsg(fd, &msg, 1, 0, NULL) != -1 ||
-        (errno != EAGAIN && errno != EWOULDBLOCK)) return 9;
+        (errno != EAGAIN && errno != EWOULDBLOCK)) return 11;
 
-    if (write(STDOUT_FILENO, "recvmmsg-errors-ok", 18) != 18) return 10;
+    if (write(STDOUT_FILENO, "recvmmsg-errors-ok", 18) != 18) return 12;
     return 0;
 }
 "#,

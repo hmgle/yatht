@@ -2249,6 +2249,16 @@ fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>,
     Ok((iovecs, total))
 }
 
+/// Imports a receive message's target segments with Linux's distinct errors
+/// for an excessive segment count and an unreadable iovec array.
+fn import_recv_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<Vec<TargetIovec>, i32> {
+    match read_iovec_targets(pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => Ok(iovecs),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Err(libc::EMSGSIZE),
+        Err(_) => Err(libc::EFAULT),
+    }
+}
+
 /// Answers a send whose call carries no destination pointer at all. The kernel
 /// drops such a name before the injected AF_UNIX endpoint sees it, so a relayed
 /// socket can simply continue and let its connected peer carry the datagram;
@@ -2795,10 +2805,10 @@ fn handle_recvmsg_once(
             return RecvHandling::Completed;
         }
     };
-    let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
+    let iovecs = match import_recv_iovecs(notif.pid, &msg) {
         Ok(iovecs) => iovecs,
-        Err(_) => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
             return RecvHandling::Completed;
         }
     };
@@ -2945,16 +2955,10 @@ fn handle_recvmmsg_once(
                 return RecvHandling::Completed;
             }
         };
-        let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
+        let iovecs = match import_recv_iovecs(notif.pid, &msg) {
             Ok(iovecs) => iovecs,
-            Err(_) => {
-                send_recvmmsg_result_or_errno(
-                    listener_fd,
-                    &notif,
-                    &state,
-                    Some(libc::EFAULT),
-                    false,
-                );
+            Err(errno) => {
+                send_recvmmsg_result_or_errno(listener_fd, &notif, &state, Some(errno), false);
                 return RecvHandling::Completed;
             }
         };
