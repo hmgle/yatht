@@ -648,6 +648,46 @@ fn lazy_udp_leaves_non_udp_sends_to_the_kernel() {
     assert_cross_protocol_sends_reach_the_kernel(Some("lazy"));
 }
 
+fn assert_connected_udplite_preserves_protocol(socket_mode: Option<&str>) {
+    let (_probe_dir, probe) = build_connected_udplite_probe();
+    let output = match socket_mode {
+        Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--proxy")
+            .arg("socks5://127.0.0.1:9")
+            .arg("--enable-udp")
+            .arg("--")
+            .arg(&probe)
+            .output()
+            .unwrap(),
+        None => Command::new(&probe).output().unwrap(),
+    };
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "connected-udplite-ok"
+    );
+}
+
+#[test]
+fn direct_kernel_connected_udplite_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_connected_udplite_preserves_protocol(None);
+}
+
+#[test]
+fn stable_udp_preserves_connected_udplite_protocol() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_connected_udplite_preserves_protocol(Some("stable"));
+}
+
 #[test]
 fn direct_kernel_udp_getsockopt_truncation_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -2957,6 +2997,54 @@ int main(void) {
     if (check_udplite_send(1) != 0) return 7;
     if (write(STDOUT_FILENO, "cross-protocol-send-ok", 22) != 22) return 8;
     return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_connected_udplite_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("connected_udplite_probe.c");
+    let bin = dir.path().join("connected_udplite_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDPLITE);
+    if (fd < 0) return 2;
+    struct sockaddr_in destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &destination.sin_addr) != 1) return 3;
+    if (connect(fd, (struct sockaddr *)&destination, sizeof(destination)) != 0) return 4;
+
+    int protocol = 0;
+    socklen_t length = sizeof(protocol);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &length) != 0 ||
+        length != sizeof(protocol) || protocol != IPPROTO_UDPLITE) return 5;
+    if (write(STDOUT_FILENO, "connected-udplite-ok", 20) != 20) return 6;
+    return close(fd);
 }
 "#,
     )

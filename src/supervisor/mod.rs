@@ -1804,9 +1804,10 @@ fn handle_connect(
         return;
     }
 
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
     let family = u16::from_ne_bytes(raw[0..2].try_into().unwrap()) as i32;
     if family == libc::AF_UNSPEC {
-        if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
+        if let Some(handle) = existing {
             handle.clear_default_dest();
             seccomp::send_success(listener_fd, notif.id);
         } else {
@@ -1822,7 +1823,7 @@ fn handle_connect(
             return;
         }
     };
-    if let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) {
+    if let Some(handle) = existing.as_ref() {
         if !handle.accepts_destination(dest) {
             seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
             return;
@@ -1851,8 +1852,10 @@ fn handle_connect(
     }
 
     let fd_inspection_started = Instant::now();
-    match socket_type(notif.pid, target_fd) {
-        Some(libc::SOCK_DGRAM) => {
+    match socket_type_and_protocol(notif.pid, target_fd) {
+        Some((libc::SOCK_DGRAM, protocol))
+            if protocol == libc::IPPROTO_UDP || existing.is_some() =>
+        {
             if let Some(kind) = udp_route_for(&cfg, dest) {
                 if !seccomp::notif_id_valid(listener_fd, notif.id) {
                     return;
@@ -1895,8 +1898,18 @@ fn handle_connect(
             seccomp::send_continue(listener_fd, notif.id);
             return;
         }
-        Some(libc::SOCK_STREAM) => {}
-        Some(other) => {
+        Some((libc::SOCK_DGRAM, protocol)) => {
+            if cfg.debug {
+                eprintln!(
+                    "yatht: unsupported datagram protocol {} for pid={} fd={}",
+                    protocol, notif.pid, target_fd
+                );
+            }
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        Some((libc::SOCK_STREAM, _)) => {}
+        Some((other, _)) => {
             if cfg.debug {
                 eprintln!(
                     "yatht: unsupported socket type {} for pid={} fd={}",
@@ -5047,9 +5060,12 @@ fn send_recv_error(listener_fd: RawFd, notif_id: u64, err: &io::Error) {
     seccomp::send_errno(listener_fd, notif_id, errno_from_io(err));
 }
 
-fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
+fn socket_type_and_protocol(pid: u32, fd: RawFd) -> Option<(i32, i32)> {
     let file = duplicate_remote_fd(pid, fd).ok()?;
-    socket_type_from_fd(file.as_raw_fd())
+    Some((
+        socket_type_from_fd(file.as_raw_fd())?,
+        socket_protocol_from_fd(file.as_raw_fd())?,
+    ))
 }
 
 fn socket_type_from_fd(fd: RawFd) -> Option<i32> {
@@ -5227,7 +5243,9 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
         }
         Err(err) => return Err(err).context("duplicate UDP target fd"),
     };
-    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM) {
+    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
+        || socket_protocol_from_fd(target.as_raw_fd()) != Some(libc::IPPROTO_UDP)
+    {
         return Ok(None);
     }
     let Some(domain) = socket_domain_from_fd(target.as_raw_fd()) else {
