@@ -534,6 +534,57 @@ fn stable_udp_matches_send_destination_semantics() {
     );
 }
 
+/// The UDP filter traps `sendmsg` for every fd, so a TCP, AF_UNIX or stale fd
+/// must keep the kernel's own limits rather than the 65535-byte datagram cap.
+fn assert_cross_protocol_sends_reach_the_kernel(socket_mode: Option<&str>) {
+    let (_probe_dir, probe) = build_cross_protocol_send_probe();
+    let output = match socket_mode {
+        Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--proxy")
+            .arg("socks5://127.0.0.1:9")
+            .arg("--enable-udp")
+            .arg("--")
+            .arg(&probe)
+            .output()
+            .unwrap(),
+        None => Command::new(&probe).output().unwrap(),
+    };
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "cross-protocol-send-ok"
+    );
+}
+
+#[test]
+fn direct_kernel_cross_protocol_send_baseline() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_cross_protocol_sends_reach_the_kernel(None);
+}
+
+#[test]
+fn stable_udp_leaves_non_udp_sends_to_the_kernel() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_cross_protocol_sends_reach_the_kernel(Some("stable"));
+}
+
+#[test]
+fn lazy_udp_leaves_non_udp_sends_to_the_kernel() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_cross_protocol_sends_reach_the_kernel(Some("lazy"));
+}
+
 #[test]
 fn direct_kernel_udp_getsockopt_truncation_baseline() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -2539,6 +2590,123 @@ int main(void) {
     (dir, bin)
 }
 
+fn build_cross_protocol_send_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("cross_protocol_send_probe.c");
+    let bin = dir.path().join("cross_protocol_send_probe");
+    fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+/* Comfortably past the 65535-byte UDP datagram limit. */
+static char bulk[70000];
+
+static int widen(int fd) {
+    int size = 400000;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) != 0) return -1;
+    return setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+}
+
+static ssize_t send_bulk(int fd) {
+    struct iovec iov = { .iov_base = bulk, .iov_len = sizeof(bulk) };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    errno = 0;
+    return sendmsg(fd, &msg, MSG_DONTWAIT);
+}
+
+/* An AF_UNIX datagram carries the whole message or none of it, so it pins the
+ * limit exactly; a stream may legitimately accept only part of it. */
+static int check_unix_pair(int type, int atomic) {
+    int fds[2];
+    if (socketpair(AF_UNIX, type | SOCK_CLOEXEC, 0, fds) != 0) return -1;
+    if (widen(fds[0]) != 0 || widen(fds[1]) != 0) { close(fds[0]); close(fds[1]); return -1; }
+    ssize_t sent = send_bulk(fds[0]);
+    close(fds[0]);
+    close(fds[1]);
+    if (atomic) return sent == (ssize_t)sizeof(bulk) ? 0 : -1;
+    return sent > 0 ? 0 : -1;
+}
+
+static int check_tcp(void) {
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) return -1;
+    socklen_t length = sizeof(address);
+    if (bind(listener, (struct sockaddr *)&address, length) != 0 ||
+        listen(listener, 1) != 0 ||
+        getsockname(listener, (struct sockaddr *)&address, &length) != 0) {
+        close(listener);
+        return -1;
+    }
+
+    int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0) { close(listener); return -1; }
+    if (connect(client, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(client);
+        close(listener);
+        return -1;
+    }
+    int served = accept(listener, NULL, NULL);
+    close(listener);
+    if (served < 0) { close(client); return -1; }
+    if (widen(client) != 0 || widen(served) != 0) { close(client); close(served); return -1; }
+
+    ssize_t sent = send_bulk(client);
+    close(client);
+    close(served);
+    return sent > 0 ? 0 : -1;
+}
+
+/* A closed fd outranks anything the message itself might be wrong about. */
+static int check_stale_fd(void) {
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = (struct iovec *)1;
+    msg.msg_iovlen = 1;
+    errno = 0;
+    if (sendmsg(-1, &msg, 0) != -1 || errno != EBADF) return -1;
+    return 0;
+}
+
+int main(void) {
+    if (check_unix_pair(SOCK_STREAM, 0) != 0) return 2;
+    if (check_unix_pair(SOCK_DGRAM, 1) != 0) return 3;
+    if (check_tcp() != 0) return 4;
+    if (check_stale_fd() != 0) return 5;
+    if (write(STDOUT_FILENO, "cross-protocol-send-ok", 22) != 22) return 6;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
 fn build_udp_send_destination_probe() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("udp_send_destination_probe.c");
@@ -2549,6 +2717,7 @@ fn build_udp_send_destination_probe() -> (TempDir, PathBuf) {
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -2655,6 +2824,8 @@ static int check_iovec_import_order(void) {
     static char small[1];
     static struct iovec many[2000];
     struct iovec huge = { .iov_base = small, .iov_len = 200000 };
+    struct iovec signed_max = { .iov_base = small, .iov_len = (size_t)SSIZE_MAX };
+    struct iovec unsigned_max = { .iov_base = small, .iov_len = (size_t)-1 };
     struct iovec bad_base = { .iov_base = (void *)1, .iov_len = 1 };
     for (int index = 0; index < 2000; index++) {
         many[index].iov_base = small;
@@ -2689,6 +2860,12 @@ static int check_iovec_import_order(void) {
         errno != EMSGSIZE) { close(fd); return -1; }
     if (SEND_MSG(&ipv4, 0, many, 2000) != -1 ||
         errno != EMSGSIZE) { close(fd); return -1; }
+    /* A length that still fits a signed ssize_t is merely too long; one that
+     * does not is rejected outright while the array is imported. */
+    if (SEND_MSG(&ipv4, 0, &signed_max, 1) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    if (SEND_MSG(&ipv4, 0, &unsigned_max, 1) != -1 ||
+        errno != EINVAL) { close(fd); return -1; }
     if (SEND_MSG(&ipv4, 0, &bad_base, 1) != -1 ||
         errno != EDESTADDRREQ) { close(fd); return -1; }
 
@@ -2703,6 +2880,9 @@ static int check_iovec_import_order(void) {
     batch.msg_hdr.msg_iov = &huge;
     errno = 0;
     if (sendmmsg(fd, &batch, 1, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
+    batch.msg_hdr.msg_iov = &unsigned_max;
+    errno = 0;
+    if (sendmmsg(fd, &batch, 1, 0) != -1 || errno != EINVAL) { close(fd); return -1; }
     batch.msg_hdr.msg_iov = &bad_base;
     errno = 0;
     if (sendmmsg(fd, &batch, 1, 0) != -1 || errno != EDESTADDRREQ) { close(fd); return -1; }

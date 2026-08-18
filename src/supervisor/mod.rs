@@ -2213,6 +2213,10 @@ fn handle_sendto(
 /// first cannot answer `EDESTADDRREQ` where Linux answers `EFAULT` or
 /// `EMSGSIZE`. Reading the buffers themselves must stay after the destination
 /// verdict, which is where the kernel copies them.
+///
+/// The UDP payload limit makes this valid only once the fd is known to be a
+/// UDP socket yatht answers for; callers must not apply it to a TCP or
+/// AF_UNIX fd that merely tripped the same syscall filter.
 fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>, usize), i32> {
     let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
@@ -2220,6 +2224,11 @@ fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>,
         Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Err(libc::EMSGSIZE),
         Err(_) => return Err(libc::EFAULT),
     };
+    // Linux reads each `iov_len` as a signed length and rejects one that does
+    // not fit before it ever sums them.
+    if iovecs.iter().any(|iov| iov.len > isize::MAX as usize) {
+        return Err(libc::EINVAL);
+    }
     // Match the sendto path: an oversized datagram cannot be sent, so report
     // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
     let total = iovec_total_len(&iovecs).map_err(|_| libc::EMSGSIZE)?;
@@ -2336,12 +2345,21 @@ fn handle_sendmsg(
         }
     };
     let existing = relays.lookup_handle(notif.pid, target_fd, true);
-    let (iovecs, total) = match import_send_iovecs(notif.pid, &msg) {
-        Ok(imported) => imported,
-        Err(errno) => {
-            seccomp::send_errno(listener_fd, notif.id, errno);
-            return;
+    // The filter traps the syscall, not the socket, so TCP, AF_UNIX and stale
+    // fds arrive here too. Only an fd yatht already relays is known to be a UDP
+    // socket, so only that one takes the UDP-shaped import ahead of the
+    // destination verdict. Every other fd keeps reaching the kernel below,
+    // which answers with its own limits.
+    let relayed_import = if existing.is_some() {
+        match import_send_iovecs(notif.pid, &msg) {
+            Ok(imported) => Some(imported),
+            Err(errno) => {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return;
+            }
         }
+    } else {
+        None
     };
     // `sendmsg(2)` drops a zero-length name, so both cases leave the datagram
     // without an explicit destination.
@@ -2392,6 +2410,18 @@ fn handle_sendmsg(
         }
     };
 
+    // A plain fd reaches here only once an explicit name proved this is a
+    // routable UDP send, so the UDP limits finally apply to it as well.
+    let (iovecs, total) = match relayed_import {
+        Some(imported) => imported,
+        None => match import_send_iovecs(notif.pid, &msg) {
+            Ok(imported) => imported,
+            Err(errno) => {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return;
+            }
+        },
+    };
     let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
         Ok(payload) => payload,
         Err(_) => {
