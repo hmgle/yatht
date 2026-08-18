@@ -123,6 +123,11 @@ pub struct Socks5UdpAssociation {
     recv_buf: Vec<u8>,
 }
 
+pub struct Socks5UdpResponse {
+    pub source: Destination,
+    pub payload: Vec<u8>,
+}
+
 impl Socks5UdpAssociation {
     pub fn connect(proxy: &ProxyConfig, deadline: Deadline) -> Result<Self> {
         let ProxyConfig::Socks5 {
@@ -170,16 +175,20 @@ impl Socks5UdpAssociation {
         dest: Destination,
         payload: &[u8],
         deadline: Deadline,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Socks5UdpResponse>> {
         let packet = encode_socks5_udp(dest, payload)?;
         self.udp.set_write_timeout(Some(deadline.remaining()?))?;
         self.udp.send(&packet)?;
 
         self.udp.set_read_timeout(Some(deadline.remaining()?))?;
         match self.udp.recv(&mut self.recv_buf) {
-            Ok(n) => Ok(Some(
-                decode_socks5_udp_payload(&self.recv_buf[..n])?.to_vec(),
-            )),
+            Ok(n) => {
+                let (source, payload) = decode_socks5_udp_response(&self.recv_buf[..n])?;
+                Ok(Some(Socks5UdpResponse {
+                    source: source.unwrap_or(dest),
+                    payload: payload.to_vec(),
+                }))
+            }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
@@ -403,29 +412,52 @@ fn encode_socks5_udp(dest: Destination, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_socks5_udp_payload(packet: &[u8]) -> Result<&[u8]> {
+fn decode_socks5_udp_response(packet: &[u8]) -> Result<(Option<Destination>, &[u8])> {
     if packet.len() < 4 {
         bail!("short SOCKS5 UDP packet");
     }
     if packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
         bail!("fragmented SOCKS5 UDP packets are not supported");
     }
-    let addr_len = match packet[3] {
-        0x01 => 4,
+    let (source, addr_len) = match packet[3] {
+        0x01 => {
+            if packet.len() < 10 {
+                bail!("short SOCKS5 UDP IPv4 packet");
+            }
+            (
+                Some(Destination {
+                    ip: IpAddr::V4(Ipv4Addr::new(packet[4], packet[5], packet[6], packet[7])),
+                    port: u16::from_be_bytes([packet[8], packet[9]]),
+                }),
+                4,
+            )
+        }
         0x03 => {
             if packet.len() < 5 {
                 bail!("short SOCKS5 UDP domain packet");
             }
-            1 + packet[4] as usize
+            (None, 1 + packet[4] as usize)
         }
-        0x04 => 16,
+        0x04 => {
+            if packet.len() < 22 {
+                bail!("short SOCKS5 UDP IPv6 packet");
+            }
+            let octets: [u8; 16] = packet[4..20].try_into().unwrap();
+            (
+                Some(Destination {
+                    ip: IpAddr::V6(Ipv6Addr::from(octets)),
+                    port: u16::from_be_bytes([packet[20], packet[21]]),
+                }),
+                16,
+            )
+        }
         atyp => bail!("bad SOCKS5 UDP address type {atyp:#x}"),
     };
     let payload_offset = 4 + addr_len + 2;
     if packet.len() < payload_offset {
         bail!("short SOCKS5 UDP packet");
     }
-    Ok(&packet[payload_offset..])
+    Ok((source, &packet[payload_offset..]))
 }
 
 fn dial_http_connect_with_timings(
@@ -749,7 +781,15 @@ mod tests {
             payload,
         )
         .unwrap();
-        assert_eq!(decode_socks5_udp_payload(&packet).unwrap(), payload);
+        let (source, decoded_payload) = decode_socks5_udp_response(&packet).unwrap();
+        assert_eq!(
+            source,
+            Some(Destination {
+                ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                port: 5300,
+            })
+        );
+        assert_eq!(decoded_payload, payload);
     }
 
     #[test]

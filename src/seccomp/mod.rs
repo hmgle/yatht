@@ -6,6 +6,7 @@ use std::ptr;
 
 pub const USER_NOTIF_FLAG_CONTINUE: u32 = 1 << 0;
 pub const ADDFD_FLAG_SETFD: u32 = 1 << 0;
+pub const ADDFD_FLAG_SEND: u32 = 1 << 1;
 
 thread_local! {
     static NOTIFICATION_ERROR: RefCell<Option<io::Error>> = const { RefCell::new(None) };
@@ -80,10 +81,17 @@ pub struct SeccompNotifAddfd {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrapSet {
     pub connect: bool,
+    pub socket: bool,
+    pub bind: bool,
     pub sendto: bool,
     pub sendmsg: bool,
+    pub sendmmsg: bool,
+    pub getsockname: bool,
+    pub getpeername: bool,
+    pub getsockopt: bool,
     pub recvfrom: bool,
     pub recvmsg: bool,
+    pub recvmmsg: bool,
     pub close: bool,
     pub close_range: bool,
     pub dup2: bool,
@@ -94,10 +102,17 @@ impl TrapSet {
     pub fn tcp_only() -> Self {
         Self {
             connect: true,
+            socket: false,
+            bind: false,
             sendto: false,
             sendmsg: false,
+            sendmmsg: false,
+            getsockname: false,
+            getpeername: false,
+            getsockopt: false,
             recvfrom: false,
             recvmsg: false,
+            recvmmsg: false,
             close: false,
             close_range: false,
             dup2: false,
@@ -105,13 +120,20 @@ impl TrapSet {
         }
     }
 
-    pub fn with_udp() -> Self {
+    pub fn with_dns() -> Self {
         Self {
             connect: true,
+            socket: false,
+            bind: false,
             sendto: true,
             sendmsg: true,
+            sendmmsg: false,
+            getsockname: false,
+            getpeername: false,
+            getsockopt: false,
             recvfrom: true,
             recvmsg: true,
+            recvmmsg: false,
             close: true,
             close_range: true,
             dup2: true,
@@ -119,8 +141,20 @@ impl TrapSet {
         }
     }
 
+    pub fn with_udp() -> Self {
+        let mut traps = Self::with_dns();
+        traps.socket = true;
+        traps.bind = true;
+        traps.sendmmsg = true;
+        traps.getsockname = true;
+        traps.getpeername = true;
+        traps.getsockopt = true;
+        traps.recvmmsg = true;
+        traps
+    }
+
     pub fn encode(self) -> String {
-        let mut bits = 0_u16;
+        let mut bits = 0_u32;
         if self.connect {
             bits |= 1 << 0;
         }
@@ -148,20 +182,48 @@ impl TrapSet {
         if self.dup3 {
             bits |= 1 << 8;
         }
+        if self.socket {
+            bits |= 1 << 9;
+        }
+        if self.bind {
+            bits |= 1 << 10;
+        }
+        if self.sendmmsg {
+            bits |= 1 << 11;
+        }
+        if self.getsockname {
+            bits |= 1 << 12;
+        }
+        if self.getpeername {
+            bits |= 1 << 13;
+        }
+        if self.getsockopt {
+            bits |= 1 << 14;
+        }
+        if self.recvmmsg {
+            bits |= 1 << 15;
+        }
         bits.to_string()
     }
 
     pub fn decode(raw: &str) -> Option<Self> {
-        let bits = raw.parse::<u16>().ok()?;
-        if bits & !0b1_1111_1111 != 0 {
+        let bits = raw.parse::<u32>().ok()?;
+        if bits & !0xffff != 0 {
             return None;
         }
         Some(Self {
             connect: bits & (1 << 0) != 0,
+            socket: bits & (1 << 9) != 0,
+            bind: bits & (1 << 10) != 0,
             sendto: bits & (1 << 1) != 0,
             sendmsg: bits & (1 << 2) != 0,
+            sendmmsg: bits & (1 << 11) != 0,
+            getsockname: bits & (1 << 12) != 0,
+            getpeername: bits & (1 << 13) != 0,
+            getsockopt: bits & (1 << 14) != 0,
             recvfrom: bits & (1 << 3) != 0,
             recvmsg: bits & (1 << 4) != 0,
+            recvmmsg: bits & (1 << 15) != 0,
             close: bits & (1 << 5) != 0,
             close_range: bits & (1 << 6) != 0,
             dup2: bits & (1 << 7) != 0,
@@ -174,17 +236,38 @@ impl TrapSet {
         if self.connect {
             nrs.push(libc::SYS_connect as u32);
         }
+        if self.socket {
+            nrs.push(libc::SYS_socket as u32);
+        }
+        if self.bind {
+            nrs.push(libc::SYS_bind as u32);
+        }
         if self.sendto {
             nrs.push(libc::SYS_sendto as u32);
         }
         if self.sendmsg {
             nrs.push(libc::SYS_sendmsg as u32);
         }
+        if self.sendmmsg {
+            nrs.push(libc::SYS_sendmmsg as u32);
+        }
+        if self.getsockname {
+            nrs.push(libc::SYS_getsockname as u32);
+        }
+        if self.getpeername {
+            nrs.push(libc::SYS_getpeername as u32);
+        }
+        if self.getsockopt {
+            nrs.push(libc::SYS_getsockopt as u32);
+        }
         if self.recvfrom {
             nrs.push(libc::SYS_recvfrom as u32);
         }
         if self.recvmsg {
             nrs.push(libc::SYS_recvmsg as u32);
+        }
+        if self.recvmmsg {
+            nrs.push(libc::SYS_recvmmsg as u32);
         }
         if self.close {
             nrs.push(libc::SYS_close as u32);
@@ -486,20 +569,39 @@ mod tests {
     }
 
     #[test]
-    fn socket_filter_traps_udp_senders() {
+    fn socket_filter_traps_stable_udp_creation_and_io() {
         let filter = socket_filter(TrapSet::with_udp());
-        assert_eq!(filter.len(), 15);
+        assert_eq!(filter.len(), 22);
         assert_eq!(filter[4].k, libc::SYS_connect as u32);
-        assert_eq!(filter[5].k, libc::SYS_sendto as u32);
-        assert_eq!(filter[6].k, libc::SYS_sendmsg as u32);
-        assert_eq!(filter[7].k, libc::SYS_recvfrom as u32);
-        assert_eq!(filter[8].k, libc::SYS_recvmsg as u32);
-        assert_eq!(filter[9].k, libc::SYS_close as u32);
-        assert_eq!(filter[10].k, libc::SYS_close_range as u32);
-        assert_eq!(filter[11].k, libc::SYS_dup2 as u32);
-        assert_eq!(filter[12].k, libc::SYS_dup3 as u32);
-        assert_eq!(filter[13].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[14].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[5].k, libc::SYS_socket as u32);
+        assert_eq!(filter[6].k, libc::SYS_bind as u32);
+        assert_eq!(filter[7].k, libc::SYS_sendto as u32);
+        assert_eq!(filter[8].k, libc::SYS_sendmsg as u32);
+        assert_eq!(filter[9].k, libc::SYS_sendmmsg as u32);
+        assert_eq!(filter[10].k, libc::SYS_getsockname as u32);
+        assert_eq!(filter[11].k, libc::SYS_getpeername as u32);
+        assert_eq!(filter[12].k, libc::SYS_getsockopt as u32);
+        assert_eq!(filter[13].k, libc::SYS_recvfrom as u32);
+        assert_eq!(filter[14].k, libc::SYS_recvmsg as u32);
+        assert_eq!(filter[15].k, libc::SYS_recvmmsg as u32);
+        assert_eq!(filter[16].k, libc::SYS_close as u32);
+        assert_eq!(filter[17].k, libc::SYS_close_range as u32);
+        assert_eq!(filter[18].k, libc::SYS_dup2 as u32);
+        assert_eq!(filter[19].k, libc::SYS_dup3 as u32);
+        assert_eq!(filter[20].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[21].k, SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
+    fn dns_filter_keeps_udp_socket_creation_in_kernel() {
+        let filter = socket_filter(TrapSet::with_dns());
+        assert_eq!(filter.len(), 15);
+        assert!(!filter
+            .iter()
+            .any(|instruction| instruction.k == libc::SYS_socket as u32));
+        assert!(!filter
+            .iter()
+            .any(|instruction| instruction.k == libc::SYS_recvmmsg as u32));
     }
 
     #[test]
@@ -512,7 +614,7 @@ mod tests {
 
     #[test]
     fn trap_set_rejects_unknown_bits() {
-        assert_eq!(TrapSet::decode("512"), None);
+        assert_eq!(TrapSet::decode("65536"), None);
     }
 
     #[test]

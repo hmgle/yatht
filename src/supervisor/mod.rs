@@ -8,7 +8,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,13 +29,22 @@ const CHILD_STAGE_ENV: &str = "SUP_CHILD_STAGE";
 const TARGET_PATH_ENV: &str = "SUP_TARGET_PATH";
 const TARGET_ARGV_ENV: &str = "SUP_TARGET_ARGV";
 const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
+const UDP_SOCKET_MODE_ENV: &str = "SUP_UDP_SOCKET_MODE";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
+const SOCKADDR_IN_SIZE: usize = 16;
+const SOCKADDR_IN6_MIN_SIZE: usize = 24;
+const SOCKADDR_IN6_SIZE: usize = 28;
 // Upper bound on relay responses buffered ahead of the target's recv. Caps
 // memory when the target stops reading and keeps the source queue from growing
 // without limit; once full, further responses are dropped rather than enqueued.
 const MAX_PENDING_SOURCES: usize = 1_024;
 const MAX_UDP_RELAYS: usize = 128;
+const STABLE_RELAY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+// Admission only waits when the relay budget is exhausted, so a short retry
+// tolerates procfs lagging a concurrent close without slowing normal creation.
+const STABLE_RELAY_REAP_ATTEMPTS: u32 = 3;
+const STABLE_RELAY_REAP_INTERVAL: Duration = Duration::from_millis(1);
 const UDP_RELAY_THREAD_STACK_SIZE: usize = 512 * 1_024;
 const MAX_NOTIFICATION_WORKERS: usize = 64;
 const NOTIFICATION_QUEUE_PER_WORKER: usize = 16;
@@ -54,8 +63,14 @@ struct NotificationFailure {
 }
 
 struct BlockingRecvQueue {
-    tx: channel::Sender<SeccompNotif>,
+    tx: channel::Sender<BlockingRecvNotification>,
     wake_fd: Arc<OwnedFd>,
+}
+
+#[derive(Clone, Copy)]
+struct BlockingRecvNotification {
+    notif: SeccompNotif,
+    received_at: Instant,
 }
 
 struct QueuedNotification {
@@ -68,6 +83,7 @@ struct PendingBlockingRecv {
     notif: SeccompNotif,
     relay_fd: OwnedFd,
     relay: FdIdentity,
+    state: BlockingRecvState,
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +91,49 @@ struct BlockingRecvWork {
     notif: SeccompNotif,
     relay: Option<FdIdentity>,
     terminal_revents: libc::c_short,
+    state: BlockingRecvState,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BlockingRecvState {
+    completed: usize,
+    timeout_initialized: bool,
+    deadline: Option<Instant>,
+    rcvtimeo: Option<Duration>,
+    rcvtimeo_deadline: Option<Instant>,
+    // Set when the notification enters the supervisor queue; direct handler
+    // calls leave it unset and use their dispatch time instead.
+    received_at: Option<Instant>,
+}
+
+impl BlockingRecvState {
+    /// Earliest pending timer. The explicit recvmmsg timespec and the socket
+    /// `SO_RCVTIMEO` keep distinct expiry results, but the reactor only needs
+    /// the next wake-up instant.
+    fn next_deadline(&self) -> Option<Instant> {
+        match (self.deadline, self.rcvtimeo_deadline) {
+            (Some(explicit), Some(rcvtimeo)) => Some(explicit.min(rcvtimeo)),
+            (explicit, rcvtimeo) => explicit.or(rcvtimeo),
+        }
+    }
+
+    fn arm_rcvtimeo(&mut self, relay_fd: RawFd) {
+        self.rcvtimeo = socket_recv_timeout(relay_fd);
+        let start = self.received_at.unwrap_or_else(Instant::now);
+        self.set_rcvtimeo_deadline(start);
+    }
+
+    /// Restarts the `SO_RCVTIMEO` window. The kernel bounds each blocking
+    /// wait with the socket timeout, so batched receives re-arm it after
+    /// every delivered datagram (anchored by the direct-kernel baseline
+    /// probe); an `Instant` overflow degrades to an unbounded wait.
+    fn reset_rcvtimeo_deadline(&mut self) {
+        self.set_rcvtimeo_deadline(Instant::now());
+    }
+
+    fn set_rcvtimeo_deadline(&mut self, start: Instant) {
+        self.rcvtimeo_deadline = self.rcvtimeo.and_then(|timeout| start.checked_add(timeout));
+    }
 }
 
 struct BlockingRecvCompletion {
@@ -92,6 +151,7 @@ enum RecvHandling {
     Deferred {
         relay_fd: OwnedFd,
         relay: FdIdentity,
+        state: BlockingRecvState,
     },
 }
 
@@ -136,12 +196,39 @@ const X86_64_MSGHDR_NAME_LEN_OFFSET: usize = 8;
 const X86_64_MSGHDR_IOV_OFFSET: usize = 16;
 const X86_64_MSGHDR_IOV_LEN_OFFSET: usize = 24;
 const X86_64_MSGHDR_FLAGS_OFFSET: u64 = 48;
+const X86_64_MMSGHDR_SIZE: usize = 64;
+const X86_64_MMSGHDR_LEN_OFFSET: u64 = 56;
+const X86_64_TIMESPEC_SIZE: usize = 16;
+const MAX_RECVMMSG_VLEN: usize = 1_024;
 const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 const CLOSE_RANGE_KNOWN_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
 
 const _: () = assert!(std::mem::size_of::<libc::iovec>() == X86_64_IOVEC_SIZE);
 const _: () = assert!(std::mem::size_of::<libc::msghdr>() == X86_64_MSGHDR_SIZE);
+const _: () = assert!(std::mem::size_of::<libc::mmsghdr>() == X86_64_MMSGHDR_SIZE);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpSocketMode {
+    Lazy,
+    Stable,
+}
+
+fn udp_socket_mode_from_env() -> io::Result<UdpSocketMode> {
+    match std::env::var(UDP_SOCKET_MODE_ENV) {
+        Ok(value) if value == "lazy" => Ok(UdpSocketMode::Lazy),
+        Ok(value) if value == "stable" => Ok(UdpSocketMode::Stable),
+        Ok(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {UDP_SOCKET_MODE_ENV} value: {value}"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(UdpSocketMode::Lazy),
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {UDP_SOCKET_MODE_ENV} value: {err}"),
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Destination {
@@ -190,8 +277,11 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     set_child_subreaper().context("become child subreaper")?;
     let argv = cfg.command.clone();
     let (parent_sock, child_sock) = socketpair().context("create control socketpair")?;
-    let trap_set = if cfg.enable_dns || cfg.enable_udp {
+    let udp_socket_mode = udp_socket_mode_from_env().context("select UDP socket mode")?;
+    let trap_set = if cfg.enable_udp && udp_socket_mode == UdpSocketMode::Stable {
         seccomp::TrapSet::with_udp()
+    } else if cfg.enable_dns || cfg.enable_udp {
+        seccomp::TrapSet::with_dns()
     } else {
         seccomp::TrapSet::tcp_only()
     };
@@ -630,7 +720,7 @@ fn notification_loop(
     }
     let mut blocking_thread = None;
     let blocking_queue = if cfg.enable_dns || cfg.enable_udp {
-        let (blocking_tx, blocking_rx) = channel::unbounded::<SeccompNotif>();
+        let (blocking_tx, blocking_rx) = channel::unbounded::<BlockingRecvNotification>();
         let wake_fd = match create_eventfd() {
             Ok(fd) => Arc::new(fd),
             Err(err) => {
@@ -645,6 +735,7 @@ fn notification_loop(
         let reactor_failure = Arc::clone(&failure);
         let loop_failure = Arc::clone(&failure);
         let reactor_wake_fd = Arc::clone(&wake_fd);
+        let reactor_debug = cfg.debug;
         blocking_thread = Some(thread::spawn(move || {
             if std::panic::catch_unwind(|| {
                 blocking_recv_reactor(
@@ -654,6 +745,7 @@ fn notification_loop(
                     reactor_relays,
                     reactor_failure,
                     worker_count,
+                    reactor_debug,
                 )
             })
             .is_err()
@@ -682,6 +774,7 @@ fn notification_loop(
                             blocking_queue,
                             listener_raw_fd,
                             notif,
+                            Instant::now(),
                             cfg.debug,
                         ) {
                             if !report_thread_notification_error(
@@ -836,9 +929,11 @@ fn queue_blocking_notification(
     queue: &BlockingRecvQueue,
     listener_fd: RawFd,
     notif: SeccompNotif,
+    received_at: Instant,
     debug: bool,
 ) -> bool {
-    match queue.tx.send(notif) {
+    let queued = BlockingRecvNotification { notif, received_at };
+    match queue.tx.send(queued) {
         Ok(()) => {
             wake_eventfd(queue.wake_fd.as_raw_fd());
             true
@@ -847,7 +942,7 @@ fn queue_blocking_notification(
             if debug {
                 eprintln!("yatht: blocking recv reactor stopped");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::EIO);
+            seccomp::send_errno(listener_fd, notif.notif.id, libc::EIO);
             false
         }
     }
@@ -963,6 +1058,7 @@ fn is_blocking_recv_notification(notif: &SeccompNotif) -> bool {
     let flags = match notif.data.nr as libc::c_long {
         libc::SYS_recvfrom => notif.data.args[3] as i32,
         libc::SYS_recvmsg => notif.data.args[2] as i32,
+        libc::SYS_recvmmsg => notif.data.args[3] as i32,
         _ => return false,
     };
     flags & libc::MSG_DONTWAIT == 0
@@ -983,6 +1079,7 @@ fn blocking_recv_worker(
                 work.notif,
                 Arc::clone(&relays),
                 false,
+                work.state,
             )
         })) {
             Ok(handling) => handling,
@@ -1042,8 +1139,64 @@ fn queue_ready_blocking_recvs(
             notif: pending_recv.notif,
             relay: Some(pending_recv.relay),
             terminal_revents: revents & terminal_events,
+            state: pending_recv.state,
         });
     }
+}
+
+fn queue_expired_blocking_recvs(
+    pending: &mut Vec<PendingBlockingRecv>,
+    in_flight: &mut HashSet<FdIdentity>,
+    work_backlog: &mut VecDeque<BlockingRecvWork>,
+) {
+    let now = Instant::now();
+    let mut index = pending.len();
+    while index > 0 {
+        index -= 1;
+        let recv = &pending[index];
+        if in_flight.contains(&recv.relay)
+            || recv
+                .state
+                .next_deadline()
+                .is_none_or(|deadline| deadline > now)
+        {
+            continue;
+        }
+        let pending_recv = pending.swap_remove(index);
+        in_flight.insert(pending_recv.relay);
+        work_backlog.push_back(BlockingRecvWork {
+            notif: pending_recv.notif,
+            relay: Some(pending_recv.relay),
+            terminal_revents: 0,
+            state: pending_recv.state,
+        });
+    }
+}
+
+fn blocking_recv_poll_timeout(
+    pending: &[PendingBlockingRecv],
+    in_flight: &HashSet<FdIdentity>,
+    channels_may_have_more: bool,
+) -> libc::c_int {
+    if channels_may_have_more {
+        return 0;
+    }
+    let now = Instant::now();
+    let Some(until_deadline) = pending
+        .iter()
+        .filter(|recv| !in_flight.contains(&recv.relay))
+        .filter_map(|recv| recv.state.next_deadline())
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .min()
+    else {
+        return BLOCKING_RECV_POLL_INTERVAL_MS;
+    };
+    if until_deadline.is_zero() {
+        return 0;
+    }
+    until_deadline
+        .as_millis()
+        .clamp(1, BLOCKING_RECV_POLL_INTERVAL_MS as u128) as libc::c_int
 }
 
 /// Owns readiness and pending-notification state without performing payload
@@ -1051,11 +1204,12 @@ fn queue_ready_blocking_recvs(
 /// a bounded worker pool, preserving liveness and parallelism across relays.
 fn blocking_recv_reactor(
     listener_fd: Arc<OwnedFd>,
-    rx: channel::Receiver<SeccompNotif>,
+    rx: channel::Receiver<BlockingRecvNotification>,
     wake_fd: Arc<OwnedFd>,
     relays: Arc<UdpRelayRegistry>,
     failure: Arc<NotificationFailure>,
     worker_count: usize,
+    debug: bool,
 ) {
     let (work_tx, work_rx) = channel::bounded::<BlockingRecvWork>(
         worker_count.saturating_mul(NOTIFICATION_QUEUE_PER_WORKER),
@@ -1087,6 +1241,7 @@ fn blocking_recv_reactor(
     let mut in_flight = HashSet::<FdIdentity>::new();
     let validity_interval = Duration::from_millis(BLOCKING_RECV_POLL_INTERVAL_MS as u64);
     let mut last_validity_sweep = Instant::now();
+    let mut last_relay_sweep = Instant::now();
     let mut channels_may_have_more = false;
     let mut pollfds = Vec::<libc::pollfd>::new();
 
@@ -1108,11 +1263,7 @@ fn blocking_recv_reactor(
             revents: 0,
         }));
 
-        let timeout = if channels_may_have_more {
-            0
-        } else {
-            BLOCKING_RECV_POLL_INTERVAL_MS
-        };
+        let timeout = blocking_recv_poll_timeout(&pending, &in_flight, channels_may_have_more);
         let rc =
             unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
@@ -1132,6 +1283,7 @@ fn blocking_recv_reactor(
         }
 
         queue_ready_blocking_recvs(&mut pending, &pollfds, &mut in_flight, &mut work_backlog);
+        queue_expired_blocking_recvs(&mut pending, &mut in_flight, &mut work_backlog);
 
         if last_validity_sweep.elapsed() >= validity_interval {
             let mut index = pending.len();
@@ -1153,6 +1305,11 @@ fn blocking_recv_reactor(
                 }
             }
             last_validity_sweep = Instant::now();
+        }
+
+        if last_relay_sweep.elapsed() >= STABLE_RELAY_SWEEP_INTERVAL {
+            relays.reap_closed_stable_best_effort(debug);
+            last_relay_sweep = Instant::now();
         }
 
         let mut completed = 0;
@@ -1177,19 +1334,42 @@ fn blocking_recv_reactor(
             }
             match completion.handling {
                 RecvHandling::Completed => {}
-                RecvHandling::Deferred { relay_fd, relay } => {
+                RecvHandling::Deferred {
+                    relay_fd,
+                    relay,
+                    state,
+                } => {
                     if completion.work.terminal_revents != 0 {
-                        send_blocking_recv_poll_error(
-                            listener_fd.as_raw_fd(),
-                            completion.work.notif.id,
-                            relay_fd.as_raw_fd(),
-                            completion.work.terminal_revents,
-                        );
+                        if state.completed == 0 {
+                            send_blocking_recv_poll_error(
+                                listener_fd.as_raw_fd(),
+                                completion.work.notif.id,
+                                relay_fd.as_raw_fd(),
+                                completion.work.terminal_revents,
+                            );
+                        } else {
+                            if completion.work.notif.data.nr as libc::c_long == libc::SYS_recvmmsg {
+                                send_recvmmsg_result_or_errno(
+                                    listener_fd.as_raw_fd(),
+                                    &completion.work.notif,
+                                    &state,
+                                    None,
+                                    false,
+                                );
+                            } else {
+                                seccomp::send_value(
+                                    listener_fd.as_raw_fd(),
+                                    completion.work.notif.id,
+                                    state.completed as i64,
+                                );
+                            }
+                        }
                     } else {
                         pending.push(PendingBlockingRecv {
                             notif: completion.work.notif,
                             relay_fd,
                             relay,
+                            state,
                         });
                     }
                 }
@@ -1202,10 +1382,14 @@ fn blocking_recv_reactor(
         let mut received = 0;
         while received < BLOCKING_RECV_CHANNEL_BUDGET {
             match rx.try_recv() {
-                Ok(notif) => work_backlog.push_back(BlockingRecvWork {
-                    notif,
+                Ok(queued) => work_backlog.push_back(BlockingRecvWork {
+                    notif: queued.notif,
                     relay: None,
                     terminal_revents: 0,
+                    state: BlockingRecvState {
+                        received_at: Some(queued.received_at),
+                        ..BlockingRecvState::default()
+                    },
                 }),
                 Err(channel::TryRecvError::Empty) => break,
                 Err(channel::TryRecvError::Disconnected) => break 'reactor,
@@ -1256,10 +1440,18 @@ fn handle_recv_notification_once(
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
     wait_for_readable: bool,
+    state: BlockingRecvState,
 ) -> RecvHandling {
     match notif.data.nr as libc::c_long {
-        libc::SYS_recvfrom => handle_recvfrom_once(listener_fd, notif, relays, wait_for_readable),
-        libc::SYS_recvmsg => handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable),
+        libc::SYS_recvfrom => {
+            handle_recvfrom_once(listener_fd, notif, relays, wait_for_readable, state)
+        }
+        libc::SYS_recvmsg => {
+            handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable, state)
+        }
+        libc::SYS_recvmmsg => {
+            handle_recvmmsg_once(listener_fd, notif, relays, wait_for_readable, state)
+        }
         _ => {
             seccomp::send_continue(listener_fd, notif.id);
             RecvHandling::Completed
@@ -1279,6 +1471,11 @@ fn handle_notification(
     queue_wait: Duration,
 ) {
     match notif.data.nr as libc::c_long {
+        libc::SYS_socket => handle_socket(listener_fd, notif, cfg, relays),
+        libc::SYS_bind => handle_bind(listener_fd, notif, relays),
+        libc::SYS_getsockname => handle_getsockname(listener_fd, notif, relays),
+        libc::SYS_getpeername => handle_getpeername(listener_fd, notif, relays),
+        libc::SYS_getsockopt => handle_getsockopt(listener_fd, notif, relays),
         libc::SYS_connect => handle_connect(
             listener_fd,
             notif,
@@ -1291,8 +1488,10 @@ fn handle_notification(
         ),
         libc::SYS_sendto => handle_sendto(listener_fd, notif, cfg, relays),
         libc::SYS_sendmsg => handle_sendmsg(listener_fd, notif, cfg, relays),
+        libc::SYS_sendmmsg => handle_sendmmsg(listener_fd, notif, cfg, relays),
         libc::SYS_recvfrom => handle_recvfrom(listener_fd, notif, relays),
         libc::SYS_recvmsg => handle_recvmsg(listener_fd, notif, relays),
+        libc::SYS_recvmmsg => handle_recvmmsg(listener_fd, notif, relays),
         libc::SYS_close => handle_close(listener_fd, notif, relays),
         libc::SYS_close_range => handle_close_range(listener_fd, notif, relays),
         libc::SYS_dup2 | libc::SYS_dup3 => handle_fd_replacement(listener_fd, notif, relays),
@@ -1305,8 +1504,250 @@ fn handle_fd_replacement(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<Ud
     let new_fd = notif.data.args[1] as RawFd;
     if old_fd != new_fd {
         relays.wait_for_creation(notif.pid, new_fd);
+        relays.remove_alias(notif.pid, new_fd);
     }
     seccomp::send_continue(listener_fd, notif.id);
+}
+
+fn handle_socket(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    cfg: Arc<EffectiveConfig>,
+    relays: Arc<UdpRelayRegistry>,
+) {
+    let domain = notif.data.args[0] as i32;
+    let socket_type = notif.data.args[1] as i32;
+    let protocol = notif.data.args[2] as i32;
+    if !is_udp_socket_request(domain, socket_type, protocol) {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+
+    match relays.create_stable(listener_fd, &cfg, &notif, socket_type) {
+        Ok(StableSocketCreation::Injected) => {}
+        Ok(StableSocketCreation::Unsupported) => {
+            if cfg.debug {
+                eprintln!(
+                    "yatht: kernel does not support atomic seccomp ADDFD+SEND; using lazy UDP mode"
+                );
+            }
+            seccomp::send_continue(listener_fd, notif.id);
+        }
+        Err(err) => {
+            if cfg.debug {
+                eprintln!("yatht: stable UDP socket setup failed: {err:#}");
+            }
+            seccomp::send_errno(listener_fd, notif.id, libc::EMFILE);
+        }
+    }
+}
+
+fn is_udp_socket_request(domain: i32, socket_type: i32, protocol: i32) -> bool {
+    let allowed_flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    matches!(domain, libc::AF_INET | libc::AF_INET6)
+        && socket_type & !allowed_flags == libc::SOCK_DGRAM
+        && matches!(protocol, 0 | libc::IPPROTO_UDP)
+}
+
+fn handle_bind(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let addr = notif.data.args[1];
+    let addr_len = notif.data.args[2] as usize;
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if addr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let destination = match read_bind_destination(notif.pid, addr, addr_len, handle.domain) {
+        Ok(destination) => destination,
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
+    };
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if !handle.set_local_bind(destination) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
+}
+
+fn handle_getsockname(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let addr = notif.data.args[1];
+    let addr_len_ptr = notif.data.args[2];
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if addr_len_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let addr_len = match read_signed_socklen(notif.pid, addr_len_ptr) {
+        Ok(addr_len) if addr_len >= 0 => addr_len as u32,
+        Ok(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+            return;
+        }
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    if addr_len > 0 && addr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let local = handle
+        .local_bind()
+        .unwrap_or_else(|| handle.unspecified_destination());
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if write_sockaddr_result(
+        notif.pid,
+        addr,
+        addr_len_ptr,
+        addr_len,
+        handle.domain,
+        local,
+    )
+    .is_err()
+    {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
+}
+
+fn handle_getpeername(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let addr = notif.data.args[1];
+    let addr_len_ptr = notif.data.args[2];
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    let Some(peer) = handle.default_destination().map(|(dest, _)| dest) else {
+        seccomp::send_errno(listener_fd, notif.id, libc::ENOTCONN);
+        return;
+    };
+    if addr_len_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let addr_len = match read_signed_socklen(notif.pid, addr_len_ptr) {
+        Ok(addr_len) if addr_len >= 0 => addr_len as u32,
+        Ok(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+            return;
+        }
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    if addr_len > 0 && addr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if write_sockaddr_result(notif.pid, addr, addr_len_ptr, addr_len, handle.domain, peer).is_err()
+    {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
+}
+
+fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let fd = notif.data.args[0] as RawFd;
+    let level = notif.data.args[1] as i32;
+    let option = notif.data.args[2] as i32;
+    let optval = notif.data.args[3];
+    let optlen_ptr = notif.data.args[4];
+    let Some(handle) = relays.lookup_handle(notif.pid, fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if level != libc::SOL_SOCKET
+        || !matches!(
+            option,
+            libc::SO_DOMAIN | libc::SO_TYPE | libc::SO_PROTOCOL | libc::SO_ERROR
+        )
+    {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    if optlen_ptr == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let optlen = match read_signed_socklen(notif.pid, optlen_ptr) {
+        Ok(optlen) => optlen,
+        Err(_) => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+            return;
+        }
+    };
+    if optlen < 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return;
+    }
+    let value_len = std::mem::size_of::<libc::c_int>() as u32;
+    let write_len = (optlen as u32).min(value_len);
+    if write_len > 0 && optval == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    let value = match option {
+        libc::SO_DOMAIN => handle.domain,
+        libc::SO_TYPE => libc::SOCK_DGRAM,
+        libc::SO_PROTOCOL => libc::IPPROTO_UDP,
+        libc::SO_ERROR => 0,
+        _ => unreachable!("getsockopt option filtered above"),
+    };
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return;
+    }
+    if (write_len > 0
+        && write_proc_bytes(
+            notif.pid,
+            optval,
+            &value.to_ne_bytes()[..write_len as usize],
+        )
+        .is_err())
+        || write_proc_bytes(notif.pid, optlen_ptr, &write_len.to_ne_bytes()).is_err()
+    {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    seccomp::send_success(listener_fd, notif.id);
 }
 
 fn handle_close(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
@@ -1363,6 +1804,18 @@ fn handle_connect(
         return;
     }
 
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    let family = u16::from_ne_bytes(raw[0..2].try_into().unwrap()) as i32;
+    if family == libc::AF_UNSPEC {
+        if let Some(handle) = existing {
+            handle.clear_default_dest();
+            seccomp::send_success(listener_fd, notif.id);
+        } else {
+            seccomp::send_continue(listener_fd, notif.id);
+        }
+        return;
+    }
+
     let dest = match parse_sockaddr(&raw) {
         Ok(dest) => dest,
         Err(_) => {
@@ -1370,6 +1823,12 @@ fn handle_connect(
             return;
         }
     };
+    if let Some(handle) = existing.as_ref() {
+        if !handle.accepts_destination(dest) {
+            seccomp::send_errno(listener_fd, notif.id, libc::EAFNOSUPPORT);
+            return;
+        }
+    }
 
     if direct_connect_can_continue_before_socket_type(&cfg, dest) {
         // A direct route normally just continues, but if this fd was already
@@ -1393,8 +1852,10 @@ fn handle_connect(
     }
 
     let fd_inspection_started = Instant::now();
-    match socket_type(notif.pid, target_fd) {
-        Some(libc::SOCK_DGRAM) => {
+    match socket_type_and_protocol(notif.pid, target_fd) {
+        Some((libc::SOCK_DGRAM, protocol))
+            if protocol == libc::IPPROTO_UDP || existing.is_some() =>
+        {
             if let Some(kind) = udp_route_for(&cfg, dest) {
                 if !seccomp::notif_id_valid(listener_fd, notif.id) {
                     return;
@@ -1437,8 +1898,18 @@ fn handle_connect(
             seccomp::send_continue(listener_fd, notif.id);
             return;
         }
-        Some(libc::SOCK_STREAM) => {}
-        Some(other) => {
+        Some((libc::SOCK_DGRAM, protocol)) => {
+            if cfg.debug {
+                eprintln!(
+                    "yatht: unsupported datagram protocol {} for pid={} fd={}",
+                    protocol, notif.pid, target_fd
+                );
+            }
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        Some((libc::SOCK_STREAM, _)) => {}
+        Some((other, _)) => {
             if cfg.debug {
                 eprintln!(
                     "yatht: unsupported socket type {} for pid={} fd={}",
@@ -1688,20 +2159,51 @@ fn handle_sendto(
     let addr = notif.data.args[4];
     let addr_len = notif.data.args[5] as usize;
 
-    if addr == 0 || addr_len == 0 {
-        seccomp::send_continue(listener_fd, notif.id);
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    // A null address leaves `msg_name` unset, so the kernel falls back to the
+    // connected peer. A zero length keeps `msg_name` set and fails the
+    // destination-length check below instead.
+    if addr == 0 {
+        send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
-    let Some(dest) = read_send_destination(notif.pid, addr, addr_len) else {
+    let Some(domain) = internet_udp_domain(notif.pid, target_fd, existing.as_ref()) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest)
-    else {
-        // Direct destination on a plain (non-relay) fd: the kernel socket is a
-        // real UDP socket, so let the syscall run unmodified.
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
+    let (dest, route) = match resolve_send_destination(notif.pid, addr, addr_len, existing.as_ref())
+    {
+        SendDestination::Explicit(dest) => {
+            let route = match udp_route_for(&cfg, dest) {
+                Some(route) => route,
+                None if existing.is_some() => UdpRouteKind::Direct,
+                // Direct destination on a plain (non-relay) fd: the kernel
+                // socket is a real UDP socket, so let the syscall run
+                // unmodified.
+                None => {
+                    seccomp::send_continue(listener_fd, notif.id);
+                    return;
+                }
+            };
+            if let Err(errno) = validate_send_destination(domain, dest) {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return;
+            }
+            (dest, route)
+        }
+        SendDestination::ConnectedPeer => match connected_send_peer(listener_fd, &notif, &existing)
+        {
+            Some(peer) => peer,
+            None => return,
+        },
+        SendDestination::Continue => {
+            seccomp::send_continue(listener_fd, notif.id);
+            return;
+        }
+        SendDestination::Errno(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
     };
     if len > MAX_UDP_PAYLOAD {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
@@ -1730,27 +2232,87 @@ fn handle_sendto(
     }
 }
 
-/// Decides how a UDP send to `dest` must be handled.
+/// Imports a message's iovec array and its total length, the two checks Linux
+/// performs before any destination verdict: `copy_msghdr_from_user` faults on
+/// an unreadable array and rejects more than `UIO_MAXIOV` segments, and
+/// `udp_sendmsg` refuses an oversized datagram ahead of reporting a missing
+/// peer. Returns the errno to report on failure, so a caller that runs this
+/// first cannot answer `EDESTADDRREQ` where Linux answers `EFAULT` or
+/// `EMSGSIZE`. Reading the buffers themselves must stay after the destination
+/// verdict, which is where the kernel copies them.
 ///
-/// A proxied/DNS destination always routes through a relay (created on demand).
-/// A direct destination only routes through a relay when the fd has *already*
-/// been turned into an AF_UNIX relay socketpair by an earlier proxied send or
-/// connect -- that fd can no longer carry an AF_INET sendto, so the relay must
-/// perform the direct send. On a plain fd a direct destination returns `None`,
-/// telling the caller to let the original syscall run.
-fn resolve_udp_send(
-    cfg: &EffectiveConfig,
-    relays: &UdpRelayRegistry,
-    pid: u32,
-    fd: RawFd,
-    dest: Destination,
-) -> Option<(Option<UdpRelayHandle>, UdpRouteKind)> {
-    match udp_route_for(cfg, dest) {
-        Some(kind) => Some((None, kind)),
-        None => relays
-            .lookup_handle(pid, fd, true)
-            .map(|handle| (Some(handle), UdpRouteKind::Direct)),
+/// The UDP payload limit makes this valid only once the fd is known to be an
+/// Internet UDP socket; callers must not apply it to a TCP or AF_UNIX fd that
+/// merely tripped the same syscall filter.
+fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>, usize), i32> {
+    let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => iovecs,
+        // Too many segments is a length error to Linux, not a fault.
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Err(libc::EMSGSIZE),
+        Err(_) => return Err(libc::EFAULT),
+    };
+    validate_iovec_segment_lengths(&iovecs)?;
+    // Match the sendto path: an oversized datagram cannot be sent, so report
+    // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
+    let total = iovec_total_len(&iovecs).map_err(|_| libc::EMSGSIZE)?;
+    Ok((iovecs, total))
+}
+
+/// Imports a receive message's target segments with Linux's distinct errors
+/// for an excessive segment count and an unreadable iovec array.
+fn import_recv_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<Vec<TargetIovec>, i32> {
+    let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => iovecs,
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Err(libc::EMSGSIZE),
+        Err(_) => return Err(libc::EFAULT),
+    };
+    validate_iovec_segment_lengths(&iovecs)?;
+    Ok(iovecs)
+}
+
+/// Linux imports each `iov_len` as a signed length and rejects one that does
+/// not fit before summing segments or waiting for socket data.
+fn validate_iovec_segment_lengths(iovecs: &[TargetIovec]) -> Result<(), i32> {
+    if iovecs.iter().any(|iov| iov.len > isize::MAX as usize) {
+        Err(libc::EINVAL)
+    } else {
+        Ok(())
     }
+}
+
+/// Answers a send whose call carries no destination pointer at all. The kernel
+/// drops such a name before the injected AF_UNIX endpoint sees it, so a relayed
+/// socket can simply continue and let its connected peer carry the datagram;
+/// an unconnected one fails with `EDESTADDRREQ`.
+fn send_without_destination(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    handle: Option<&UdpRelayHandle>,
+) {
+    match handle {
+        Some(handle) if handle.default_destination().is_none() => {
+            seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+        }
+        _ => seccomp::send_continue(listener_fd, notif.id),
+    }
+}
+
+/// Resolves the peer that carries a send whose supplied name Linux drops. The
+/// relay must perform this send itself: continuing would hand the dropped name
+/// to the injected AF_UNIX endpoint, which rejects any non-AF_UNIX address.
+/// Answers the notification and returns `None` when the socket is unconnected.
+fn connected_send_peer(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    handle: &Option<UdpRelayHandle>,
+) -> Option<(Destination, UdpRouteKind)> {
+    let peer = handle
+        .as_ref()
+        .and_then(|handle| handle.default_destination());
+    if peer.is_none() {
+        seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+    }
+    peer
 }
 
 /// If `fd` already has a relay, records `dest` as the relay's default direct
@@ -1827,47 +2389,66 @@ fn handle_sendmsg(
             return;
         }
     };
-    if msg.name == 0 || msg.name_len == 0 {
+    let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    // The filter traps the syscall, not the socket, so TCP, AF_UNIX and stale
+    // fds arrive here too. Classify an unrelayed fd before applying UDP's
+    // datagram limits: an explicit, routable name does not prove the fd is
+    // UDP, while a lazy UDP socket still needs the kernel's iovec-import order
+    // on its first send.
+    let Some(domain) = internet_udp_domain(notif.pid, target_fd, existing.as_ref()) else {
         seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    let (iovecs, total) = match import_send_iovecs(notif.pid, &msg) {
+        Ok(imported) => imported,
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
+    };
+    // `sendmsg(2)` drops a zero-length name, so both cases leave the datagram
+    // without an explicit destination.
+    if msg.name == 0 || msg.name_len == 0 {
+        send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
 
-    let raw = match read_sockaddr(notif.pid, msg.name, msg.name_len as usize) {
-        Ok(raw) => raw,
-        Err(_) => {
+    let (dest, route) = match resolve_send_destination(
+        notif.pid,
+        msg.name,
+        msg.name_len as usize,
+        existing.as_ref(),
+    ) {
+        SendDestination::Explicit(dest) => {
+            let route = match udp_route_for(&cfg, dest) {
+                Some(route) => route,
+                None if existing.is_some() => UdpRouteKind::Direct,
+                None => {
+                    seccomp::send_continue(listener_fd, notif.id);
+                    return;
+                }
+            };
+            if let Err(errno) = validate_send_destination(domain, dest) {
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return;
+            }
+            (dest, route)
+        }
+        SendDestination::ConnectedPeer => match connected_send_peer(listener_fd, &notif, &existing)
+        {
+            Some(peer) => peer,
+            None => return,
+        },
+        SendDestination::Continue => {
             seccomp::send_continue(listener_fd, notif.id);
             return;
         }
-    };
-    let dest = match parse_sockaddr(&raw) {
-        Ok(dest) => dest,
-        Err(_) => {
-            seccomp::send_continue(listener_fd, notif.id);
+        SendDestination::Errno(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
             return;
         }
-    };
-    let Some((existing, route)) = resolve_udp_send(&cfg, &relays, notif.pid, target_fd, dest)
-    else {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
     };
 
-    let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
-        Ok(iovecs) => iovecs,
-        Err(_) => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-            return;
-        }
-    };
-    // Match the sendto path: an oversized datagram cannot be sent, so report
-    // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
-    let total = match iovec_total_len(&iovecs) {
-        Ok(total) => total,
-        Err(_) => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
-            return;
-        }
-    };
     let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
         Ok(payload) => payload,
         Err(_) => {
@@ -1892,6 +2473,143 @@ fn handle_sendmsg(
             seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
         }
         Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
+    }
+}
+
+fn handle_sendmmsg(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    cfg: Arc<EffectiveConfig>,
+    relays: Arc<UdpRelayRegistry>,
+) {
+    let target_fd = notif.data.args[0] as RawFd;
+    let msgvec = notif.data.args[1];
+    let vlen = notif.data.args[2] as usize;
+    let flags = notif.data.args[3] as i32;
+    if msgvec == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    if vlen == 0 {
+        seccomp::send_success(listener_fd, notif.id);
+        return;
+    }
+    if vlen > 1024 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return;
+    }
+
+    let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) else {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    };
+    if !handle.stable {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
+        .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
+    let mut sent = 0_usize;
+
+    for index in 0..vlen {
+        let Some(entry_ptr) = msgvec.checked_add((index * X86_64_MMSGHDR_SIZE) as u64) else {
+            send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EFAULT);
+            return;
+        };
+        let msg = match read_msghdr(notif.pid, entry_ptr) {
+            Ok(msg) => msg,
+            Err(_) => {
+                send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EFAULT);
+                return;
+            }
+        };
+        let (iovecs, total) = match import_send_iovecs(notif.pid, &msg) {
+            Ok(imported) => imported,
+            Err(errno) => {
+                send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+                return;
+            }
+        };
+        let named = if msg.name != 0 && msg.name_len != 0 {
+            match resolve_send_destination(
+                notif.pid,
+                msg.name,
+                msg.name_len as usize,
+                Some(&handle),
+            ) {
+                SendDestination::Explicit(dest) => {
+                    if let Err(errno) = validate_send_destination(handle.domain, dest) {
+                        send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+                        return;
+                    }
+                    Some((
+                        dest,
+                        udp_route_for(&cfg, dest).unwrap_or(UdpRouteKind::Direct),
+                    ))
+                }
+                // A dropped name falls back to the connected peer, exactly as
+                // an unnamed entry does. `Continue` needs a plain fd, which
+                // this stable-only path never sees.
+                SendDestination::ConnectedPeer | SendDestination::Continue => None,
+                SendDestination::Errno(errno) => {
+                    send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let (dest, route) = match named {
+            Some(target) => target,
+            None => {
+                let default = *handle.default_dest.lock().unwrap();
+                let Some(default) = default else {
+                    send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EDESTADDRREQ);
+                    return;
+                };
+                default
+            }
+        };
+        let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
+            Ok(payload) => payload,
+            Err(_) => {
+                send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EFAULT);
+                return;
+            }
+        };
+        if !seccomp::notif_id_valid(listener_fd, notif.id) {
+            return;
+        }
+        if let Err(err) = handle.send(dest, payload, route, nonblocking) {
+            let errno = if err.kind() == io::ErrorKind::WouldBlock {
+                libc::EAGAIN
+            } else {
+                libc::ECONNREFUSED
+            };
+            send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+            return;
+        }
+        if write_proc_bytes(
+            notif.pid,
+            entry_ptr + X86_64_MMSGHDR_LEN_OFFSET,
+            &(total as u32).to_ne_bytes(),
+        )
+        .is_err()
+        {
+            send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EFAULT);
+            return;
+        }
+        sent += 1;
+    }
+
+    seccomp::send_value(listener_fd, notif.id, sent as i64);
+}
+
+fn send_mmsg_result_or_errno(listener_fd: RawFd, notif_id: u64, sent: usize, errno: i32) {
+    if sent == 0 {
+        seccomp::send_errno(listener_fd, notif_id, errno);
+    } else {
+        seccomp::send_value(listener_fd, notif_id, sent as i64);
     }
 }
 
@@ -1938,7 +2656,13 @@ fn recv_request_is_nonblocking(pid: u32, fd: RawFd, flags: i32) -> io::Result<bo
 }
 
 fn handle_recvfrom(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
-    let _ = handle_recvfrom_once(listener_fd, notif, relays, true);
+    let _ = handle_recvfrom_once(
+        listener_fd,
+        notif,
+        relays,
+        true,
+        BlockingRecvState::default(),
+    );
 }
 
 fn handle_recvfrom_once(
@@ -1946,6 +2670,7 @@ fn handle_recvfrom_once(
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
     wait_for_readable: bool,
+    mut state: BlockingRecvState,
 ) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
     let buf_ptr = notif.data.args[1];
@@ -1962,6 +2687,10 @@ fn handle_recvfrom_once(
     else {
         return RecvHandling::Completed;
     };
+    if !state.timeout_initialized {
+        state.arm_rcvtimeo(relay_fd.as_raw_fd());
+        state.timeout_initialized = true;
+    }
     // A single UDP datagram never exceeds MAX_UDP_PAYLOAD, so cap the local
     // receive buffer instead of continuing the syscall on the relay fd: a plain
     // send_continue would bypass source rewrite and leave pending_sources
@@ -2010,8 +2739,15 @@ fn handle_recvfrom_once(
             }
             if let Some(addr_len) = addr_len {
                 if let Some(source) = source {
-                    if write_sockaddr_result(notif.pid, src_addr, addr_len_ptr, addr_len, source)
-                        .is_err()
+                    if write_sockaddr_result(
+                        notif.pid,
+                        src_addr,
+                        addr_len_ptr,
+                        addr_len,
+                        handle.domain,
+                        source,
+                    )
+                    .is_err()
                     {
                         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                         return RecvHandling::Completed;
@@ -2022,9 +2758,18 @@ fn handle_recvfrom_once(
             RecvHandling::Completed
         }
         Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
-            RecvHandling::Deferred {
-                relay_fd,
-                relay: handle.target_identity,
+            if state
+                .rcvtimeo_deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
+                send_recv_error(listener_fd, notif.id, &err);
+                RecvHandling::Completed
+            } else {
+                RecvHandling::Deferred {
+                    relay_fd,
+                    relay: handle.target_identity,
+                    state,
+                }
             }
         }
         Err(err) => {
@@ -2035,7 +2780,13 @@ fn handle_recvfrom_once(
 }
 
 fn handle_recvmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
-    let _ = handle_recvmsg_once(listener_fd, notif, relays, true);
+    let _ = handle_recvmsg_once(
+        listener_fd,
+        notif,
+        relays,
+        true,
+        BlockingRecvState::default(),
+    );
 }
 
 fn handle_recvmsg_once(
@@ -2043,6 +2794,7 @@ fn handle_recvmsg_once(
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
     wait_for_readable: bool,
+    mut state: BlockingRecvState,
 ) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
     let msg_ptr = notif.data.args[1];
@@ -2056,6 +2808,10 @@ fn handle_recvmsg_once(
     else {
         return RecvHandling::Completed;
     };
+    if !state.timeout_initialized {
+        state.arm_rcvtimeo(relay_fd.as_raw_fd());
+        state.timeout_initialized = true;
+    }
     if msg_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return RecvHandling::Completed;
@@ -2070,10 +2826,10 @@ fn handle_recvmsg_once(
             return RecvHandling::Completed;
         }
     };
-    let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
+    let iovecs = match import_recv_iovecs(notif.pid, &msg) {
         Ok(iovecs) => iovecs,
-        Err(_) => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
             return RecvHandling::Completed;
         }
     };
@@ -2099,41 +2855,275 @@ fn handle_recvmsg_once(
         wait_for_readable,
     ) {
         Ok(received) => {
-            let source = received.source;
-            if write_iovec_payload(notif.pid, &iovecs, &received.payload).is_err()
-                || write_proc_bytes(
-                    notif.pid,
-                    msg_ptr + X86_64_MSGHDR_FLAGS_OFFSET,
-                    &received.msg_flags.to_ne_bytes(),
-                )
+            if write_recvmsg_result(notif.pid, msg_ptr, &msg, &iovecs, handle.domain, &received)
                 .is_err()
             {
                 seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
                 return RecvHandling::Completed;
             }
-            if msg.name != 0 {
-                if let Some(source) = source {
-                    if write_sockaddr_to_msghdr(notif.pid, msg_ptr, msg.name, msg.name_len, source)
-                        .is_err()
-                    {
-                        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-                        return RecvHandling::Completed;
-                    }
-                }
-            }
             seccomp::send_value(listener_fd, notif.id, received.result_len as i64);
             RecvHandling::Completed
         }
         Err(err) if err.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
-            RecvHandling::Deferred {
-                relay_fd,
-                relay: handle.target_identity,
+            if state
+                .rcvtimeo_deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
+                send_recv_error(listener_fd, notif.id, &err);
+                RecvHandling::Completed
+            } else {
+                RecvHandling::Deferred {
+                    relay_fd,
+                    relay: handle.target_identity,
+                    state,
+                }
             }
         }
         Err(err) => {
             send_recv_error(listener_fd, notif.id, &err);
             RecvHandling::Completed
         }
+    }
+}
+
+fn handle_recvmmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
+    let _ = handle_recvmmsg_once(
+        listener_fd,
+        notif,
+        relays,
+        true,
+        BlockingRecvState::default(),
+    );
+}
+
+fn handle_recvmmsg_once(
+    listener_fd: RawFd,
+    notif: SeccompNotif,
+    relays: Arc<UdpRelayRegistry>,
+    _wait_for_readable: bool,
+    mut state: BlockingRecvState,
+) -> RecvHandling {
+    let target_fd = notif.data.args[0] as RawFd;
+    let msgvec = notif.data.args[1];
+    let vlen = notif.data.args[2] as usize;
+    let flags = notif.data.args[3] as i32;
+    let timeout_ptr = notif.data.args[4];
+
+    if !seccomp::notif_id_valid(listener_fd, notif.id) {
+        return RecvHandling::Completed;
+    }
+    let Some((handle, relay_fd)) =
+        lookup_relay_for_recv(listener_fd, &notif, &relays, target_fd, flags)
+    else {
+        return RecvHandling::Completed;
+    };
+    if !state.timeout_initialized {
+        state.deadline = match read_recvmmsg_deadline(
+            notif.pid,
+            timeout_ptr,
+            state.received_at.unwrap_or_else(Instant::now),
+        ) {
+            Ok(deadline) => deadline,
+            Err(err) => {
+                let errno = if err.kind() == io::ErrorKind::InvalidInput {
+                    libc::EINVAL
+                } else {
+                    libc::EFAULT
+                };
+                seccomp::send_errno(listener_fd, notif.id, errno);
+                return RecvHandling::Completed;
+            }
+        };
+        state.arm_rcvtimeo(relay_fd.as_raw_fd());
+        state.timeout_initialized = true;
+    }
+    if vlen == 0 {
+        seccomp::send_success(listener_fd, notif.id);
+        return RecvHandling::Completed;
+    }
+    if vlen > MAX_RECVMMSG_VLEN {
+        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+        return RecvHandling::Completed;
+    }
+    if msgvec == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return RecvHandling::Completed;
+    }
+
+    let nonblocking = recv_is_nonblocking(relay_fd.as_raw_fd(), flags);
+    while state.completed < vlen {
+        if !seccomp::notif_id_valid(listener_fd, notif.id) {
+            return RecvHandling::Completed;
+        }
+        let Some(entry_offset) = state.completed.checked_mul(X86_64_MMSGHDR_SIZE) else {
+            send_recvmmsg_result_or_errno(listener_fd, &notif, &state, Some(libc::EFAULT), false);
+            return RecvHandling::Completed;
+        };
+        let Some(entry_ptr) = msgvec.checked_add(entry_offset as u64) else {
+            send_recvmmsg_result_or_errno(listener_fd, &notif, &state, Some(libc::EFAULT), false);
+            return RecvHandling::Completed;
+        };
+        let msg = match read_msghdr(notif.pid, entry_ptr) {
+            Ok(msg) => msg,
+            Err(_) => {
+                send_recvmmsg_result_or_errno(
+                    listener_fd,
+                    &notif,
+                    &state,
+                    Some(libc::EFAULT),
+                    false,
+                );
+                return RecvHandling::Completed;
+            }
+        };
+        let iovecs = match import_recv_iovecs(notif.pid, &msg) {
+            Ok(iovecs) => iovecs,
+            Err(errno) => {
+                send_recvmmsg_result_or_errno(listener_fd, &notif, &state, Some(errno), false);
+                return RecvHandling::Completed;
+            }
+        };
+        let capacity = iovecs
+            .iter()
+            .try_fold(0_usize, |acc, iov| acc.checked_add(iov.len))
+            .filter(|len| *len <= MAX_UDP_PAYLOAD)
+            .unwrap_or(MAX_UDP_PAYLOAD);
+        let mut recv_flags = flags & !libc::MSG_WAITFORONE;
+        if state.completed > 0 && flags & libc::MSG_WAITFORONE != 0 {
+            recv_flags |= libc::MSG_DONTWAIT;
+        }
+
+        match recv_msg_from_relay_fd(
+            listener_fd,
+            notif.id,
+            relay_fd.as_raw_fd(),
+            capacity,
+            recv_flags,
+            &handle.pending_sources,
+            false,
+        ) {
+            Ok(received) => {
+                if write_recvmsg_result(
+                    notif.pid,
+                    entry_ptr,
+                    &msg,
+                    &iovecs,
+                    handle.domain,
+                    &received,
+                )
+                .is_err()
+                    || write_proc_bytes(
+                        notif.pid,
+                        entry_ptr + X86_64_MMSGHDR_LEN_OFFSET,
+                        &(received.result_len as u32).to_ne_bytes(),
+                    )
+                    .is_err()
+                {
+                    send_recvmmsg_result_or_errno(
+                        listener_fd,
+                        &notif,
+                        &state,
+                        Some(libc::EFAULT),
+                        false,
+                    );
+                    return RecvHandling::Completed;
+                }
+                state.completed += 1;
+                state.reset_rcvtimeo_deadline();
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                let deadline_expired = state.deadline.is_some_and(|deadline| deadline <= now);
+                let rcvtimeo_expired = state
+                    .rcvtimeo_deadline
+                    .is_some_and(|deadline| deadline <= now);
+                if state.completed > 0
+                    && (nonblocking
+                        || flags & libc::MSG_WAITFORONE != 0
+                        || deadline_expired
+                        || rcvtimeo_expired)
+                {
+                    send_recvmmsg_result_or_errno(listener_fd, &notif, &state, None, false);
+                    return RecvHandling::Completed;
+                }
+                // When both timers are expired the earlier one keeps its own
+                // result: an explicit timespec returns the batch count (zero
+                // included) instead of Linux's documented quiet-socket hang,
+                // while an expired SO_RCVTIMEO matches the kernel's EAGAIN.
+                let explicit_governs = deadline_expired
+                    && state.deadline.is_some_and(|explicit| {
+                        state
+                            .rcvtimeo_deadline
+                            .is_none_or(|rcvtimeo| explicit <= rcvtimeo)
+                    });
+                if explicit_governs {
+                    send_recvmmsg_result_or_errno(listener_fd, &notif, &state, None, true);
+                    return RecvHandling::Completed;
+                }
+                if rcvtimeo_expired {
+                    send_recvmmsg_result_or_errno(
+                        listener_fd,
+                        &notif,
+                        &state,
+                        Some(libc::EAGAIN),
+                        false,
+                    );
+                    return RecvHandling::Completed;
+                }
+                if nonblocking {
+                    send_recvmmsg_result_or_errno(
+                        listener_fd,
+                        &notif,
+                        &state,
+                        Some(libc::EAGAIN),
+                        false,
+                    );
+                    return RecvHandling::Completed;
+                }
+                return RecvHandling::Deferred {
+                    relay_fd,
+                    relay: handle.target_identity,
+                    state,
+                };
+            }
+            Err(err) => {
+                send_recvmmsg_result_or_errno(
+                    listener_fd,
+                    &notif,
+                    &state,
+                    Some(errno_from_io(&err)),
+                    false,
+                );
+                return RecvHandling::Completed;
+            }
+        }
+    }
+
+    send_recvmmsg_result_or_errno(listener_fd, &notif, &state, None, false);
+    RecvHandling::Completed
+}
+
+fn send_recvmmsg_result_or_errno(
+    listener_fd: RawFd,
+    notif: &SeccompNotif,
+    state: &BlockingRecvState,
+    errno: Option<i32>,
+    explicit_timeout_expired: bool,
+) {
+    // Linux writes the remaining explicit timeout after both a nonempty batch
+    // and an explicit expiry. A failed final write overrides any batch count.
+    if (state.completed > 0 || explicit_timeout_expired)
+        && write_recvmmsg_remaining_timeout(notif.pid, notif.data.args[4], state.deadline).is_err()
+    {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
+        return;
+    }
+    if state.completed > 0 {
+        seccomp::send_value(listener_fd, notif.id, state.completed as i64);
+    } else if let Some(errno) = errno {
+        seccomp::send_errno(listener_fd, notif.id, errno);
+    } else {
+        seccomp::send_success(listener_fd, notif.id);
     }
 }
 
@@ -2164,7 +3154,9 @@ struct FdIdentity {
 
 struct UdpTargetSnapshot {
     identity: FdIdentity,
+    domain: i32,
     flags: TargetFdFlags,
+    rcvtimeo: Option<Duration>,
 }
 
 /// Relay slot state. `Creating` is a single-flight marker published under the
@@ -2183,19 +3175,32 @@ enum RelayLookup {
     Missing,
 }
 
+enum StableSocketCreation {
+    Injected,
+    Unsupported,
+}
+
 #[derive(Default)]
 struct UdpRelayRegistry {
     inner: Mutex<HashMap<RelayKey, RelayState>>,
+    stable_by_cookie: Mutex<HashMap<u64, UdpRelayHandle>>,
     created: Condvar,
+    active: AtomicUsize,
+    stable_addfd_unsupported: AtomicBool,
+    stable_reap_warning_reported: AtomicBool,
 }
 
 #[derive(Clone)]
 struct UdpRelayHandle {
     tx: channel::Sender<UdpJob>,
     default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
+    local_bind: Arc<Mutex<Option<Destination>>>,
     pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     relay_fd: Arc<OwnedFd>,
     target_identity: FdIdentity,
+    target_cookie: u64,
+    domain: i32,
+    stable: bool,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -2203,6 +3208,11 @@ struct UdpJob {
     dest: Destination,
     payload: Vec<u8>,
     route: UdpRouteKind,
+}
+
+struct UdpRelayResponse {
+    source: Destination,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -2216,6 +3226,7 @@ struct UdpRelayConfig {
 struct DirectUdpSocket {
     sock: UdpSocket,
     recv_buf: Vec<u8>,
+    requested_bind: Destination,
 }
 
 fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
@@ -2293,6 +3304,7 @@ fn valid_relay_locked(
     key: RelayKey,
     pid: u32,
     fd: RawFd,
+    active: &AtomicUsize,
 ) -> Option<UdpRelayHandle> {
     let handle = match relays.get(&key) {
         Some(RelayState::Ready(handle)) => handle.clone(),
@@ -2304,7 +3316,12 @@ fn valid_relay_locked(
         Some(handle)
     } else {
         if let Some(RelayState::Ready(stale)) = relays.remove(&key) {
-            stale.shutdown();
+            if !stale.stable {
+                stale.shutdown();
+                let _ = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
+            }
         }
         None
     }
@@ -2331,6 +3348,209 @@ fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
 }
 
 impl UdpRelayRegistry {
+    /// Closes stable relays whose target socket is gone. Only relays that were
+    /// already published when the sweep started are eligible: `/proc/net/unix`
+    /// is generated as it is read, so a socket that a concurrent
+    /// `create_stable` opens while the read is in flight can be missing from
+    /// the snapshot even though it is alive. Taking the candidate list before
+    /// the read keeps such a relay from being shut down at birth and from
+    /// releasing an admission slot its creator still holds.
+    fn reap_closed_stable(&self) -> io::Result<usize> {
+        let candidates = self
+            .stable_by_cookie
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(cookie, handle)| (*cookie, handle.target_identity))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let live_inodes = unix_socket_inodes()?;
+        let removed = {
+            let mut stable = self.stable_by_cookie.lock().unwrap();
+            let mut closed = Vec::new();
+            for (cookie, identity) in &candidates {
+                if live_inodes.contains(&identity.ino) {
+                    continue;
+                }
+                // Reap only the handle the candidate list saw. A replacement
+                // published under the same cookie since then has its own
+                // socket and must not inherit this verdict.
+                match stable.get(cookie) {
+                    Some(handle) if handle.target_identity == *identity => {
+                        closed.push((*cookie, handle.clone()));
+                    }
+                    _ => continue,
+                }
+            }
+            for (cookie, _) in &closed {
+                stable.remove(cookie);
+            }
+            closed
+        };
+        if removed.is_empty() {
+            return Ok(0);
+        }
+
+        let identities = removed
+            .iter()
+            .map(|(_, handle)| handle.target_identity)
+            .collect::<HashSet<_>>();
+        self.inner.lock().unwrap().retain(|_, state| {
+            !matches!(state, RelayState::Ready(handle) if identities.contains(&handle.target_identity))
+        });
+        self.created.notify_all();
+        for (_, handle) in &removed {
+            handle.shutdown();
+            self.release_relay_slot();
+        }
+        Ok(removed.len())
+    }
+
+    fn reserve_relay_slot(&self) -> Result<RelaySlotGuard<'_>> {
+        let reserved = self
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_UDP_RELAYS).then_some(active + 1)
+            });
+        if reserved.is_err() {
+            bail!("active UDP relay limit of {MAX_UDP_RELAYS} reached");
+        }
+        Ok(RelaySlotGuard {
+            registry: self,
+            committed: false,
+        })
+    }
+
+    fn reap_closed_stable_best_effort(&self, debug: bool) {
+        match self.reap_closed_stable() {
+            Ok(_) => self
+                .stable_reap_warning_reported
+                .store(false, Ordering::Release),
+            Err(err) => {
+                let first = !self
+                    .stable_reap_warning_reported
+                    .swap(true, Ordering::AcqRel);
+                if debug && first {
+                    eprintln!("yatht: stable UDP relay cleanup skipped: {err}");
+                }
+            }
+        }
+    }
+
+    /// Reserves an admission slot for a stable socket. The common path never
+    /// scans procfs; only an exhausted budget sweeps, and it then retries
+    /// briefly because `/proc/net/unix` can lag the final close of a
+    /// target-side alias performed by another thread. The wait sits entirely
+    /// on the already-slow path.
+    fn reserve_stable_relay_slot(&self, debug: bool) -> Result<RelaySlotGuard<'_>> {
+        let mut last = match self.reserve_relay_slot() {
+            Ok(slot) => return Ok(slot),
+            Err(err) => err,
+        };
+        for attempt in 0..STABLE_RELAY_REAP_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(STABLE_RELAY_REAP_INTERVAL);
+            }
+            self.reap_closed_stable_best_effort(debug);
+            match self.reserve_relay_slot() {
+                Ok(slot) => return Ok(slot),
+                Err(err) => last = err,
+            }
+        }
+        Err(last)
+    }
+
+    fn release_relay_slot(&self) {
+        let _ = self
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            });
+    }
+
+    fn remove_stable_cookie_if_current(&self, cookie: u64, target_identity: FdIdentity) {
+        let mut stable = self.stable_by_cookie.lock().unwrap();
+        if matches!(stable.get(&cookie), Some(current) if current.target_identity == target_identity)
+        {
+            stable.remove(&cookie);
+        }
+    }
+
+    fn create_stable(
+        &self,
+        listener_fd: RawFd,
+        cfg: &EffectiveConfig,
+        notif: &SeccompNotif,
+        socket_type: i32,
+    ) -> Result<StableSocketCreation> {
+        if self.stable_addfd_unsupported.load(Ordering::Acquire) {
+            return Ok(StableSocketCreation::Unsupported);
+        }
+
+        let mut slot = self.reserve_stable_relay_slot(cfg.debug)?;
+        let (relay_socket, target_fd) =
+            make_relay_pair().context("create stable UDP relay datagram socketpair")?;
+        if socket_type & libc::SOCK_NONBLOCK != 0 {
+            set_nonblocking(target_fd.as_raw_fd())
+                .context("set stable UDP relay target nonblocking")?;
+        }
+        let target_identity =
+            fd_identity(target_fd.as_raw_fd()).context("stat stable UDP relay target socket")?;
+        let target_cookie = socket_cookie(target_fd.as_raw_fd())
+            .context("read stable UDP relay target SO_COOKIE")?;
+        let handle = start_udp_relay(
+            build_udp_relay_config(cfg),
+            relay_socket,
+            None,
+            target_identity,
+            target_cookie,
+            notif.data.args[0] as i32,
+            true,
+        )
+        .context("start stable UDP relay workers")?;
+
+        // Publish the primary identity before ADDFD+SEND wakes the target. If
+        // the target immediately uses a dup/fork alias before the fd cache is
+        // populated, lookup can still recover the relay by SO_COOKIE.
+        self.stable_by_cookie
+            .lock()
+            .unwrap()
+            .insert(target_cookie, handle.clone());
+        let mut addfd = SeccompNotifAddfd {
+            id: notif.id,
+            flags: seccomp::ADDFD_FLAG_SEND,
+            srcfd: target_fd.as_raw_fd() as u32,
+            newfd: 0,
+            newfd_flags: if socket_type & libc::SOCK_CLOEXEC != 0 {
+                libc::O_CLOEXEC as u32
+            } else {
+                0
+            },
+        };
+        let target_fd_number = match seccomp::notif_addfd(listener_fd, &mut addfd) {
+            Ok(fd) => fd,
+            Err(err) => {
+                self.remove_stable_cookie_if_current(target_cookie, target_identity);
+                handle.shutdown();
+                if err.raw_os_error() == Some(libc::EINVAL) {
+                    self.stable_addfd_unsupported.store(true, Ordering::Release);
+                    return Ok(StableSocketCreation::Unsupported);
+                }
+                return Err(err).context("atomically inject stable UDP socket");
+            }
+        };
+
+        self.inner.lock().unwrap().insert(
+            relay_key(notif.pid, target_fd_number),
+            RelayState::Ready(handle),
+        );
+        slot.commit();
+        Ok(StableSocketCreation::Injected)
+    }
+
     fn ensure(
         &self,
         listener_fd: RawFd,
@@ -2357,10 +3577,10 @@ impl UdpRelayRegistry {
         // -- so it never blocks lookups for unrelated keys -- while still making a
         // concurrent lookup for THIS key wait for the relay instead of missing
         // the empty map and continuing its recv on the original fd.
-        {
+        let mut slot = {
             let mut relays = self.inner.lock().unwrap();
             loop {
-                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
+                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd, &self.active) {
                     if let Some((dest, route)) = default_dest {
                         handle.set_default_dest(dest, route);
                     }
@@ -2375,13 +3595,13 @@ impl UdpRelayRegistry {
                     }
                     // Free to claim: publish the marker and build below.
                     _ => {
-                        ensure_udp_relay_capacity(&relays)?;
+                        let slot = self.reserve_relay_slot()?;
                         relays.insert(key, RelayState::Creating);
-                        break;
+                        break slot;
                     }
                 }
             }
-        }
+        };
 
         // We own the Creating marker for `key`. The guard clears it and wakes
         // waiters on every early return (build error, injection failure) so a
@@ -2403,6 +3623,10 @@ impl UdpRelayRegistry {
         if target_snapshot.flags.status_flags & libc::O_NONBLOCK != 0 {
             let _ = set_nonblocking(target_fd.as_raw_fd());
         }
+        if let Some(timeout) = target_snapshot.rcvtimeo {
+            set_socket_recv_timeout(target_fd.as_raw_fd(), timeout)
+                .context("preserve UDP SO_RCVTIMEO across lazy relay replacement")?;
+        }
         let target_identity =
             fd_identity(target_fd.as_raw_fd()).context("stat UDP relay target socket")?;
 
@@ -2421,8 +3645,18 @@ impl UdpRelayRegistry {
         {
             bail!("UDP target fd changed before relay injection");
         }
-        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target_identity)
-            .context("start bounded UDP relay workers")?;
+        let target_cookie =
+            socket_cookie(target_fd.as_raw_fd()).context("read UDP relay target SO_COOKIE")?;
+        let handle = start_udp_relay(
+            relay_cfg,
+            relay_socket,
+            default_dest,
+            target_identity,
+            target_cookie,
+            target_snapshot.domain,
+            false,
+        )
+        .context("start bounded UDP relay workers")?;
         if let Err(err) = seccomp::notif_addfd(listener_fd, &mut addfd) {
             handle.shutdown();
             return Err(err).context("inject UDP relay fd");
@@ -2432,6 +3666,7 @@ impl UdpRelayRegistry {
         // Publish the ready relay and hand the marker off to Ready in one
         // critical section so waiters wake to a usable handle.
         guard.commit(RelayState::Ready(handle.clone()));
+        slot.commit();
         Ok(Some(handle))
     }
 
@@ -2445,11 +3680,11 @@ impl UdpRelayRegistry {
     /// concurrent insert of a fresh relay is never clobbered.
     fn lookup(&self, pid: u32, fd: RawFd, wait_creating: bool) -> RelayLookup {
         let key = relay_key(pid, fd);
-        let handle = {
+        let cached = {
             let mut relays = self.inner.lock().unwrap();
             loop {
                 match relays.get(&key) {
-                    Some(RelayState::Ready(handle)) => break handle.clone(),
+                    Some(RelayState::Ready(handle)) => break Some(handle.clone()),
                     // A relay is mid-creation for this key: wait for it rather
                     // than reporting a miss, which would continue this recv on
                     // the original fd and then block forever once the relay
@@ -2460,55 +3695,57 @@ impl UdpRelayRegistry {
                         }
                         relays = self.created.wait(relays).unwrap();
                     }
-                    None => return RelayLookup::Missing,
+                    None => break None,
                 }
             }
         };
-        let duplicated = match handle.duplicate_target_fd(pid, fd) {
-            Ok(duplicated) => duplicated,
-            Err(_) => {
-                self.remove_ready_if_current(key, handle.target_identity);
-                return RelayLookup::Missing;
+
+        if let Some(handle) = cached {
+            let duplicated = match handle.duplicate_target_fd(pid, fd) {
+                Ok(duplicated) => duplicated,
+                Err(_) => {
+                    self.remove_ready_if_current(key, handle.target_identity);
+                    return RelayLookup::Missing;
+                }
+            };
+            if handle.matches_target_fd(duplicated.as_raw_fd()) {
+                return RelayLookup::Ready(handle, duplicated);
             }
-        };
-        let identity = match fd_identity(duplicated.as_raw_fd()) {
-            Ok(identity) => identity,
-            Err(_) => {
-                self.remove_ready_if_current(key, handle.target_identity);
-                return RelayLookup::Missing;
-            }
-        };
-        if handle.target_identity == identity {
-            RelayLookup::Ready(handle, duplicated)
-        } else {
             self.remove_ready_if_current(key, handle.target_identity);
-            RelayLookup::Missing
+            return RelayLookup::Missing;
         }
+
+        // `(tgid, fd)` is only a cache for stable sockets. A dup or fork alias
+        // misses that cache, so duplicate the notifying fd and recover the
+        // primary relay by the kernel socket cookie.
+        if self.stable_by_cookie.lock().unwrap().is_empty() {
+            return RelayLookup::Missing;
+        }
+        let duplicated = match duplicate_remote_fd(pid, fd) {
+            Ok(duplicated) => duplicated,
+            Err(_) => return RelayLookup::Missing,
+        };
+        let Some(cookie) = socket_cookie(duplicated.as_raw_fd()) else {
+            return RelayLookup::Missing;
+        };
+        let handle = self.stable_by_cookie.lock().unwrap().get(&cookie).cloned();
+        let Some(handle) = handle else {
+            return RelayLookup::Missing;
+        };
+        if !handle.matches_target_fd(duplicated.as_raw_fd()) {
+            return RelayLookup::Missing;
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(key, RelayState::Ready(handle.clone()));
+        RelayLookup::Ready(handle, duplicated)
     }
 
     fn lookup_handle(&self, pid: u32, fd: RawFd, wait_creating: bool) -> Option<UdpRelayHandle> {
-        let key = relay_key(pid, fd);
-        let handle = {
-            let mut relays = self.inner.lock().unwrap();
-            loop {
-                match relays.get(&key) {
-                    Some(RelayState::Ready(handle)) => break handle.clone(),
-                    Some(RelayState::Creating) => {
-                        if !wait_creating {
-                            return None;
-                        }
-                        relays = self.created.wait(relays).unwrap();
-                    }
-                    None => return None,
-                }
-            }
-        };
-        match handle.remote_fd_identity(pid, fd) {
-            Ok(identity) if identity == handle.target_identity => Some(handle),
-            _ => {
-                self.remove_ready_if_current(key, handle.target_identity);
-                None
-            }
+        match self.lookup(pid, fd, wait_creating) {
+            RelayLookup::Ready(handle, _) => Some(handle),
+            RelayLookup::Creating | RelayLookup::Missing => None,
         }
     }
 
@@ -2571,6 +3808,15 @@ impl UdpRelayRegistry {
         }
     }
 
+    fn remove_alias(&self, pid: u32, fd: RawFd) {
+        let key = relay_key(pid, fd);
+        let removed = self.inner.lock().unwrap().remove(&key);
+        if let Some(RelayState::Ready(handle)) = removed {
+            self.finish_removed_handle(handle);
+        }
+        self.created.notify_all();
+    }
+
     fn remove_ready_if_current(&self, key: RelayKey, target_identity: FdIdentity) {
         let removed = {
             let mut relays = self.inner.lock().unwrap();
@@ -2582,22 +3828,59 @@ impl UdpRelayRegistry {
             }
         };
         if let Some(RelayState::Ready(handle)) = removed {
+            self.finish_removed_handle(handle);
+        }
+    }
+
+    fn finish_removed_handle(&self, handle: UdpRelayHandle) {
+        if !handle.stable {
             handle.shutdown();
+            self.release_relay_slot();
         }
     }
 }
 
-fn ensure_udp_relay_capacity(relays: &HashMap<RelayKey, RelayState>) -> Result<()> {
-    if relays.len() >= MAX_UDP_RELAYS {
-        bail!("active UDP relay limit of {MAX_UDP_RELAYS} reached");
+// `/proc/net/unix`'s Num column is rendered through `%pK` and can be zeroed by
+// kptr_restrict, so it is not a portable identity component. Inode reuse can
+// conservatively delay cleanup while the reused inode remains present, but it
+// cannot reclaim a live relay.
+fn unix_socket_inodes() -> io::Result<HashSet<libc::ino_t>> {
+    let raw = fs::read_to_string("/proc/net/unix")?;
+    let mut inodes = HashSet::new();
+    for line in raw.lines().skip(1) {
+        let Some(raw_inode) = line.split_whitespace().nth(6) else {
+            continue;
+        };
+        if let Ok(inode) = raw_inode.parse::<libc::ino_t>() {
+            inodes.insert(inode);
+        }
     }
-    Ok(())
+    Ok(inodes)
 }
 
 fn fd_in_close_range(fd: RawFd, first: u32, last: u32) -> bool {
     u32::try_from(fd)
         .map(|fd| (first..=last).contains(&fd))
         .unwrap_or(false)
+}
+
+struct RelaySlotGuard<'a> {
+    registry: &'a UdpRelayRegistry,
+    committed: bool,
+}
+
+impl RelaySlotGuard<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RelaySlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.registry.release_relay_slot();
+        }
+    }
 }
 
 /// Owns the single-flight `Creating` marker for one relay key. On drop it clears
@@ -2643,8 +3926,44 @@ impl Drop for CreatingGuard<'_> {
 }
 
 impl UdpRelayHandle {
+    fn local_bind(&self) -> Option<Destination> {
+        *self.local_bind.lock().unwrap()
+    }
+
+    fn default_destination(&self) -> Option<(Destination, UdpRouteKind)> {
+        *self.default_dest.lock().unwrap()
+    }
+
+    fn unspecified_destination(&self) -> Destination {
+        Destination {
+            ip: if self.domain == libc::AF_INET6 {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            },
+            port: 0,
+        }
+    }
+
     fn set_default_dest(&self, dest: Destination, route: UdpRouteKind) {
         *self.default_dest.lock().unwrap() = Some((dest, route));
+    }
+
+    fn clear_default_dest(&self) {
+        *self.default_dest.lock().unwrap() = None;
+    }
+
+    fn accepts_destination(&self, dest: Destination) -> bool {
+        udp_domain_accepts_destination(self.domain, dest)
+    }
+
+    fn set_local_bind(&self, bind: Destination) -> bool {
+        let mut current = self.local_bind.lock().unwrap();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(bind);
+        true
     }
 
     fn send(
@@ -2682,13 +4001,15 @@ impl UdpRelayHandle {
         duplicate_remote_fd(pid, fd)
     }
 
-    fn remote_fd_identity(&self, pid: u32, fd: RawFd) -> io::Result<FdIdentity> {
-        let duplicated = self.duplicate_target_fd(pid, fd)?;
-        fd_identity(duplicated.as_raw_fd())
+    fn matches_target_fd(&self, fd: RawFd) -> bool {
+        socket_cookie(fd) == Some(self.target_cookie)
+            && matches!(fd_identity(fd), Ok(identity) if identity == self.target_identity)
     }
 
     fn target_fd_matches(&self, pid: u32, fd: RawFd) -> bool {
-        matches!(self.remote_fd_identity(pid, fd), Ok(identity) if identity == self.target_identity)
+        self.duplicate_target_fd(pid, fd)
+            .map(|duplicated| self.matches_target_fd(duplicated.as_raw_fd()))
+            .unwrap_or(false)
     }
 
     fn shutdown(&self) {
@@ -2698,16 +4019,40 @@ impl UdpRelayHandle {
     }
 }
 
+fn udp_domain_accepts_destination(domain: i32, dest: Destination) -> bool {
+    matches!(
+        (domain, dest.ip),
+        (libc::AF_INET, IpAddr::V4(_)) | (libc::AF_INET6, _)
+    )
+}
+
+/// Renders `dest` in the socket's logical address family. A dual-stack AF_INET6
+/// socket reaches IPv4 peers, and Linux reports those peers as v4-mapped IPv6
+/// addresses, so `getpeername(2)` and every receive source must do the same.
+fn udp_domain_logical_address(domain: i32, dest: Destination) -> Destination {
+    match (domain, dest.ip) {
+        (libc::AF_INET6, IpAddr::V4(ip)) => Destination {
+            ip: IpAddr::V6(ip.to_ipv6_mapped()),
+            port: dest.port,
+        },
+        _ => dest,
+    }
+}
+
 fn start_udp_relay(
     cfg: UdpRelayConfig,
     relay_socket: OwnedFd,
     default_dest: Option<(Destination, UdpRouteKind)>,
     target_identity: FdIdentity,
+    target_cookie: u64,
+    domain: i32,
+    stable: bool,
 ) -> io::Result<UdpRelayHandle> {
     let relay_fd = Arc::new(relay_socket);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
     let default_dest = Arc::new(Mutex::new(default_dest));
+    let local_bind = Arc::new(Mutex::new(None));
     let pending_sources = Arc::new(Mutex::new(VecDeque::new()));
 
     let read_fd = Arc::clone(&relay_fd);
@@ -2749,6 +4094,7 @@ fn start_udp_relay(
         })?;
 
     let write_pending_sources = Arc::clone(&pending_sources);
+    let write_local_bind = Arc::clone(&local_bind);
     let write_fd = Arc::clone(&relay_fd);
     let write_shutdown = Arc::clone(&shutdown);
     let writer = thread::Builder::new()
@@ -2762,8 +4108,15 @@ fn start_udp_relay(
                 if write_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                let source = job.dest;
-                match forward_udp_job(&cfg, &mut dns_tcp, &mut socks_udp, &mut direct_udp, job) {
+                let local_bind = *write_local_bind.lock().unwrap();
+                match forward_udp_job(
+                    &cfg,
+                    &mut dns_tcp,
+                    &mut socks_udp,
+                    &mut direct_udp,
+                    local_bind,
+                    job,
+                ) {
                     Ok(Some(response)) => {
                         let mut pending = write_pending_sources.lock().unwrap();
                         // Drop the response if the target is not draining fast
@@ -2775,8 +4128,8 @@ fn start_udp_relay(
                             }
                             continue;
                         }
-                        pending.push_back(source);
-                        if !send_relay_response(write_fd.as_raw_fd(), &response) {
+                        pending.push_back(response.source);
+                        if !send_relay_response(write_fd.as_raw_fd(), &response.payload) {
                             let _ = pending.pop_back();
                             if write_shutdown.load(Ordering::SeqCst) {
                                 break;
@@ -2804,9 +4157,13 @@ fn start_udp_relay(
     Ok(UdpRelayHandle {
         tx,
         default_dest,
+        local_bind,
         pending_sources,
         relay_fd,
         target_identity,
+        target_cookie,
+        domain,
+        stable,
         shutdown,
     })
 }
@@ -2850,14 +4207,20 @@ fn forward_udp_job(
     dns_tcp: &mut Option<proxy::DnsTcpConnection>,
     socks_udp: &mut Option<proxy::Socks5UdpAssociation>,
     direct_udp: &mut Option<DirectUdpSocket>,
+    local_bind: Option<Destination>,
     job: UdpJob,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<UdpRelayResponse>> {
     let deadline = proxy::Deadline::after(cfg.timeout);
     // The route was decided by the notification handler, which has the full
     // routing table. Honour it verbatim so a datagram bound for a direct route
     // is never accidentally tunnelled through the proxy (and vice versa).
     match job.route {
-        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(Some),
+        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(|payload| {
+            Some(UdpRelayResponse {
+                source: job.dest,
+                payload,
+            })
+        }),
         UdpRouteKind::Generic => {
             if socks_udp.is_none() {
                 *socks_udp = Some(proxy::Socks5UdpAssociation::connect(&cfg.proxy, deadline)?);
@@ -2866,8 +4229,16 @@ fn forward_udp_job(
                 .as_mut()
                 .expect("SOCKS5 UDP association initialized")
                 .send_datagram(job.dest, &job.payload, deadline)
+                .map(|response| {
+                    response.map(|response| UdpRelayResponse {
+                        source: response.source,
+                        payload: response.payload,
+                    })
+                })
         }
-        UdpRouteKind::Direct => forward_direct_udp(direct_udp, job.dest, &job.payload, cfg.timeout),
+        UdpRouteKind::Direct => {
+            forward_direct_udp(direct_udp, local_bind, job.dest, &job.payload, cfg.timeout)
+        }
     }
 }
 
@@ -2903,32 +4274,40 @@ fn forward_dns_tcp(
 }
 
 /// Sends a datagram straight to its destination on a plain UDP socket, reusing a
-/// cached socket across jobs and rebinding only when the address family changes.
+/// cached socket across jobs until its effective bind changes.
 /// Mirrors the single request/response model of the proxy paths: one datagram is
 /// read back (within the timeout) so the connected-UDP return path stays fed.
 fn forward_direct_udp(
     direct_udp: &mut Option<DirectUdpSocket>,
+    requested_bind: Option<Destination>,
     dest: Destination,
     payload: &[u8],
     timeout: Duration,
-) -> Result<Option<Vec<u8>>> {
-    let family_matches = direct_udp
-        .as_ref()
-        .and_then(|state| state.sock.local_addr().ok())
-        .map(|addr| addr.is_ipv4() == dest.ip.is_ipv4())
-        .unwrap_or(false);
-    if !family_matches {
-        let bind = if dest.ip.is_ipv4() {
-            "0.0.0.0:0"
+) -> Result<Option<UdpRelayResponse>> {
+    let default_bind = Destination {
+        ip: if dest.ip.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         } else {
-            "[::]:0"
-        };
-        let sock = UdpSocket::bind(bind)?;
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        },
+        port: 0,
+    };
+    // Keep an explicit AF_INET6 bind even for an IPv4 destination. A dual-stack
+    // socket accepts that send and its bound port remains the datagram's source
+    // port; replacing the bind with an IPv4 wildcard silently loses it.
+    let requested_bind = requested_bind.unwrap_or(default_bind);
+    let bind_matches = direct_udp
+        .as_ref()
+        .map(|state| state.requested_bind == requested_bind)
+        .unwrap_or(false);
+    if !bind_matches {
+        let sock = UdpSocket::bind(SocketAddr::new(requested_bind.ip, requested_bind.port))?;
         sock.set_read_timeout(Some(timeout))?;
         sock.set_write_timeout(Some(timeout))?;
         *direct_udp = Some(DirectUdpSocket {
             sock,
             recv_buf: vec![0_u8; MAX_UDP_PAYLOAD],
+            requested_bind,
         });
     }
     let state = direct_udp
@@ -2939,7 +4318,13 @@ fn forward_direct_udp(
         .send_to(payload, SocketAddr::new(dest.ip, dest.port))?;
 
     match state.sock.recv_from(&mut state.recv_buf) {
-        Ok((n, _)) => Ok(Some(state.recv_buf[..n].to_vec())),
+        Ok((n, source)) => Ok(Some(UdpRelayResponse {
+            source: Destination {
+                ip: source.ip(),
+                port: source.port(),
+            },
+            payload: state.recv_buf[..n].to_vec(),
+        })),
         Err(err)
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut =>
         {
@@ -2983,9 +4368,167 @@ fn make_relay_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
-fn read_send_destination(pid: u32, addr: u64, addr_len: usize) -> Option<Destination> {
-    let raw_addr = read_sockaddr(pid, addr, addr_len).ok()?;
-    parse_sockaddr(&raw_addr).ok()
+/// Destination named by a send call, before the socket's own address family is
+/// taken into account.
+enum SendName {
+    /// A parsed AF_INET or AF_INET6 destination.
+    Explicit(Destination),
+    /// A family that only means something relative to the socket.
+    /// [`resolve_send_name`] finishes it once the domain is known.
+    SocketRelative { family: i32, raw: Vec<u8> },
+}
+
+/// Resolved destination for one send notification.
+enum SendDestination {
+    /// Forward the datagram to this destination.
+    Explicit(Destination),
+    /// Linux drops the supplied name, so the connected peer carries the
+    /// datagram and an unconnected socket fails with `EDESTADDRREQ`.
+    ConnectedPeer,
+    /// Nothing here depends on relay state; run the original syscall.
+    Continue,
+    /// Reject the call with this errno.
+    Errno(i32),
+}
+
+/// Reads the destination named by `addr`/`addr_len`, applying only the checks
+/// Linux performs before it looks at the socket: a truncated name is `EINVAL`,
+/// and any other family is deferred to [`resolve_send_name`].
+fn read_send_name(pid: u32, addr: u64, addr_len: usize) -> std::result::Result<SendName, i32> {
+    let raw =
+        read_proc_bytes(pid, addr, addr_len.min(SOCKADDR_IN6_SIZE)).map_err(|_| libc::EFAULT)?;
+    if raw.len() < 2 {
+        return Err(libc::EINVAL);
+    }
+    let family = u16::from_ne_bytes([raw[0], raw[1]]) as i32;
+    if !matches!(family, libc::AF_INET | libc::AF_INET6) {
+        return Ok(SendName::SocketRelative { family, raw });
+    }
+    parse_sockaddr(&raw)
+        .map(SendName::Explicit)
+        .map_err(|_| libc::EINVAL)
+}
+
+/// Resolves a name whose family Linux reads relative to the socket. `Ok(None)`
+/// means the name is dropped and the connected peer takes over.
+///
+/// An AF_INET socket accepts an `AF_UNSPEC` name as AF_INET for compatibility
+/// and rejects every other family with `EAFNOSUPPORT`. An AF_INET6 socket
+/// treats an `AF_UNSPEC` name as no name at all and rejects every other family
+/// with `EINVAL`.
+fn resolve_send_name(
+    raw: &[u8],
+    family: i32,
+    domain: i32,
+) -> std::result::Result<Option<Destination>, i32> {
+    match (domain, family) {
+        (libc::AF_INET, libc::AF_UNSPEC) => {
+            let mut compat = raw.to_vec();
+            compat[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+            parse_sockaddr_in(&compat)
+                .map(Some)
+                .map_err(|_| libc::EINVAL)
+        }
+        (libc::AF_INET6, libc::AF_UNSPEC) => Ok(None),
+        (libc::AF_INET6, _) => Err(libc::EINVAL),
+        _ => Err(libc::EAFNOSUPPORT),
+    }
+}
+
+/// Resolves the destination named by a send on a socket whose relay is
+/// `handle`. Without a relay the fd is still a plain UDP socket, so anything
+/// that depends on its address family is left to the kernel.
+fn resolve_send_destination(
+    pid: u32,
+    addr: u64,
+    addr_len: usize,
+    handle: Option<&UdpRelayHandle>,
+) -> SendDestination {
+    match read_send_name(pid, addr, addr_len) {
+        Ok(SendName::Explicit(dest)) => SendDestination::Explicit(dest),
+        Ok(SendName::SocketRelative { family, raw }) => {
+            let Some(domain) = handle.map(|handle| handle.domain) else {
+                return SendDestination::Continue;
+            };
+            match resolve_send_name(&raw, family, domain) {
+                Ok(Some(dest)) => SendDestination::Explicit(dest),
+                Ok(None) => SendDestination::ConnectedPeer,
+                Err(errno) => SendDestination::Errno(errno),
+            }
+        }
+        Err(errno) if handle.is_some() => SendDestination::Errno(errno),
+        Err(_) => SendDestination::Continue,
+    }
+}
+
+/// Applies the checks Linux defers until it knows both the named destination
+/// and the socket's address family. Only explicit names reach these: a peer
+/// recorded by `connect(2)` keeps whatever that call accepted.
+fn validate_send_destination(domain: i32, dest: Destination) -> std::result::Result<(), i32> {
+    if !udp_domain_accepts_destination(domain, dest) {
+        return Err(libc::EAFNOSUPPORT);
+    }
+    if dest.port == 0 {
+        return Err(libc::EINVAL);
+    }
+    Ok(())
+}
+
+fn read_bind_destination(
+    pid: u32,
+    addr: u64,
+    addr_len: usize,
+    domain: i32,
+) -> std::result::Result<Destination, i32> {
+    let minimum_len = match domain {
+        libc::AF_INET => SOCKADDR_IN_SIZE,
+        libc::AF_INET6 => SOCKADDR_IN6_MIN_SIZE,
+        _ => return Err(libc::EAFNOSUPPORT),
+    };
+    if addr_len < minimum_len {
+        return Err(libc::EINVAL);
+    }
+
+    // The length check above guarantees at least a family and an IPv4 payload.
+    let mut raw =
+        read_proc_bytes(pid, addr, addr_len.min(SOCKADDR_IN6_SIZE)).map_err(|_| libc::EFAULT)?;
+    let family = u16::from_ne_bytes([raw[0], raw[1]]) as i32;
+    if family == libc::AF_UNSPEC {
+        // Linux keeps an AF_UNSPEC bind working on AF_INET sockets, but only
+        // for the wildcard address.
+        if domain != libc::AF_INET {
+            return Err(libc::EAFNOSUPPORT);
+        }
+        raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        let destination = parse_sockaddr_in(&raw).map_err(|_| libc::EINVAL)?;
+        return destination
+            .ip
+            .is_unspecified()
+            .then_some(destination)
+            .ok_or(libc::EAFNOSUPPORT);
+    }
+    if family != domain {
+        return Err(libc::EAFNOSUPPORT);
+    }
+
+    parse_sockaddr(&raw).map_err(|_| libc::EINVAL)
+}
+
+fn remote_udp_domain(pid: u32, fd: RawFd) -> Option<i32> {
+    let target = duplicate_remote_fd(pid, fd).ok()?;
+    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
+        || socket_protocol_from_fd(target.as_raw_fd()) != Some(libc::IPPROTO_UDP)
+    {
+        return None;
+    }
+    socket_domain_from_fd(target.as_raw_fd())
+}
+
+fn internet_udp_domain(pid: u32, fd: RawFd, existing: Option<&UdpRelayHandle>) -> Option<i32> {
+    let domain = existing
+        .map(|handle| handle.domain)
+        .or_else(|| remote_udp_domain(pid, fd))?;
+    matches!(domain, libc::AF_INET | libc::AF_INET6).then_some(domain)
 }
 
 #[derive(Debug)]
@@ -3292,6 +4835,117 @@ fn notification_interrupted() -> io::Error {
     io::Error::from_raw_os_error(libc::EINTR)
 }
 
+/// Reads the target-visible `SO_RCVTIMEO`. A zero timeout means "block forever"
+/// and maps to `None`, as does a read failure: an unreadable option must
+/// degrade to the previous unbounded wait rather than fail the receive.
+fn socket_recv_timeout(fd: RawFd) -> Option<Duration> {
+    let mut timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = std::mem::size_of_val(&timeout) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&mut timeout as *mut libc::timeval).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || timeout.tv_sec < 0 || timeout.tv_usec < 0 {
+        return None;
+    }
+    if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(timeout.tv_sec as u64) + Duration::from_micros(timeout.tv_usec as u64))
+}
+
+fn set_socket_recv_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
+    let tv_sec = libc::time_t::try_from(timeout.as_secs()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SO_RCVTIMEO duration does not fit timeval",
+        )
+    })?;
+    let value = libc::timeval {
+        tv_sec,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&value as *const libc::timeval).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn read_recvmmsg_deadline(
+    pid: u32,
+    timeout_ptr: u64,
+    received_at: Instant,
+) -> io::Result<Option<Instant>> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let raw = read_proc_bytes(pid, timeout_ptr, X86_64_TIMESPEC_SIZE)?;
+    let duration = parse_recvmmsg_timeout(&raw)?;
+    received_at
+        .checked_add(duration)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recvmmsg timeout overflow"))
+}
+
+fn write_recvmmsg_remaining_timeout(
+    pid: u32,
+    timeout_ptr: u64,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    debug_assert_ne!(timeout_ptr, 0);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let seconds = i64::try_from(remaining.as_secs()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recvmmsg remaining timeout does not fit timespec",
+        )
+    })?;
+    let nanos = i64::from(remaining.subsec_nanos());
+    let mut raw = [0_u8; X86_64_TIMESPEC_SIZE];
+    raw[0..8].copy_from_slice(&seconds.to_ne_bytes());
+    raw[8..16].copy_from_slice(&nanos.to_ne_bytes());
+    write_proc_bytes(pid, timeout_ptr, &raw)
+}
+
+fn parse_recvmmsg_timeout(raw: &[u8]) -> io::Result<Duration> {
+    if raw.len() != X86_64_TIMESPEC_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid x86_64 timespec size",
+        ));
+    }
+    let seconds = i64::from_ne_bytes(raw[0..8].try_into().unwrap());
+    let nanos = i64::from_ne_bytes(raw[8..16].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid recvmmsg timeout",
+        ));
+    }
+    Ok(Duration::new(seconds as u64, nanos as u32))
+}
+
 fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::Result<()> {
     if payload.is_empty() {
         return Ok(());
@@ -3319,9 +4973,36 @@ fn write_iovec_payload(pid: u32, iovecs: &[TargetIovec], payload: &[u8]) -> io::
     process_vm_writev_all(pid, &mut local, &mut remote)
 }
 
+fn write_recvmsg_result(
+    pid: u32,
+    msg_ptr: u64,
+    msg: &TargetMsghdr,
+    iovecs: &[TargetIovec],
+    domain: i32,
+    received: &RelayRecvmsg,
+) -> io::Result<()> {
+    write_iovec_payload(pid, iovecs, &received.payload)?;
+    write_proc_bytes(
+        pid,
+        msg_ptr + X86_64_MSGHDR_FLAGS_OFFSET,
+        &received.msg_flags.to_ne_bytes(),
+    )?;
+    if msg.name != 0 {
+        if let Some(source) = received.source {
+            write_sockaddr_to_msghdr(pid, msg_ptr, msg.name, msg.name_len, domain, source)?;
+        }
+    }
+    Ok(())
+}
+
 fn read_socklen(pid: u32, addr: u64) -> io::Result<u32> {
     let raw = read_proc_bytes(pid, addr, std::mem::size_of::<libc::socklen_t>())?;
     Ok(u32::from_ne_bytes(raw.try_into().unwrap()))
+}
+
+fn read_signed_socklen(pid: u32, addr: u64) -> io::Result<i32> {
+    let raw = read_proc_bytes(pid, addr, std::mem::size_of::<libc::socklen_t>())?;
+    Ok(i32::from_ne_bytes(raw.try_into().unwrap()))
 }
 
 fn write_sockaddr_result(
@@ -3329,11 +5010,14 @@ fn write_sockaddr_result(
     addr: u64,
     addr_len_ptr: u64,
     addr_len: u32,
+    domain: i32,
     source: Destination,
 ) -> io::Result<()> {
-    let (raw, raw_len) = sockaddr_bytes(source);
+    let (raw, raw_len) = sockaddr_bytes(udp_domain_logical_address(domain, source));
     let write_len = (addr_len as usize).min(raw_len);
-    write_proc_bytes(pid, addr, &raw[..write_len])?;
+    if write_len > 0 {
+        write_proc_bytes(pid, addr, &raw[..write_len])?;
+    }
     write_proc_bytes(pid, addr_len_ptr, &(raw_len as u32).to_ne_bytes())
 }
 
@@ -3342,9 +5026,10 @@ fn write_sockaddr_to_msghdr(
     msg_ptr: u64,
     addr: u64,
     addr_len: u32,
+    domain: i32,
     source: Destination,
 ) -> io::Result<()> {
-    let (raw, raw_len) = sockaddr_bytes(source);
+    let (raw, raw_len) = sockaddr_bytes(udp_domain_logical_address(domain, source));
     let write_len = (addr_len as usize).min(raw_len);
     write_proc_bytes(pid, addr, &raw[..write_len])?;
     write_proc_bytes(
@@ -3354,20 +5039,20 @@ fn write_sockaddr_to_msghdr(
     )
 }
 
-fn sockaddr_bytes(dest: Destination) -> ([u8; 28], usize) {
-    let mut raw = [0_u8; 28];
+fn sockaddr_bytes(dest: Destination) -> ([u8; SOCKADDR_IN6_SIZE], usize) {
+    let mut raw = [0_u8; SOCKADDR_IN6_SIZE];
     match dest.ip {
         IpAddr::V4(ip) => {
             raw[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
             raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
             raw[4..8].copy_from_slice(&ip.octets());
-            (raw, 16)
+            (raw, SOCKADDR_IN_SIZE)
         }
         IpAddr::V6(ip) => {
             raw[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
             raw[2..4].copy_from_slice(&dest.port.to_be_bytes());
             raw[8..24].copy_from_slice(&ip.octets());
-            (raw, 28)
+            (raw, SOCKADDR_IN6_SIZE)
         }
     }
 }
@@ -3383,9 +5068,12 @@ fn send_recv_error(listener_fd: RawFd, notif_id: u64, err: &io::Error) {
     seccomp::send_errno(listener_fd, notif_id, errno_from_io(err));
 }
 
-fn socket_type(pid: u32, fd: RawFd) -> Option<i32> {
+fn socket_type_and_protocol(pid: u32, fd: RawFd) -> Option<(i32, i32)> {
     let file = duplicate_remote_fd(pid, fd).ok()?;
-    socket_type_from_fd(file.as_raw_fd())
+    Some((
+        socket_type_from_fd(file.as_raw_fd())?,
+        socket_protocol_from_fd(file.as_raw_fd())?,
+    ))
 }
 
 fn socket_type_from_fd(fd: RawFd) -> Option<i32> {
@@ -3423,6 +5111,25 @@ fn socket_domain_from_fd(fd: RawFd) -> Option<i32> {
         None
     } else {
         Some(domain)
+    }
+}
+
+fn socket_protocol_from_fd(fd: RawFd) -> Option<i32> {
+    let mut protocol: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&protocol) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PROTOCOL,
+            (&mut protocol as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        None
+    } else {
+        Some(protocol)
     }
 }
 
@@ -3545,11 +5252,14 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
         Err(err) => return Err(err).context("duplicate UDP target fd"),
     };
     if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
-        || !matches!(
-            socket_domain_from_fd(target.as_raw_fd()),
-            Some(libc::AF_INET | libc::AF_INET6)
-        )
+        || socket_protocol_from_fd(target.as_raw_fd()) != Some(libc::IPPROTO_UDP)
     {
+        return Ok(None);
+    }
+    let Some(domain) = socket_domain_from_fd(target.as_raw_fd()) else {
+        return Ok(None);
+    };
+    if !matches!(domain, libc::AF_INET | libc::AF_INET6) {
         return Ok(None);
     }
 
@@ -3557,7 +5267,9 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
     flags.status_flags = fd_status_flags(target.as_raw_fd()).unwrap_or(flags.status_flags);
     Ok(Some(UdpTargetSnapshot {
         identity: fd_identity(target.as_raw_fd()).context("stat UDP target fd")?,
+        domain,
         flags,
+        rcvtimeo: socket_recv_timeout(target.as_raw_fd()),
     }))
 }
 
@@ -3657,8 +5369,8 @@ fn read_sockaddr(pid: u32, addr: u64, addr_len: usize) -> io::Result<Vec<u8>> {
 
     let family = u16::from_ne_bytes([family_raw[0], family_raw[1]]) as i32;
     let needed_len = match family {
-        libc::AF_INET => 8,
-        libc::AF_INET6 => 28,
+        libc::AF_INET => SOCKADDR_IN_SIZE,
+        libc::AF_INET6 => SOCKADDR_IN6_SIZE,
         _ => return Ok(family_raw),
     };
     read_proc_bytes(pid, addr, addr_len.min(needed_len).min(128))
@@ -3848,7 +5560,7 @@ fn parse_sockaddr(raw: &[u8]) -> Result<Destination> {
 }
 
 fn parse_sockaddr_in(raw: &[u8]) -> Result<Destination> {
-    if raw.len() < 8 {
+    if raw.len() < SOCKADDR_IN_SIZE {
         bail!("sockaddr_in too short");
     }
     let port = u16::from_be_bytes([raw[2], raw[3]]);
@@ -3860,7 +5572,7 @@ fn parse_sockaddr_in(raw: &[u8]) -> Result<Destination> {
 }
 
 fn parse_sockaddr_in6(raw: &[u8]) -> Result<Destination> {
-    if raw.len() < 28 {
+    if raw.len() < SOCKADDR_IN6_MIN_SIZE {
         bail!("sockaddr_in6 too short");
     }
     let port = u16::from_be_bytes([raw[2], raw[3]]);
@@ -4214,25 +5926,150 @@ mod tests {
 
     #[test]
     fn udp_relay_capacity_is_globally_bounded() {
-        let mut relays = HashMap::new();
-        for fd in 0..MAX_UDP_RELAYS {
-            relays.insert(
-                RelayKey {
-                    tgid: 1,
-                    fd: fd as RawFd,
-                },
-                RelayState::Creating,
-            );
+        let registry = UdpRelayRegistry::default();
+        let mut slots = Vec::new();
+        for _ in 0..MAX_UDP_RELAYS {
+            slots.push(registry.reserve_relay_slot().unwrap());
         }
 
-        let err = ensure_udp_relay_capacity(&relays).unwrap_err().to_string();
+        let err = match registry.reserve_relay_slot() {
+            Ok(_) => panic!("relay reservation unexpectedly exceeded the limit"),
+            Err(err) => err.to_string(),
+        };
         assert!(err.contains("active UDP relay limit"), "{err}");
 
-        relays.remove(&RelayKey {
-            tgid: 1,
-            fd: (MAX_UDP_RELAYS - 1) as RawFd,
+        drop(slots.pop());
+        registry.reserve_relay_slot().unwrap();
+    }
+
+    #[test]
+    fn stable_relay_reaping_waits_for_the_last_target_alias() {
+        let registry = UdpRelayRegistry::default();
+        let (relay, target) = make_relay_pair().unwrap();
+        let alias_fd = unsafe { libc::dup(target.as_raw_fd()) };
+        assert!(alias_fd >= 0);
+        let alias = unsafe { OwnedFd::from_raw_fd(alias_fd) };
+        let (tx, _rx) = channel::bounded(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let target_identity = fd_identity(target.as_raw_fd()).unwrap();
+        let handle = UdpRelayHandle {
+            tx,
+            default_dest: Arc::new(Mutex::new(None)),
+            local_bind: Arc::new(Mutex::new(None)),
+            pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+            relay_fd: Arc::new(relay),
+            target_identity,
+            target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
+            domain: libc::AF_INET,
+            stable: true,
+            shutdown: Arc::clone(&shutdown),
+        };
+        registry.active.store(1, Ordering::Release);
+        registry
+            .stable_by_cookie
+            .lock()
+            .unwrap()
+            .insert(handle.target_cookie, handle);
+
+        drop(target);
+        assert_eq!(registry.reap_closed_stable().unwrap(), 0);
+        assert_eq!(registry.active.load(Ordering::Acquire), 1);
+
+        drop(alias);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if registry.reap_closed_stable().unwrap() == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "closed AF_UNIX socket remained visible in /proc/net/unix"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(registry.active.load(Ordering::Acquire), 0);
+        assert!(shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
+        // Mirrors `create_stable`'s publish order against a sweep running in
+        // parallel. Every target socket stays open for its whole batch, so a
+        // relay that gets shut down or loses its admission slot was reaped
+        // purely because the sweep's snapshot predates it.
+        let registry = Arc::new(UdpRelayRegistry::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let reaper_registry = Arc::clone(&registry);
+        let reaper_stop = Arc::clone(&stop);
+        let reaper = thread::spawn(move || {
+            while !reaper_stop.load(Ordering::Relaxed) {
+                reaper_registry.reap_closed_stable().unwrap();
+            }
         });
-        ensure_udp_relay_capacity(&relays).unwrap();
+
+        for batch in 0..20_usize {
+            let mut live = Vec::new();
+            for index in 0..32_usize {
+                let mut slot = registry.reserve_relay_slot().unwrap();
+                let (relay, target) = make_relay_pair().unwrap();
+                let (tx, _rx) = channel::bounded(1);
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
+                let key = relay_key(1, (batch * 32 + index) as RawFd);
+                let handle = UdpRelayHandle {
+                    tx,
+                    default_dest: Arc::new(Mutex::new(None)),
+                    local_bind: Arc::new(Mutex::new(None)),
+                    pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+                    relay_fd: Arc::new(relay),
+                    target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+                    target_cookie,
+                    domain: libc::AF_INET,
+                    stable: true,
+                    shutdown: Arc::clone(&shutdown),
+                };
+                registry
+                    .stable_by_cookie
+                    .lock()
+                    .unwrap()
+                    .insert(target_cookie, handle.clone());
+                // Stands in for the ADDFD round trip inside `create_stable`.
+                thread::yield_now();
+                registry
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .insert(key, RelayState::Ready(handle));
+                slot.commit();
+                live.push((target, shutdown, target_cookie, key));
+            }
+
+            thread::sleep(Duration::from_millis(5));
+            for (_, shutdown, cookie, _) in &live {
+                assert!(
+                    !shutdown.load(Ordering::SeqCst),
+                    "sweep closed a live stable relay"
+                );
+                assert!(
+                    registry
+                        .stable_by_cookie
+                        .lock()
+                        .unwrap()
+                        .contains_key(cookie),
+                    "sweep dropped a live stable relay"
+                );
+            }
+            assert_eq!(registry.active.load(Ordering::Acquire), live.len());
+
+            for (_, _, cookie, key) in &live {
+                registry.stable_by_cookie.lock().unwrap().remove(cookie);
+                registry.inner.lock().unwrap().remove(key);
+                registry.release_relay_slot();
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        reaper.join().unwrap();
     }
 
     #[test]
@@ -4284,12 +6121,17 @@ mod tests {
         let (relay, target) = make_relay_pair().unwrap();
         let (tx, _rx) = channel::bounded(1);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
         let handle = UdpRelayHandle {
             tx,
             default_dest: Arc::new(Mutex::new(None)),
+            local_bind: Arc::new(Mutex::new(None)),
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            target_cookie,
+            domain: libc::AF_INET,
+            stable: false,
             shutdown: Arc::clone(&shutdown),
         };
         let key = relay_key(std::process::id(), target.as_raw_fd());
@@ -4393,12 +6235,17 @@ mod tests {
     fn nonblocking_udp_send_reports_full_job_queue() {
         let (relay, target) = make_relay_pair().unwrap();
         let (tx, _rx) = channel::bounded(1);
+        let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
         let handle = UdpRelayHandle {
             tx,
             default_dest: Arc::new(Mutex::new(None)),
+            local_bind: Arc::new(Mutex::new(None)),
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            target_cookie,
+            domain: libc::AF_INET,
+            stable: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         let dest = Destination {
@@ -4429,6 +6276,7 @@ mod tests {
             &queue,
             -1,
             SeccompNotif::default(),
+            Instant::now(),
             false,
         ));
         assert!(rx.try_recv().is_ok());
@@ -4463,16 +6311,19 @@ mod tests {
                 notif: first_notif,
                 relay_fd: create_eventfd().unwrap(),
                 relay: first_relay,
+                state: BlockingRecvState::default(),
             },
             PendingBlockingRecv {
                 notif: second_notif,
                 relay_fd: create_eventfd().unwrap(),
                 relay: first_relay,
+                state: BlockingRecvState::default(),
             },
             PendingBlockingRecv {
                 notif: third_notif,
                 relay_fd: create_eventfd().unwrap(),
                 relay: second_relay,
+                state: BlockingRecvState::default(),
             },
         ];
         let pollfds = std::iter::once(libc::pollfd {
@@ -4508,6 +6359,162 @@ mod tests {
     }
 
     #[test]
+    fn expired_recvmmsg_receive_reenters_worker_queue() {
+        let expired_relay = FdIdentity { dev: 1, ino: 1 };
+        let future_relay = FdIdentity { dev: 1, ino: 2 };
+        let mut pending = vec![
+            PendingBlockingRecv {
+                notif: SeccompNotif {
+                    id: 1,
+                    ..SeccompNotif::default()
+                },
+                relay_fd: create_eventfd().unwrap(),
+                relay: expired_relay,
+                state: BlockingRecvState {
+                    completed: 0,
+                    timeout_initialized: true,
+                    deadline: Some(Instant::now() - Duration::from_millis(1)),
+                    ..BlockingRecvState::default()
+                },
+            },
+            PendingBlockingRecv {
+                notif: SeccompNotif {
+                    id: 2,
+                    ..SeccompNotif::default()
+                },
+                relay_fd: create_eventfd().unwrap(),
+                relay: future_relay,
+                state: BlockingRecvState {
+                    completed: 0,
+                    timeout_initialized: true,
+                    deadline: Some(Instant::now() + Duration::from_secs(1)),
+                    ..BlockingRecvState::default()
+                },
+            },
+        ];
+        let mut in_flight = HashSet::new();
+        let mut work_backlog = VecDeque::new();
+
+        queue_expired_blocking_recvs(&mut pending, &mut in_flight, &mut work_backlog);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].relay, future_relay);
+        assert_eq!(work_backlog.len(), 1);
+        assert_eq!(work_backlog[0].relay, Some(expired_relay));
+        assert!(in_flight.contains(&expired_relay));
+    }
+
+    #[test]
+    fn recvmmsg_timeout_controls_reactor_poll_deadline() {
+        let relay = FdIdentity { dev: 1, ino: 1 };
+        let pending = vec![PendingBlockingRecv {
+            notif: SeccompNotif::default(),
+            relay_fd: create_eventfd().unwrap(),
+            relay,
+            state: BlockingRecvState {
+                completed: 0,
+                timeout_initialized: true,
+                deadline: Some(Instant::now() + Duration::from_secs(10)),
+                ..BlockingRecvState::default()
+            },
+        }];
+
+        let timeout = blocking_recv_poll_timeout(&pending, &HashSet::new(), false);
+
+        assert_eq!(timeout, BLOCKING_RECV_POLL_INTERVAL_MS);
+        assert_eq!(
+            blocking_recv_poll_timeout(&pending, &HashSet::new(), true),
+            0
+        );
+    }
+
+    #[test]
+    fn socket_recv_timeout_reads_target_configured_value() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(socket_recv_timeout(socket.as_raw_fd()), None);
+
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let timeout = socket_recv_timeout(socket.as_raw_fd()).unwrap();
+        assert!(timeout >= Duration::from_millis(500));
+        assert!(timeout <= Duration::from_millis(600));
+
+        socket.set_read_timeout(None).unwrap();
+        assert_eq!(socket_recv_timeout(socket.as_raw_fd()), None);
+    }
+
+    #[test]
+    fn next_deadline_prefers_earliest_pending_timer() {
+        let now = Instant::now();
+        let earlier = now + Duration::from_millis(100);
+        let later = now + Duration::from_millis(200);
+        let mut state = BlockingRecvState::default();
+        assert_eq!(state.next_deadline(), None);
+
+        state.deadline = Some(later);
+        assert_eq!(state.next_deadline(), Some(later));
+
+        state.rcvtimeo_deadline = Some(earlier);
+        assert_eq!(state.next_deadline(), Some(earlier));
+
+        state.deadline = None;
+        assert_eq!(state.next_deadline(), Some(earlier));
+    }
+
+    #[test]
+    fn reset_rcvtimeo_deadline_rearms_only_with_a_timeout() {
+        let mut state = BlockingRecvState::default();
+        state.reset_rcvtimeo_deadline();
+        assert_eq!(state.rcvtimeo_deadline, None);
+
+        state.rcvtimeo = Some(Duration::from_millis(250));
+        let before = Instant::now();
+        state.reset_rcvtimeo_deadline();
+        assert!(state.rcvtimeo_deadline.unwrap() >= before + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn arm_rcvtimeo_uses_notification_received_at() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let received_at = Instant::now() - Duration::from_secs(2);
+        let mut state = BlockingRecvState {
+            received_at: Some(received_at),
+            ..BlockingRecvState::default()
+        };
+
+        state.arm_rcvtimeo(socket.as_raw_fd());
+
+        assert!(state
+            .rcvtimeo_deadline
+            .is_some_and(|deadline| deadline < Instant::now() - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn parses_x86_64_recvmmsg_timeout() {
+        let mut raw = [0_u8; X86_64_TIMESPEC_SIZE];
+        raw[0..8].copy_from_slice(&2_i64.to_ne_bytes());
+        raw[8..16].copy_from_slice(&3_i64.to_ne_bytes());
+
+        assert_eq!(parse_recvmmsg_timeout(&raw).unwrap(), Duration::new(2, 3));
+
+        raw[0..8].copy_from_slice(&(-1_i64).to_ne_bytes());
+        assert_eq!(
+            parse_recvmmsg_timeout(&raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        raw[0..8].copy_from_slice(&0_i64.to_ne_bytes());
+        raw[8..16].copy_from_slice(&1_000_000_000_i64.to_ne_bytes());
+        assert_eq!(
+            parse_recvmmsg_timeout(&raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn explicit_nonblocking_receives_skip_blocking_reactor() {
         let mut recvfrom = SeccompNotif::default();
         recvfrom.data.nr = libc::SYS_recvfrom as i32;
@@ -4520,6 +6527,12 @@ mod tests {
         assert!(is_blocking_recv_notification(&recvmsg));
         recvmsg.data.args[2] = libc::MSG_DONTWAIT as u64;
         assert!(!is_blocking_recv_notification(&recvmsg));
+
+        let mut recvmmsg = SeccompNotif::default();
+        recvmmsg.data.nr = libc::SYS_recvmmsg as i32;
+        assert!(is_blocking_recv_notification(&recvmmsg));
+        recvmmsg.data.args[3] = libc::MSG_DONTWAIT as u64;
+        assert!(!is_blocking_recv_notification(&recvmmsg));
 
         let mut sendmsg = SeccompNotif::default();
         sendmsg.data.nr = libc::SYS_sendmsg as i32;
@@ -4575,12 +6588,17 @@ mod tests {
     fn test_relay_handle() -> UdpRelayHandle {
         let (relay, target) = make_relay_pair().unwrap();
         let (tx, _rx) = channel::bounded(1);
+        let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
         UdpRelayHandle {
             tx,
             default_dest: Arc::new(Mutex::new(None)),
+            local_bind: Arc::new(Mutex::new(None)),
             pending_sources: Arc::new(Mutex::new(VecDeque::new())),
             relay_fd: Arc::new(relay),
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
+            target_cookie,
+            domain: libc::AF_INET,
+            stable: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }

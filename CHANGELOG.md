@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## 0.4.0
+
+- Add an opt-in stable UDP socket mode (`SUP_UDP_SOCKET_MODE=stable` with
+  `--enable-udp`) that injects the relay endpoint at `socket(2)` time, so the
+  open file description survives `dup(2)`, `fork(2)`, and close races. The
+  default lazy first-send replacement path is unchanged.
+- Key stable relay state by `SO_COOKIE` and reclaim idle relays through a
+  low-frequency sweep that confirms the target socket is gone; capacity-bound
+  admission sweeps and retries instead of failing early.
+- Virtualize `bind(2)`, `getsockname(2)`, `getpeername(2)`, and the
+  `SOL_SOCKET` identity options for stable UDP sockets, preserving Linux
+  destination and bind family rules, `AF_UNSPEC` connect and name handling,
+  invalid port errors, and short or negative `getsockopt(2)` lengths.
+- Model Linux default dual-stack behavior for stable IPv6 UDP sockets and
+  report logical addresses in the socket's own family, so dual-stack peers and
+  response sources appear as v4-mapped addresses.
+- Rewrite `sendmmsg(2)` destinations and serve `recvmmsg(2)` through the
+  receive supervisor, preserving per-entry length, flags, source, `MSG_PEEK`,
+  `MSG_TRUNC`, `MSG_WAITFORONE`, partial completion, and remaining-timeout
+  writeback.
+- Preserve numeric UDP response sources from the SOCKS5 UDP response header or
+  the direct worker's kernel peer for `recvfrom(2)`, `recvmsg(2)`, and each
+  `recvmmsg(2)` entry.
+- Honor `SO_RCVTIMEO` for blocking relayed receives, including per-entry
+  re-arming across `recvmmsg(2)` batches and transfer of a pre-existing timeout
+  across lazy replacement.
+- Keep UDP-Lite sockets in the kernel instead of emulating their sends and
+  connects.
+- Match Linux validation for UDP destination name lengths, zero-length names,
+  and oversized receive iovec segments.
+
 ## 0.3.0
 
 - Require Linux 6.9 or newer so notification threads always support reliable

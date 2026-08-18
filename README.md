@@ -108,9 +108,9 @@ immediately. Resource exhaustion is fail-closed and classified in the summary.
 
 ### Runtime environment selectors
 
-The TCP broker data plane exposes environment selectors. The defaults are the
-supported configuration; the alternates exist for rollback and for opt-in
-experiments. Unsupported values fail startup instead of being ignored.
+The data plane exposes environment selectors. The defaults are the supported
+configuration; the alternates exist for rollback and for opt-in experiments.
+Unsupported values fail startup instead of being ignored.
 
 - `SUP_TCP_REACTOR=epoll|poll`: readiness backend. Default `epoll`; `poll` is
   the explicit rollback path.
@@ -126,6 +126,12 @@ experiments. Unsupported values fail startup instead of being ignored.
   a 30 s idle timeout; each warm session serves exactly one flow and misses
   fall back to cold dials. It mainly benefits short-connection bursts against
   proxies with non-trivial RTT.
+- `SUP_UDP_SOCKET_MODE=lazy|stable`: UDP socket identity model, applied only
+  with `--enable-udp`. Default `lazy` replaces the descriptor on the first
+  proxied send. `stable` is experimental and injects the relay endpoint at
+  `socket(2)` time, which keeps the open file description stable across
+  `dup(2)`, `fork(2)`, and close races and enables the virtualized
+  `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
 
 ## Compatibility and Limitations
 
@@ -144,13 +150,60 @@ loopback broker.
 
 Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
-multiple responses, ancillary data, pre-existing epoll registrations, or fd
-aliases created with `dup(2)` or inherited across `fork(2)`.
-Active UDP relays are capped at 128, with a bounded 16-datagram input queue per
-relay. New relay setup fails closed when the global limit is reached.
+multiple responses, ancillary data, or pre-existing epoll registrations. The
+default lazy mode creates the relay on the first proxied send and does not
+preserve aliases created before that point. Set `SUP_UDP_SOCKET_MODE=stable`
+with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
+the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
+using `SO_COOKIE` as the primary relay key.
+Active UDP relay creation is capped at 128, with a bounded 16-datagram input
+queue per relay. A low-frequency supervisor sweep reclaims relays whose AF_UNIX
+inode no longer has an open target-side alias; capacity-bound admission also
+sweeps and retries briefly. Normal socket creation does not scan procfs, and
+an unavailable `/proc/net/unix` delays cleanup instead of breaking creation
+while capacity remains.
 
-UDP redirection currently covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
-`recvmsg(2)`. Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten.
+UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
+`recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`
+and serves `recvmmsg(2)` through the receive supervisor. Stable mode also
+virtualizes `getsockname(2)`, `getpeername(2)`, and the common
+`SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
+`SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
+addresses are logical relay state; an unbound socket reports its family's
+wildcard address with port zero, and an explicitly bound port zero is not
+replaced with a kernel-assigned ephemeral port. Logical operations reject
+invalid destination ports and unsupported families before creating a relay.
+AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
+Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations;
+their logical addresses are reported in the socket's own family, so a
+dual-stack peer or response source appears as a v4-mapped IPv6 address.
+Destination names are read the way the target socket reads them: a zero-length
+name fails `sendto(2)` and falls back to the connected peer in `sendmsg(2)`, an
+`AF_UNSPEC` name is an AF_INET address on AF_INET sockets and no name at all on
+AF_INET6 ones, and any other family is rejected with that socket's error.
+Bind remains strict-family, including Linux's IPv6 length checks and IPv4
+`AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
+`AF_UNSPEC` connect clears the peer, after which destination-free sends fail
+with `EDESTADDRREQ`. Virtualized integer socket options preserve Linux's
+short-buffer truncation and negative-length rejection rules. For
+unconnected request/response traffic, `recvfrom(2)`, `recvmsg(2)`, and each
+`recvmmsg(2)` entry report the numeric source from the SOCKS5 UDP response header
+or the direct worker's kernel peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`,
+partial completion, and mixed receive calls preserve payload/source queue order.
+Blocking relayed receives
+honor `SO_RCVTIMEO` read from the injected endpoint: a quiet
+`recvfrom(2)`/`recvmsg(2)` fails with `EAGAIN` at the deadline, while
+`recvmmsg(2)` re-arms the socket timeout after each delivered entry and returns
+the completed count once it expires with progress. Successful batches write the
+remaining explicit interval back to the caller's timespec; a failed writeback
+returns `EFAULT` even after batch progress. Stable `recvmmsg(2)`
+uses an absolute reactor deadline and returns zero with a zero remaining interval
+when an empty-queue explicit timeout expires, instead of reproducing Linux's
+documented timeout hang; when both the socket timeout and an explicit timespec
+are armed, the earlier deadline keeps its own expiry result. Lazy replacement
+transfers a pre-existing `SO_RCVTIMEO` to the injected endpoint. SOCKS5
+domain-name response sources, `msg_control` data, error queues, and other
+IP-level option semantics remain limited.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

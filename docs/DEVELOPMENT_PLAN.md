@@ -71,7 +71,10 @@ is `socks5://127.0.0.1:1080`.
   acknowledges receipt.
 - The filter kills non-x86_64 ABIs, always traps `connect(2)`, and traps UDP
   send/receive plus descriptor close/replacement syscalls only when DNS or
-  generic UDP redirection is enabled. All other syscalls are allowed.
+  generic UDP redirection is enabled. Opt-in stable UDP mode also traps
+  `socket(2)`, `bind(2)`, `sendmmsg(2)`, `recvmmsg(2)`, `getsockname(2)`,
+  `getpeername(2)`, and selected `getsockopt(2)` queries; all other syscalls are
+  allowed.
 - The child stage writes the listener fd number to the parent and the parent
   duplicates it with `pidfd_getfd(2)`, avoiding a post-filter `sendmsg(2)`
   bootstrap exception.
@@ -135,13 +138,39 @@ is `socks5://127.0.0.1:1080`.
   size is bounded by the number of target threads because each thread can have
   only one notification pending.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
-  target and runs a supervisor relay on the other end. Explicit `sendto(2)` /
-  `sendmsg(2)` destinations are forwarded by the notification handler;
-  connected UDP sends are read by the relay socket. `close(2)`, closing
-  `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay creation so
-  a concurrent descriptor change cannot cross the injection window. Closing
-  calls also remove matching relays so long-running targets do not retain relay
-  threads after closing UDP sockets.
+  target and runs a supervisor relay on the other end. Lazy mode performs this
+  replacement on the first proxied send. Stable mode (`SUP_UDP_SOCKET_MODE=stable`)
+  traps UDP socket creation and uses `SECCOMP_ADDFD_FLAG_SEND` so the target sees
+  the injected fd as the `socket(2)` result; `bind(2)` is emulated for the
+  logical endpoint and direct workers reuse that requested local address.
+  `getsockname(2)` and `getpeername(2)` return the logical local/connected
+  destination, while `getsockopt(2)` reports the AF_INET/AF_INET6 UDP domain,
+  type, protocol, and a zero socket error.
+  Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
+  `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
+  descriptor-number change. A low-frequency reactor sweep checks AF_UNIX
+  inodes in `/proc/net/unix` and reclaims a relay only after its last target-side
+  open file description has disappeared. Capacity-bound admission sweeps and
+  retries briefly; normal socket creation avoids procfs, and read failures
+  defer cleanup instead of failing creation while capacity remains.
+  Explicit `sendto(2)`/`sendmsg(2)`
+  destinations are forwarded by the notification handler; connected UDP sends
+  are read by the relay socket. Destination names are resolved against the
+  target socket's own address family: a zero-length name fails `sendto(2)` and
+  falls back to the connected peer in `sendmsg(2)`, an `AF_UNSPEC` name is an
+  AF_INET address on AF_INET sockets and no name at all on AF_INET6 ones, and
+  other families take that socket's error. Ports and family compatibility are
+  checked once the family is settled, so a peer recorded by `connect(2)` keeps
+  whatever that call accepted. AF_INET6 sockets model the default dual-stack
+  policy for destinations and report logical addresses in their own family,
+  while bind stays strict-family and preserves native
+  length errors. `IPV6_V6ONLY` remains unvirtualized. Disconnected sends fail,
+  and `AF_UNSPEC` disconnect is emulated without altering the AF_UNIX transport.
+  A send whose name the kernel drops is relayed by the supervisor rather than
+  continued, so the AF_UNIX endpoint never sees an address it would reject.
+  `close(2)`,
+  closing `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay
+  creation so a concurrent descriptor change cannot cross the injection window.
 - UDP relay admission is globally capped at 128. Each relay uses two fallible
   workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
   sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
@@ -149,8 +178,28 @@ is `socks5://127.0.0.1:1080`.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
-- Batched `sendmmsg(2)` / `recvmmsg(2)` calls are not rewritten in the current
-  implementation.
+- Stable mode rewrites explicit destinations in `sendmmsg(2)` and writes each
+  successful message length back to the target array. Stable `recvmmsg(2)` runs
+  through the receive reactor, retains partial batch progress across readiness
+  waits, and writes each entry's payload length, flags, and numeric source.
+  `recvfrom(2)`, `recvmsg(2)`, and `recvmmsg(2)` atomically pair responses with
+  the SOCKS5 UDP header source or the direct worker's kernel peer across
+  `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`, and mixed receive calls. Sources
+  and peers are rendered in the socket's own family, so a dual-stack AF_INET6
+  socket sees v4-mapped IPv4 addresses. Empty-queue
+  batch timeouts use an absolute reactor deadline rather than reproducing the
+  documented Linux timeout hang. Blocking receives sample `SO_RCVTIMEO` from
+  the supervisor's duplicate of the injected endpoint (one open file
+  description, so stable dup/fork aliases and the lazy replacement endpoint
+  share the transferred option): a quiet `recvfrom(2)`/`recvmsg(2)` fails with
+  `EAGAIN` at the syscall-relative deadline, and
+  `recvmmsg(2)` bounds each inter-datagram gap, re-arms after every delivered
+  entry, and returns the completed count when the timeout expires with
+  progress. Successful batch progress writes the remaining explicit timeout
+  back to the target timespec, and a failed writeback overrides progress with
+  `EFAULT`; the earlier of the socket timeout and the
+  explicit timespec keeps its own expiry result. SOCKS5 domain-name response
+  sources, error queues, and ancillary/control data remain deferred.
 
 ## Routing Rules
 
