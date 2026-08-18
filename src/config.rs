@@ -7,11 +7,14 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ipnet::IpNet;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
+
+/// Deprecated alias for `--udp-socket-mode`, kept for one release.
+const UDP_SOCKET_MODE_ENV: &str = "SUP_UDP_SOCKET_MODE";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +53,13 @@ pub struct Cli {
     #[arg(long, help = "DNS-over-TCP upstream for --enable-dns")]
     pub dns_server: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "UDP socket identity model for --enable-udp [default: lazy]"
+    )]
+    pub udp_socket_mode: Option<UdpSocketMode>,
+
     #[arg(long)]
     pub debug: bool,
 
@@ -70,9 +80,24 @@ pub struct EffectiveConfig {
     pub enable_dns: bool,
     pub enable_udp: bool,
     pub dns_server: Option<SocketAddr>,
+    pub udp_socket_mode: UdpSocketMode,
     pub debug: bool,
     pub metrics_file: Option<PathBuf>,
     pub command: Vec<OsString>,
+}
+
+/// Socket identity model for redirected UDP. `Lazy` replaces the target's
+/// descriptor on the first proxied send; `Stable` injects the relay endpoint at
+/// `socket(2)` time so the open file description survives `dup(2)`, `fork(2)`,
+/// and close races. Both change observable socket semantics, so the selector
+/// lives on the CLI next to `--enable-udp` rather than in the data-plane
+/// environment selectors.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpSocketMode {
+    #[default]
+    Lazy,
+    Stable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +129,7 @@ struct FileConfig {
     enable_dns: Option<bool>,
     enable_udp: Option<bool>,
     dns_server: Option<String>,
+    udp_socket_mode: Option<UdpSocketMode>,
     debug: Option<bool>,
     metrics_file: Option<PathBuf>,
 }
@@ -156,6 +182,9 @@ impl EffectiveConfig {
         let dns_server = enable_dns
             .then(|| resolve_dns_server(&dns_server_raw))
             .transpose()?;
+        // Parsed even when an explicit flag or config key wins, so an
+        // unsupported value keeps failing startup instead of being ignored.
+        let env_udp_socket_mode = udp_socket_mode_from_env()?;
 
         let cfg = Self {
             proxy,
@@ -170,6 +199,11 @@ impl EffectiveConfig {
             enable_dns,
             enable_udp: cli.enable_udp || file_cfg.enable_udp.unwrap_or(false),
             dns_server,
+            udp_socket_mode: cli
+                .udp_socket_mode
+                .or(file_cfg.udp_socket_mode)
+                .or(env_udp_socket_mode)
+                .unwrap_or_default(),
             debug: cli.debug || file_cfg.debug.unwrap_or(false),
             metrics_file: cli.metrics_file.or(file_cfg.metrics_file),
             command: cli.command,
@@ -184,6 +218,9 @@ impl EffectiveConfig {
         }
         if self.enable_udp && matches!(self.proxy, ProxyConfig::Http { .. }) {
             bail!("generic UDP redirection requires a SOCKS5 proxy");
+        }
+        if self.udp_socket_mode == UdpSocketMode::Stable && !self.enable_udp {
+            bail!("--udp-socket-mode=stable requires --enable-udp");
         }
         Ok(())
     }
@@ -216,6 +253,30 @@ fn resolve_dns_server(raw: &str) -> Result<SocketAddr> {
         .with_context(|| format!("resolve DNS server {raw:?}"))?
         .find(|addr| addr.port() != 0)
         .ok_or_else(|| anyhow!("DNS server {raw:?} resolved to no address with a nonzero port"))
+}
+
+fn udp_socket_mode_from_env() -> Result<Option<UdpSocketMode>> {
+    let raw = match std::env::var(UDP_SOCKET_MODE_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => bail!("invalid {UDP_SOCKET_MODE_ENV} value: {err}"),
+    };
+    let mode = parse_udp_socket_mode_env(raw.as_deref())?;
+    if mode.is_some() {
+        eprintln!(
+            "yatht: {UDP_SOCKET_MODE_ENV} is deprecated and will be removed; \
+             use --udp-socket-mode instead"
+        );
+    }
+    Ok(mode)
+}
+
+fn parse_udp_socket_mode_env(raw: Option<&str>) -> Result<Option<UdpSocketMode>> {
+    raw.map(|raw| {
+        UdpSocketMode::from_str(raw, false)
+            .map_err(|_| anyhow!("unsupported {UDP_SOCKET_MODE_ENV} value: {raw}"))
+    })
+    .transpose()
 }
 
 impl ProxyConfig {
@@ -472,6 +533,85 @@ mod tests {
     }
 
     #[test]
+    fn rejects_stable_udp_socket_mode_without_generic_udp() {
+        let mut cfg = test_config();
+        cfg.udp_socket_mode = UdpSocketMode::Stable;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("requires --enable-udp"), "{err}");
+
+        cfg.enable_udp = true;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_lazy_udp_socket_mode_without_generic_udp() {
+        let mut cfg = test_config();
+        cfg.udp_socket_mode = UdpSocketMode::Lazy;
+
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_udp_socket_mode_flag_values() {
+        let cli =
+            Cli::try_parse_from(["yatht", "--udp-socket-mode", "stable", "--", "true"]).unwrap();
+        assert_eq!(cli.udp_socket_mode, Some(UdpSocketMode::Stable));
+
+        let cli = Cli::try_parse_from(["yatht", "--udp-socket-mode=lazy", "--", "true"]).unwrap();
+        assert_eq!(cli.udp_socket_mode, Some(UdpSocketMode::Lazy));
+
+        let cli = Cli::try_parse_from(["yatht", "--", "true"]).unwrap();
+        assert_eq!(cli.udp_socket_mode, None);
+
+        let err = Cli::try_parse_from(["yatht", "--udp-socket-mode", "eager", "--", "true"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("eager"), "{err}");
+    }
+
+    #[test]
+    fn parses_udp_socket_mode_from_the_config_file() {
+        let file_cfg = toml::from_str::<FileConfig>("udp_socket_mode = 'stable'").unwrap();
+        assert_eq!(file_cfg.udp_socket_mode, Some(UdpSocketMode::Stable));
+
+        let err = toml::from_str::<FileConfig>("udp_socket_mode = 'eager'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("eager"), "{err}");
+    }
+
+    #[test]
+    fn accepts_the_deprecated_udp_socket_mode_env_alias() {
+        assert_eq!(parse_udp_socket_mode_env(None).unwrap(), None);
+        assert_eq!(
+            parse_udp_socket_mode_env(Some("lazy")).unwrap(),
+            Some(UdpSocketMode::Lazy)
+        );
+        assert_eq!(
+            parse_udp_socket_mode_env(Some("stable")).unwrap(),
+            Some(UdpSocketMode::Stable)
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_udp_socket_mode_env_alias_values() {
+        let err = parse_udp_socket_mode_env(Some("Stable"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unsupported SUP_UDP_SOCKET_MODE value"),
+            "{err}"
+        );
+
+        let err = parse_udp_socket_mode_env(Some("")).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported SUP_UDP_SOCKET_MODE value"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn resolves_and_caches_proxy_hostname_addresses() {
         let mut endpoint = ProxyEndpoint::new("localhost:1080".to_string());
         assert!(endpoint.addrs().is_empty());
@@ -511,6 +651,7 @@ mod tests {
             enable_dns: true,
             enable_udp: false,
             dns_server: Some("127.0.0.1:5353".to_string()),
+            udp_socket_mode: None,
             debug: false,
             metrics_file: None,
             command: vec![OsString::from("true")],
@@ -535,6 +676,7 @@ mod tests {
             enable_dns: false,
             enable_udp: false,
             dns_server: None,
+            udp_socket_mode: UdpSocketMode::Lazy,
             debug: false,
             metrics_file: None,
             command: vec![OsString::from("true")],
@@ -615,6 +757,7 @@ mod tests {
             enable_dns: false,
             enable_udp: false,
             dns_server: None,
+            udp_socket_mode: UdpSocketMode::Lazy,
             debug: false,
             metrics_file: None,
             command: vec![OsString::from("true")],

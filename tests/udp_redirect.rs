@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -435,7 +435,8 @@ fn stable_udp_matches_socket_error_semantics() {
 
     let (_probe_dir, probe) = build_udp_socket_error_probe();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -472,7 +473,8 @@ fn stable_udp_matches_address_semantics() {
 
     let (_probe_dir, probe) = build_udp_address_semantics_probe();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -492,7 +494,8 @@ fn assert_udp_name_length_semantics(socket_mode: Option<&str>) {
     let (_probe_dir, probe) = build_udp_name_length_probe();
     let output = match socket_mode {
         Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
-            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--udp-socket-mode")
+            .arg(mode)
             .arg("--proxy")
             .arg("socks5://127.0.0.1:9")
             .arg("--enable-udp")
@@ -554,7 +557,8 @@ fn stable_udp_matches_send_destination_semantics() {
     let (_probe_dir, probe) = build_udp_send_destination_probe();
     let peer = UdpSocket::bind("[::1]:0").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -580,7 +584,8 @@ fn lazy_udp_matches_send_destination_semantics() {
     let (_probe_dir, probe) = build_udp_send_destination_probe();
     let peer = UdpSocket::bind("[::1]:0").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "lazy")
+        .arg("--udp-socket-mode")
+        .arg("lazy")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -603,7 +608,8 @@ fn assert_cross_protocol_sends_reach_the_kernel(socket_mode: Option<&str>) {
     let (_probe_dir, probe) = build_cross_protocol_send_probe();
     let output = match socket_mode {
         Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
-            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--udp-socket-mode")
+            .arg(mode)
             .arg("--proxy")
             .arg("socks5://127.0.0.1:9")
             .arg("--enable-udp")
@@ -652,7 +658,8 @@ fn assert_connected_udplite_preserves_protocol(socket_mode: Option<&str>) {
     let (_probe_dir, probe) = build_connected_udplite_probe();
     let output = match socket_mode {
         Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
-            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--udp-socket-mode")
+            .arg(mode)
             .arg("--proxy")
             .arg("socks5://127.0.0.1:9")
             .arg("--enable-udp")
@@ -709,7 +716,8 @@ fn stable_udp_preserves_getsockopt_truncation() {
 
     let (_probe_dir, probe) = build_udp_getsockopt_probe();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -766,7 +774,8 @@ fn stable_udp_recvmmsg_matches_error_and_nonblocking_baseline() {
 
     let (_probe_dir, probe) = build_udp_recvmmsg_error_probe();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -812,7 +821,8 @@ fn stable_udp_recvmmsg_timeout_write_fault_overrides_batch_count() {
     let (_probe_dir, probe) = build_udp_recvmmsg_timeout_fault_probe();
     let (destination, server_thread) = spawn_udp_recvmmsg_timeout_fault_exchange();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -838,7 +848,8 @@ fn stable_udp_recvmmsg_honors_an_empty_queue_deadline() {
 
     let (_probe_dir, probe) = build_udp_recvmmsg_deadline_probe();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -883,7 +894,8 @@ fn stable_udp_direct_receive_honors_rcvtimeo() {
     let (destination, server_thread) = spawn_udp_rcvtimeo_exchange();
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -939,7 +951,8 @@ fn stable_udp_proxy_receive_honors_rcvtimeo() {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1038,7 +1051,8 @@ fn stable_udp_recvmmsg_returns_partial_count_before_bad_entry() {
     let (_probe_dir, probe) = build_udp_recvmmsg_partial_probe();
     let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1085,7 +1099,8 @@ fn stable_udp_recvmmsg_preserves_peek_and_waitforone() {
     let (_probe_dir, probe) = build_udp_recvmmsg_flag_probe();
     let (destination, response_sources, server_thread) = spawn_udp_recvmmsg_flag_exchange();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1111,7 +1126,8 @@ fn stable_udp_direct_recvmmsg_preserves_sources_and_queue_order() {
     let (destination, response_sources, server_thread) = spawn_changed_source_udp_batch_exchange();
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1174,7 +1190,8 @@ fn stable_udp_proxy_recvmmsg_preserves_sources_and_queue_order() {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1223,7 +1240,8 @@ fn stable_udp_reports_dual_stack_addresses_as_v4_mapped() {
     let (destination, response_source, server_thread) = spawn_changed_source_udp_rounds(2);
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1263,7 +1281,8 @@ fn assert_dual_stack_bind_preserves_source_port(socket_mode: Option<&str>) {
 
     let output = match socket_mode {
         Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
-            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--udp-socket-mode")
+            .arg(mode)
             .arg("--proxy")
             .arg("socks5://127.0.0.1:9")
             .arg("--enable-udp")
@@ -1323,7 +1342,8 @@ fn stable_udp_direct_receive_reports_actual_response_source() {
     let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1382,7 +1402,8 @@ fn stable_udp_proxy_receive_reports_socks5_response_source() {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1437,7 +1458,8 @@ fn stable_udp_socket_survives_bind_dup_close_and_fork() {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1465,7 +1487,8 @@ fn stable_udp_reclaims_closed_socket_capacity() {
 
     let (_probe_dir, probe) = build_stable_udp_lifetime_probe();
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1490,7 +1513,8 @@ fn stable_udp_reaps_idle_closed_relay_workers() {
     const SOCKET_COUNT: usize = 24;
     let (_probe_dir, probe) = build_stable_udp_idle_reap_probe();
     let mut child = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg("socks5://127.0.0.1:9")
         .arg("--enable-udp")
@@ -1530,6 +1554,51 @@ fn stable_udp_reaps_idle_closed_relay_workers() {
 }
 
 #[test]
+fn rejects_stable_udp_socket_mode_without_generic_udp() {
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--udp-socket-mode")
+        .arg("stable")
+        .arg("--")
+        .arg("true")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "status={:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--udp-socket-mode=stable requires --enable-udp"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn deprecated_udp_socket_mode_env_alias_selects_stable_mode() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    const SOCKET_COUNT: usize = 24;
+    let (_probe_dir, probe) = build_stable_udp_idle_reap_probe();
+    let lazy = run_idle_reap_probe(&probe, SocketModeSelector::Flag("lazy"));
+    let aliased = run_idle_reap_probe(&probe, SocketModeSelector::DeprecatedEnv("stable"));
+
+    assert!(
+        aliased.threads >= lazy.threads + SOCKET_COUNT * 2,
+        "deprecated alias did not select stable mode: lazy={}, aliased={}",
+        lazy.threads,
+        aliased.threads
+    );
+    assert!(
+        aliased.stderr.contains("SUP_UDP_SOCKET_MODE is deprecated"),
+        "{}",
+        aliased.stderr
+    );
+    assert!(!lazy.stderr.contains("deprecated"), "{}", lazy.stderr);
+}
+
+#[test]
 fn stable_udp_connected_socket_reports_logical_peer() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1565,7 +1634,8 @@ fn stable_udp_connected_socket_reports_logical_peer() {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1624,7 +1694,8 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
-        .env("SUP_UDP_SOCKET_MODE", "stable")
+        .arg("--udp-socket-mode")
+        .arg("stable")
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -4727,6 +4798,55 @@ fn encode_udp_packet(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&dest.port().to_be_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+enum SocketModeSelector<'a> {
+    Flag(&'a str),
+    DeprecatedEnv(&'a str),
+}
+
+struct IdleReapProbeRun {
+    threads: usize,
+    stderr: String,
+}
+
+/// Runs the idle-reap probe under one socket-mode selector and samples the
+/// supervisor's thread count while the probe's sockets are open. Stable mode
+/// starts a relay reader and writer per socket at `socket(2)` time and lazy
+/// mode starts none until the first proxied send, so comparing two runs
+/// identifies the selected mode without depending on how many notification
+/// workers the host's core count produces.
+fn run_idle_reap_probe(probe: &Path, selector: SocketModeSelector<'_>) -> IdleReapProbeRun {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    match selector {
+        SocketModeSelector::Flag(mode) => command.arg("--udp-socket-mode").arg(mode),
+        SocketModeSelector::DeprecatedEnv(mode) => command.env("SUP_UDP_SOCKET_MODE", mode),
+    };
+    let mut child = command
+        .arg("--proxy")
+        .arg("socks5://127.0.0.1:9")
+        .arg("--enable-udp")
+        .arg("--")
+        .arg(probe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "open\n");
+    let threads = process_thread_count(child.id());
+
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "status={:?}", output.status);
+    IdleReapProbeRun {
+        threads,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }
 
 fn process_thread_count(pid: u32) -> usize {

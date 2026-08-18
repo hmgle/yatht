@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel as channel;
 
-use crate::config::{EffectiveConfig, Route};
+use crate::config::{EffectiveConfig, Route, UdpSocketMode};
 use crate::observability::{Observability, ObservabilityRuntime, TcpSetupTrace};
 use crate::proxy;
 use crate::proxy::warm::{
@@ -29,7 +29,6 @@ const CHILD_STAGE_ENV: &str = "SUP_CHILD_STAGE";
 const TARGET_PATH_ENV: &str = "SUP_TARGET_PATH";
 const TARGET_ARGV_ENV: &str = "SUP_TARGET_ARGV";
 const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
-const UDP_SOCKET_MODE_ENV: &str = "SUP_UDP_SOCKET_MODE";
 const CONTROL_FD: RawFd = 3;
 const MAX_UDP_PAYLOAD: usize = 65_535;
 const SOCKADDR_IN_SIZE: usize = 16;
@@ -209,28 +208,6 @@ const _: () = assert!(std::mem::size_of::<libc::msghdr>() == X86_64_MSGHDR_SIZE)
 const _: () = assert!(std::mem::size_of::<libc::mmsghdr>() == X86_64_MMSGHDR_SIZE);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UdpSocketMode {
-    Lazy,
-    Stable,
-}
-
-fn udp_socket_mode_from_env() -> io::Result<UdpSocketMode> {
-    match std::env::var(UDP_SOCKET_MODE_ENV) {
-        Ok(value) if value == "lazy" => Ok(UdpSocketMode::Lazy),
-        Ok(value) if value == "stable" => Ok(UdpSocketMode::Stable),
-        Ok(value) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported {UDP_SOCKET_MODE_ENV} value: {value}"),
-        )),
-        Err(std::env::VarError::NotPresent) => Ok(UdpSocketMode::Lazy),
-        Err(err) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid {UDP_SOCKET_MODE_ENV} value: {err}"),
-        )),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Destination {
     pub ip: IpAddr,
     pub port: u16,
@@ -277,8 +254,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     set_child_subreaper().context("become child subreaper")?;
     let argv = cfg.command.clone();
     let (parent_sock, child_sock) = socketpair().context("create control socketpair")?;
-    let udp_socket_mode = udp_socket_mode_from_env().context("select UDP socket mode")?;
-    let trap_set = if cfg.enable_udp && udp_socket_mode == UdpSocketMode::Stable {
+    let trap_set = if cfg.enable_udp && cfg.udp_socket_mode == UdpSocketMode::Stable {
         seccomp::TrapSet::with_udp()
     } else if cfg.enable_dns || cfg.enable_udp {
         seccomp::TrapSet::with_dns()
@@ -6617,6 +6593,7 @@ mod tests {
             enable_dns,
             enable_udp: false,
             dns_server: enable_dns.then(|| SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53))),
+            udp_socket_mode: UdpSocketMode::Lazy,
             debug: false,
             metrics_file: None,
             command: Vec::new(),

@@ -68,6 +68,7 @@ proxy_cidrs = []
 enable_dns = false
 enable_udp = false
 dns_server = "1.1.1.1:53"
+udp_socket_mode = "lazy"
 debug = false
 # metrics_file = "/tmp/yatht-metrics.jsonl"
 ```
@@ -86,6 +87,8 @@ Important options:
 - `--enable-dns`: redirect UDP/53 through DNS-over-TCP.
 - `--enable-udp`: redirect generic UDP through SOCKS5 UDP ASSOCIATE.
 - `--dns-server <addr>`: DNS-over-TCP upstream for `--enable-dns`.
+- `--udp-socket-mode <lazy|stable>`: UDP socket identity model, default `lazy`.
+  Requires `--enable-udp`; `stable` without it fails startup.
 - `--debug`: print routing and notification diagnostics.
 - `--metrics-file <path>`: write experimental performance metrics as JSONL.
 
@@ -126,12 +129,13 @@ Unsupported values fail startup instead of being ignored.
   a 30 s idle timeout; each warm session serves exactly one flow and misses
   fall back to cold dials. It mainly benefits short-connection bursts against
   proxies with non-trivial RTT.
-- `SUP_UDP_SOCKET_MODE=lazy|stable`: UDP socket identity model, applied only
-  with `--enable-udp`. Default `lazy` replaces the descriptor on the first
-  proxied send. `stable` is experimental and injects the relay endpoint at
-  `socket(2)` time, which keeps the open file description stable across
-  `dup(2)`, `fork(2)`, and close races and enables the virtualized
-  `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
+
+`SUP_UDP_SOCKET_MODE=lazy|stable` is a deprecated alias for
+`--udp-socket-mode`. It still works but prints a notice and will be removed in
+the next release; it also has the lowest precedence, so the CLI flag and the
+configuration key both override it. The mode changes observable socket
+semantics rather than gating an internal data-plane implementation, which is
+why it belongs on the CLI instead of alongside the selectors above.
 
 ## Compatibility and Limitations
 
@@ -152,10 +156,11 @@ Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
 multiple responses, ancillary data, or pre-existing epoll registrations. The
 default lazy mode creates the relay on the first proxied send and does not
-preserve aliases created before that point. Set `SUP_UDP_SOCKET_MODE=stable`
+preserve aliases created before that point. Pass `--udp-socket-mode=stable`
 with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
-using `SO_COOKIE` as the primary relay key.
+using `SO_COOKIE` as the primary relay key. Stable mode also enables the
+virtualized `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
 Active UDP relay creation is capped at 128, with a bounded 16-datagram input
 queue per relay. A low-frequency supervisor sweep reclaims relays whose AF_UNIX
 inode no longer has an open target-side alias; capacity-bound admission also

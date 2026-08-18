@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Select the UDP socket identity model with `--udp-socket-mode=lazy|stable` or
+  the `udp_socket_mode` configuration key, and reject `stable` without
+  `--enable-udp` at startup. `SUP_UDP_SOCKET_MODE` remains a deprecated,
+  lowest-precedence alias for one release and now prints a notice.
+
 ## 0.4.0
 
 - Add an opt-in stable UDP socket mode (`SUP_UDP_SOCKET_MODE=stable` with

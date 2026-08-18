@@ -6,5 +6,6 @@ proxy_cidrs = []
 enable_dns = false
 enable_udp = false
 dns_server = "1.1.1.1:53"
+udp_socket_mode = "lazy"
 debug = false
 # metrics_file = "/tmp/yatht-metrics.jsonl"
