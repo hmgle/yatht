@@ -1043,7 +1043,7 @@ fn direct_kernel_udp_dual_stack_address_baseline() {
     }
 
     let (_probe_dir, probe) = build_udp_dual_stack_address_probe();
-    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_rounds(2);
 
     let output = Command::new(&probe)
         .arg(destination.to_string())
@@ -1066,7 +1066,7 @@ fn stable_udp_reports_dual_stack_addresses_as_v4_mapped() {
     }
 
     let (_probe_dir, probe) = build_udp_dual_stack_address_probe();
-    let (destination, response_source, server_thread) = spawn_changed_source_udp_exchange();
+    let (destination, response_source, server_thread) = spawn_changed_source_udp_rounds(2);
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .env("SUP_UDP_SOCKET_MODE", "stable")
@@ -2305,9 +2305,32 @@ int main(int argc, char **argv) {
     if (msg.msg_namelen != sizeof(msg_source) ||
         !same_address(&msg_source, &expected_source)) return 15;
     if (memcmp(received, response, sizeof(response) - 1) != 0) return 16;
-    if (close(fd) != 0) return 17;
 
-    if (write(STDOUT_FILENO, "dual-stack-address-ok", 21) != 21) return 18;
+    /* recvmmsg fills msg_name per entry and must map the source the same way. */
+    if (sendto(fd, query, sizeof(query) - 1, MSG_NOSIGNAL,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(query) - 1)) return 17;
+
+    char batch_payload[sizeof(response)];
+    struct iovec batch_iov = {
+        .iov_base = batch_payload, .iov_len = sizeof(batch_payload)
+    };
+    struct sockaddr_in6 batch_source;
+    struct mmsghdr batch;
+    memset(&batch_source, 0, sizeof(batch_source));
+    memset(&batch, 0, sizeof(batch));
+    batch.msg_hdr.msg_name = &batch_source;
+    batch.msg_hdr.msg_namelen = sizeof(batch_source);
+    batch.msg_hdr.msg_iov = &batch_iov;
+    batch.msg_hdr.msg_iovlen = 1;
+    if (recvmmsg(fd, &batch, 1, 0, NULL) != 1) return 18;
+    if (batch.msg_len != (unsigned int)(sizeof(response) - 1)) return 19;
+    if (batch.msg_hdr.msg_namelen != sizeof(batch_source) ||
+        !same_address(&batch_source, &expected_source)) return 20;
+    if (memcmp(batch_payload, response, sizeof(response) - 1) != 0) return 21;
+    if (close(fd) != 0) return 22;
+
+    if (write(STDOUT_FILENO, "dual-stack-address-ok", 21) != 21) return 23;
     return 0;
 }
 "#,
@@ -3848,15 +3871,26 @@ int main(int argc, char **argv) {
 }
 
 fn spawn_changed_source_udp_exchange() -> (SocketAddr, SocketAddr, thread::JoinHandle<()>) {
+    spawn_changed_source_udp_rounds(1)
+}
+
+/// Answers `rounds` queries from a source address that differs from the
+/// destination, so a probe can check every receive call shape against the same
+/// v4-mapped source.
+fn spawn_changed_source_udp_rounds(
+    rounds: usize,
+) -> (SocketAddr, SocketAddr, thread::JoinHandle<()>) {
     let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
     let destination = receiver.local_addr().unwrap();
     let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
     let response_source = sender.local_addr().unwrap();
     let server_thread = thread::spawn(move || {
-        let mut query = [0_u8; 128];
-        let (n, peer) = receiver.recv_from(&mut query).unwrap();
-        assert_eq!(&query[..n], UDP_METADATA_QUERY);
-        sender.send_to(UDP_METADATA_RESPONSE, peer).unwrap();
+        for _ in 0..rounds {
+            let mut query = [0_u8; 128];
+            let (n, peer) = receiver.recv_from(&mut query).unwrap();
+            assert_eq!(&query[..n], UDP_METADATA_QUERY);
+            sender.send_to(UDP_METADATA_RESPONSE, peer).unwrap();
+        }
     });
     (destination, response_source, server_thread)
 }
