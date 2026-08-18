@@ -2205,6 +2205,27 @@ fn handle_sendto(
     }
 }
 
+/// Imports a message's iovec array and its total length, the two checks Linux
+/// performs before any destination verdict: `copy_msghdr_from_user` faults on
+/// an unreadable array and rejects more than `UIO_MAXIOV` segments, and
+/// `udp_sendmsg` refuses an oversized datagram ahead of reporting a missing
+/// peer. Returns the errno to report on failure, so a caller that runs this
+/// first cannot answer `EDESTADDRREQ` where Linux answers `EFAULT` or
+/// `EMSGSIZE`. Reading the buffers themselves must stay after the destination
+/// verdict, which is where the kernel copies them.
+fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>, usize), i32> {
+    let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
+        Ok(iovecs) => iovecs,
+        // Too many segments is a length error to Linux, not a fault.
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => return Err(libc::EMSGSIZE),
+        Err(_) => return Err(libc::EFAULT),
+    };
+    // Match the sendto path: an oversized datagram cannot be sent, so report
+    // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
+    let total = iovec_total_len(&iovecs).map_err(|_| libc::EMSGSIZE)?;
+    Ok((iovecs, total))
+}
+
 /// Answers a send whose call carries no destination pointer at all. The kernel
 /// drops such a name before the injected AF_UNIX endpoint sees it, so a relayed
 /// socket can simply continue and let its connected peer carry the datagram;
@@ -2315,6 +2336,13 @@ fn handle_sendmsg(
         }
     };
     let existing = relays.lookup_handle(notif.pid, target_fd, true);
+    let (iovecs, total) = match import_send_iovecs(notif.pid, &msg) {
+        Ok(imported) => imported,
+        Err(errno) => {
+            seccomp::send_errno(listener_fd, notif.id, errno);
+            return;
+        }
+    };
     // `sendmsg(2)` drops a zero-length name, so both cases leave the datagram
     // without an explicit destination.
     if msg.name == 0 || msg.name_len == 0 {
@@ -2364,22 +2392,6 @@ fn handle_sendmsg(
         }
     };
 
-    let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
-        Ok(iovecs) => iovecs,
-        Err(_) => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-            return;
-        }
-    };
-    // Match the sendto path: an oversized datagram cannot be sent, so report
-    // EMSGSIZE rather than EFAULT (the buffer is valid, just too large).
-    let total = match iovec_total_len(&iovecs) {
-        Ok(total) => total,
-        Err(_) => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
-            return;
-        }
-    };
     let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
         Ok(payload) => payload,
         Err(_) => {
@@ -2454,6 +2466,13 @@ fn handle_sendmmsg(
                 return;
             }
         };
+        let (iovecs, total) = match import_send_iovecs(notif.pid, &msg) {
+            Ok(imported) => imported,
+            Err(errno) => {
+                send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
+                return;
+            }
+        };
         let named = if msg.name != 0 && msg.name_len != 0 {
             match resolve_send_destination(
                 notif.pid,
@@ -2492,20 +2511,6 @@ fn handle_sendmmsg(
                     return;
                 };
                 default
-            }
-        };
-        let iovecs = match read_iovec_targets(notif.pid, msg.iov, msg.iov_len) {
-            Ok(iovecs) => iovecs,
-            Err(_) => {
-                send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EFAULT);
-                return;
-            }
-        };
-        let total = match iovec_total_len(&iovecs) {
-            Ok(total) => total,
-            Err(_) => {
-                send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EMSGSIZE);
-                return;
             }
         };
         let payload = match read_iovec_payload(notif.pid, &iovecs, total) {

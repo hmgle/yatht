@@ -2624,6 +2624,79 @@ static int check_socket_relative_names(void) {
     return close(fd);
 }
 
+/* Linux imports the iovec array while copying the message header, and
+ * `udp_sendmsg` rejects an oversized datagram, both before it reports a
+ * missing peer. Reading the buffers themselves happens after that verdict, so
+ * a faulting `iov_base` must still surface as EDESTADDRREQ. */
+static int check_iovec_import_order(void) {
+    static char small[1];
+    static struct iovec many[2000];
+    struct iovec huge = { .iov_base = small, .iov_len = 200000 };
+    struct iovec bad_base = { .iov_base = (void *)1, .iov_len = 1 };
+    for (int index = 0; index < 2000; index++) {
+        many[index].iov_base = small;
+        many[index].iov_len = 0;
+    }
+
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+
+    /* An AF_INET6 socket drops an AF_UNSPEC name, reaching the same
+     * unconnected-peer verdict by a different route. */
+    struct sockaddr_in6 unspecified;
+    memset(&unspecified, 0, sizeof(unspecified));
+    unspecified.sin6_family = AF_UNSPEC;
+    unspecified.sin6_port = htons(9);
+
+    struct msghdr msg;
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+#define SEND_MSG(name_ptr, name_len, iov_ptr, iov_count) \
+    (memset(&msg, 0, sizeof(msg)), msg.msg_name = (name_ptr), \
+     msg.msg_namelen = (name_len), msg.msg_iov = (iov_ptr), \
+     msg.msg_iovlen = (iov_count), errno = 0, sendmsg(fd, &msg, 0))
+
+    if (SEND_MSG(&ipv4, 0, (struct iovec *)1, 1) != -1 ||
+        errno != EFAULT) { close(fd); return -1; }
+    if (SEND_MSG(&ipv4, 0, &huge, 1) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    if (SEND_MSG(&ipv4, 0, many, 2000) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    if (SEND_MSG(&ipv4, 0, &bad_base, 1) != -1 ||
+        errno != EDESTADDRREQ) { close(fd); return -1; }
+
+    struct mmsghdr batch;
+    memset(&batch, 0, sizeof(batch));
+    batch.msg_hdr.msg_name = &ipv4;
+    batch.msg_hdr.msg_namelen = 0;
+    batch.msg_hdr.msg_iovlen = 1;
+    batch.msg_hdr.msg_iov = (struct iovec *)1;
+    errno = 0;
+    if (sendmmsg(fd, &batch, 1, 0) != -1 || errno != EFAULT) { close(fd); return -1; }
+    batch.msg_hdr.msg_iov = &huge;
+    errno = 0;
+    if (sendmmsg(fd, &batch, 1, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
+    batch.msg_hdr.msg_iov = &bad_base;
+    errno = 0;
+    if (sendmmsg(fd, &batch, 1, 0) != -1 || errno != EDESTADDRREQ) { close(fd); return -1; }
+    if (close(fd) != 0) return -1;
+
+    fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (SEND_MSG(&unspecified, sizeof(unspecified), (struct iovec *)1, 1) != -1 ||
+        errno != EFAULT) { close(fd); return -1; }
+    if (SEND_MSG(&unspecified, sizeof(unspecified), &bad_base, 1) != -1 ||
+        errno != EDESTADDRREQ) { close(fd); return -1; }
+
+#undef SEND_MSG
+
+    return close(fd);
+}
+
 /* A dropped AF_UNSPEC name hands the datagram to the connected peer. Linux
  * only reaches a v4-mapped peer from the IPv4 fast path, which this call
  * bypasses, so the peer here is IPv6 to keep the check portable. */
@@ -2652,7 +2725,8 @@ int main(int argc, char **argv) {
     if (check_empty_name(AF_INET6) != 0) return 4;
     if (check_socket_relative_names() != 0) return 5;
     if (check_connected_unspecified_name(argv[1]) != 0) return 6;
-    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 7;
+    if (check_iovec_import_order() != 0) return 7;
+    if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 8;
     return 0;
 }
 "#,
