@@ -4233,7 +4233,7 @@ fn forward_dns_tcp(
 }
 
 /// Sends a datagram straight to its destination on a plain UDP socket, reusing a
-/// cached socket across jobs and rebinding only when the address family changes.
+/// cached socket across jobs until its effective bind changes.
 /// Mirrors the single request/response model of the proxy paths: one datagram is
 /// read back (within the timeout) so the connected-UDP return path stays fed.
 fn forward_direct_udp(
@@ -4251,9 +4251,10 @@ fn forward_direct_udp(
         },
         port: 0,
     };
-    let requested_bind = requested_bind
-        .filter(|bind| bind.ip.is_ipv4() == dest.ip.is_ipv4())
-        .unwrap_or(default_bind);
+    // Keep an explicit AF_INET6 bind even for an IPv4 destination. A dual-stack
+    // socket accepts that send and its bound port remains the datagram's source
+    // port; replacing the bind with an IPv4 wildcard silently loses it.
+    let requested_bind = requested_bind.unwrap_or(default_bind);
     let bind_matches = direct_udp
         .as_ref()
         .map(|state| state.requested_bind == requested_bind)

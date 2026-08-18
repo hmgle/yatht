@@ -1165,6 +1165,77 @@ fn stable_udp_reports_dual_stack_addresses_as_v4_mapped() {
     server_thread.join().unwrap();
 }
 
+fn assert_dual_stack_bind_preserves_source_port(socket_mode: Option<&str>) {
+    let (_probe_dir, probe) = build_udp_dual_stack_bind_probe();
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let destination = server.local_addr().unwrap();
+    let bind_reservation = UdpSocket::bind("[::]:0").unwrap();
+    let bind_port = bind_reservation.local_addr().unwrap().port();
+    drop(bind_reservation);
+    let (source_tx, source_rx) = mpsc::channel();
+    let server_thread = thread::spawn(move || {
+        let mut payload = [0_u8; 32];
+        let (received, source) = server.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..received], b"dual-stack-bind-query");
+        source_tx.send(source).unwrap();
+        server.send_to(b"dual-stack-bind-ok", source).unwrap();
+    });
+
+    let output = match socket_mode {
+        Some(mode) => Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .env("SUP_UDP_SOCKET_MODE", mode)
+            .arg("--proxy")
+            .arg("socks5://127.0.0.1:9")
+            .arg("--enable-udp")
+            .arg("--")
+            .arg(&probe)
+            .arg(destination.to_string())
+            .arg(bind_port.to_string())
+            .output()
+            .unwrap(),
+        None => Command::new(&probe)
+            .arg(destination.to_string())
+            .arg(bind_port.to_string())
+            .output()
+            .unwrap(),
+    };
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "dual-stack-bind-ok"
+    );
+    assert_eq!(
+        source_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .port(),
+        bind_port
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn direct_kernel_dual_stack_bind_preserves_source_port() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_dual_stack_bind_preserves_source_port(None);
+}
+
+#[test]
+fn stable_udp_dual_stack_bind_preserves_source_port() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    assert_dual_stack_bind_preserves_source_port(Some("stable"));
+}
+
 #[test]
 fn stable_udp_direct_receive_reports_actual_response_source() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -2409,6 +2480,72 @@ int main(int argc, char **argv) {
 
     if (write(STDOUT_FILENO, "dual-stack-address-ok", 21) != 21) return 23;
     return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&src)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (dir, bin)
+}
+
+fn build_udp_dual_stack_bind_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("udp_dual_stack_bind_probe.c");
+    let bin = dir.path().join("udp_dual_stack_bind_probe");
+    fs::write(
+        &src,
+        r#"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    struct sockaddr_in destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.sin_family = AF_INET;
+    char *colon = strrchr(argv[1], ':');
+    if (colon == NULL) return 3;
+    *colon = '\0';
+    destination.sin_port = htons((unsigned short)strtoul(colon + 1, NULL, 10));
+    if (inet_pton(AF_INET, argv[1], &destination.sin_addr) != 1) return 4;
+
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 5;
+    struct sockaddr_in6 local;
+    memset(&local, 0, sizeof(local));
+    local.sin6_family = AF_INET6;
+    local.sin6_addr = in6addr_any;
+    local.sin6_port = htons((unsigned short)strtoul(argv[2], NULL, 10));
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) return 6;
+
+    struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return 7;
+    static const char query[] = "dual-stack-bind-query";
+    if (sendto(fd, query, sizeof(query) - 1, 0,
+               (struct sockaddr *)&destination, sizeof(destination)) !=
+        (ssize_t)(sizeof(query) - 1)) return 8;
+
+    char response[32];
+    ssize_t received = recv(fd, response, sizeof(response), 0);
+    if (received != 18 || memcmp(response, "dual-stack-bind-ok", 18) != 0) return 9;
+    if (write(STDOUT_FILENO, response, (size_t)received) != received) return 10;
+    return close(fd);
 }
 "#,
     )
