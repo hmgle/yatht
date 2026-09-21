@@ -1580,9 +1580,7 @@ fn handle_recv_notification_once(
         libc::SYS_recvmsg => {
             handle_recvmsg_once(listener_fd, notif, relays, wait_for_readable, state)
         }
-        libc::SYS_recvmmsg => {
-            handle_recvmmsg_once(listener_fd, notif, relays, wait_for_readable, state)
-        }
+        libc::SYS_recvmmsg => handle_recvmmsg_once(listener_fd, notif, relays, state),
         _ => {
             seccomp::send_continue(listener_fd, notif.id);
             RecvHandling::Completed
@@ -3041,20 +3039,13 @@ fn handle_recvmsg_once(
 }
 
 fn handle_recvmmsg(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRelayRegistry>) {
-    let _ = handle_recvmmsg_once(
-        listener_fd,
-        notif,
-        relays,
-        true,
-        BlockingRecvState::default(),
-    );
+    let _ = handle_recvmmsg_once(listener_fd, notif, relays, BlockingRecvState::default());
 }
 
 fn handle_recvmmsg_once(
     listener_fd: RawFd,
     notif: SeccompNotif,
     relays: Arc<UdpRelayRegistry>,
-    _wait_for_readable: bool,
     mut state: BlockingRecvState,
 ) -> RecvHandling {
     let target_fd = notif.data.args[0] as RawFd;
