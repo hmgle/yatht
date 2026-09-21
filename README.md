@@ -159,11 +159,15 @@ default lazy mode creates the relay on the first proxied send and does not
 preserve aliases created before that point. Pass `--udp-socket-mode=stable`
 with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
-using `SO_COOKIE` as the primary relay key. Stable mode also enables the
-virtualized `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
-Active UDP relay creation is capped at 128, with a bounded 16-datagram input
-queue per relay. A dedicated low-priority supervisor thread reclaims relays
-whose AF_UNIX inode no longer has an open target-side alias, so its host-wide
+using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
+every mode once a relay exists, while `recvmmsg(2)` and the socket-query paths
+described below remain stable-mode features. Active UDP relay creation is
+capped at 128, with a bounded 16-datagram input queue per relay. A
+`sendmmsg(2)` batch that outpaces the relay worker reports only the enqueued
+entries as its sent count — like a kernel socket whose send buffer has filled
+— so a large batch under `MSG_DONTWAIT` can partially commit. A dedicated
+low-priority supervisor thread reclaims relays whose AF_UNIX inode no longer
+has an open target-side alias, so its host-wide
 `/proc/net/unix` read never stalls the receive reactor. It sweeps every second
 and, after five consecutive sweeps that reclaim nothing, backs off up to 30
 seconds; reclaiming a relay or creating a new one restores the base cadence.
@@ -173,9 +177,9 @@ procfs, and an unavailable `/proc/net/unix` delays cleanup instead of breaking
 creation while capacity remains.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
-`recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`
-and serves `recvmmsg(2)` through the receive supervisor. Stable mode also
-virtualizes `getsockname(2)`, `getpeername(2)`, and the common
+`recvmsg(2)`. `sendmmsg(2)` entries are rewritten and virtualized in every
+mode once a relay exists. Stable mode serves `recvmmsg(2)` through the receive
+supervisor and virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
