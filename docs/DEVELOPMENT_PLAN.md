@@ -210,6 +210,8 @@ is `socks5://127.0.0.1:1080`.
   `EFAULT`; the earlier of the socket timeout and the
   explicit timespec keeps its own expiry result. SOCKS5 domain-name response
   sources, error queues, and ancillary/control data remain deferred.
+  Emulated recvmsg/recvmmsg results clear msg_controllen because no control
+  messages are returned; caller capacity must not masquerade as output data.
 
 ## Routing Rules
 

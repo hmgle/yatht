@@ -879,6 +879,13 @@ pub(super) fn write_recvmsg_result(
     received: &RelayRecvmsg,
 ) -> io::Result<()> {
     write_iovec_payload(pid, iovecs, &received.payload)?;
+    // No ancillary data is synthesized. Leaving the input capacity here would
+    // make CMSG_FIRSTHDR expose untouched caller memory as a returned cmsg.
+    write_proc_bytes(
+        pid,
+        msg_ptr + X86_64_MSGHDR_CONTROL_LEN_OFFSET,
+        &0_u64.to_ne_bytes(),
+    )?;
     write_proc_bytes(
         pid,
         msg_ptr + X86_64_MSGHDR_FLAGS_OFFSET,

@@ -154,7 +154,9 @@ loopback broker.
 
 Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
-multiple responses, ancillary data, or pre-existing epoll registrations. The
+multiple responses, ancillary data, or pre-existing epoll registrations.
+Emulated receives report `msg_controllen = 0` when returning no ancillary data.
+The
 default lazy mode creates the relay on the first proxied send and does not
 preserve aliases created before that point. Aliases made after replacement
 share the relay, which survives until the last alias closes.

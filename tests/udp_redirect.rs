@@ -2654,7 +2654,12 @@ int main(int argc, char **argv) {
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
+    unsigned char control[64];
+    memset(control, 0xa5, sizeof(control));
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
     ssize_t n = recvmsg(fd, &msg, 0);
+    if (msg.msg_controllen != 0 || CMSG_FIRSTHDR(&msg) != NULL) return 12;
     if (n < 0) return 9;
     if (peer.sin_family != AF_INET ||
         peer.sin_port != dest.sin_port ||
@@ -2963,6 +2968,8 @@ int main(int argc, char **argv) {
     if (memcmp(peek, response, sizeof(peek)) != 0) return 9;
 
     char received[9];
+    unsigned char control[64];
+    memset(control, 0xa5, sizeof(control));
     struct iovec iov = { .iov_base = received, .iov_len = sizeof(received) };
     struct sockaddr_in msg_source;
     struct msghdr msg;
@@ -2972,8 +2979,11 @@ int main(int argc, char **argv) {
     msg.msg_namelen = sizeof(msg_source);
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
     ssize_t received_len = recvmsg(fd, &msg, 0);
     if (received_len != (ssize_t)sizeof(received)) return 10;
+    if (msg.msg_controllen != 0 || CMSG_FIRSTHDR(&msg) != NULL) return 15;
     if ((msg.msg_flags & MSG_TRUNC) == 0) return 11;
     if (msg.msg_namelen != sizeof(msg_source) ||
         !same_address(&msg_source, &expected_source)) return 12;
@@ -4054,6 +4064,8 @@ int main(int argc, char **argv) {
     };
     struct sockaddr_in sources[2];
     struct mmsghdr recv_msgs[2];
+    unsigned char controls[2][64];
+    memset(controls, 0xa5, sizeof(controls));
     memset(sources, 0, sizeof(sources));
     memset(recv_msgs, 0, sizeof(recv_msgs));
     for (int i = 0; i < 2; ++i) {
@@ -4061,9 +4073,15 @@ int main(int argc, char **argv) {
         recv_msgs[i].msg_hdr.msg_namelen = sizeof(sources[i]);
         recv_msgs[i].msg_hdr.msg_iov = &recv_iov[i];
         recv_msgs[i].msg_hdr.msg_iovlen = 1;
+        recv_msgs[i].msg_hdr.msg_control = controls[i];
+        recv_msgs[i].msg_hdr.msg_controllen = sizeof(controls[i]);
     }
     struct timespec batch_timeout = { .tv_sec = 5, .tv_nsec = 0 };
     if (recvmmsg(fd, recv_msgs, 2, MSG_TRUNC, &batch_timeout) != 2) return 8;
+    for (int i = 0; i < 2; ++i) {
+        if (recv_msgs[i].msg_hdr.msg_controllen != 0 ||
+            CMSG_FIRSTHDR(&recv_msgs[i].msg_hdr) != NULL) return 18;
+    }
     if (batch_timeout.tv_sec < 0 || batch_timeout.tv_sec >= 5 ||
         batch_timeout.tv_nsec < 0 || batch_timeout.tv_nsec >= 1000000000) return 17;
     if (recv_msgs[0].msg_len != strlen(responses[0]) ||
