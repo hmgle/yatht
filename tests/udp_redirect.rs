@@ -3337,6 +3337,69 @@ static int check_iovec_import_order(void) {
     return close(fd);
 }
 
+/* `udp_sendmsg` itself refuses only a datagram over the UDP length field;
+ * the tighter IP-layer ceiling (65507 on the IPv4 transmission path, 65527
+ * on IPv6) surfaces once a destination is known. The ceiling follows the
+ * destination's transmission family, not the socket family: a v4-mapped
+ * name on a dual-stack socket takes the IPv4 ceiling. */
+static int check_datagram_size_limits(void) {
+    static char payload[70000];
+    memset(payload, 'x', sizeof payload);
+
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+
+    struct sockaddr_in6 mapped;
+    memset(&mapped, 0, sizeof(mapped));
+    mapped.sin6_family = AF_INET6;
+    mapped.sin6_port = htons(9);
+    if (inet_pton(AF_INET6, "::ffff:203.0.113.1", &mapped.sin6_addr) != 1) return -1;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    /* 65507 sits at the IPv4 ceiling: it must not be answered EMSGSIZE. */
+    errno = 0;
+    if (sendto(fd, payload, 65507, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) == -1 &&
+        errno == EMSGSIZE) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, payload, 65508, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, payload, 65535, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+
+    /* An iovec split around the ceiling hits the same verdict. */
+    struct iovec split[2] = {
+        { .iov_base = payload, .iov_len = 60000 },
+        { .iov_base = payload, .iov_len = 5508 },
+    };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &ipv4;
+    msg.msg_namelen = sizeof(ipv4);
+    msg.msg_iov = split;
+    msg.msg_iovlen = 2;
+    errno = 0;
+    if (sendmsg(fd, &msg, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
+
+    /* The length verdict precedes the missing-destination one. */
+    errno = 0;
+    if (sendto(fd, payload, 70000, 0, NULL, 0) != -1 || errno != EMSGSIZE) {
+        close(fd); return -1;
+    }
+
+    /* A dual-stack socket sending a v4-mapped name keeps the IPv4 ceiling. */
+    fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    errno = 0;
+    if (sendto(fd, payload, 65508, 0, (struct sockaddr *)&mapped, sizeof(mapped)) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    return close(fd);
+}
+
 /* A dropped AF_UNSPEC name hands the datagram to the connected peer. Linux
  * only reaches a v4-mapped peer from the IPv4 fast path, which this call
  * bypasses, so the peer here is IPv6 to keep the check portable. */
@@ -3366,6 +3429,7 @@ int main(int argc, char **argv) {
     if (check_socket_relative_names() != 0) return 5;
     if (check_connected_unspecified_name(argv[1]) != 0) return 6;
     if (check_iovec_import_order() != 0) return 7;
+    if (check_datagram_size_limits() != 0) return 9;
     if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 8;
     return 0;
 }

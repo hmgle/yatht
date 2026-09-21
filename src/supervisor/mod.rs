@@ -30,7 +30,27 @@ const TARGET_PATH_ENV: &str = "SUP_TARGET_PATH";
 const TARGET_ARGV_ENV: &str = "SUP_TARGET_ARGV";
 const TRAP_SET_ENV: &str = "SUP_TRAP_SET";
 const CONTROL_FD: RawFd = 3;
+// The largest datagram `udp_sendmsg` accepts before any destination verdict:
+// one byte less than the UDP length field's capacity.
 const MAX_UDP_PAYLOAD: usize = 65_535;
+// Once a destination is known the IP layer refuses a datagram that cannot
+// fit its header budget: 0xFFFF minus the UDP header, and minus the IPv4
+// header too on the IPv4 path. The ceiling follows the *transmission* family
+// of the destination, not the socket family — a dual-stack AF_INET6 socket
+// sends a v4-mapped destination through the IPv4 path.
+const MAX_IPV4_UDP_PAYLOAD: usize = 65_507;
+const MAX_IPV6_UDP_PAYLOAD: usize = 65_527;
+
+fn max_udp_payload_for(dest: Destination) -> usize {
+    match dest.ip {
+        IpAddr::V4(_) => MAX_IPV4_UDP_PAYLOAD,
+        // A v4-mapped destination leaves the IPv6 socket but still takes
+        // the IPv4 transmission path, so it inherits the IPv4 ceiling.
+        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => MAX_IPV4_UDP_PAYLOAD,
+        IpAddr::V6(_) => MAX_IPV6_UDP_PAYLOAD,
+    }
+}
+
 const SOCKADDR_IN_SIZE: usize = 16;
 const SOCKADDR_IN6_MIN_SIZE: usize = 24;
 const SOCKADDR_IN6_SIZE: usize = 28;
@@ -2172,15 +2192,23 @@ fn handle_sendto(
     let existing = relays.lookup_handle(notif.pid, target_fd, true);
     // A null address leaves `msg_name` unset, so the kernel falls back to the
     // connected peer. A zero length keeps `msg_name` set and fails the
-    // destination-length check below instead.
-    if addr == 0 {
+    // destination-length check below instead. The common small null-address
+    // send takes this fast path without classifying the fd.
+    if addr == 0 && len <= MAX_UDP_PAYLOAD {
         send_without_destination(listener_fd, &notif, existing.as_ref());
         return;
     }
+    // `udp_sendmsg` refuses an oversized datagram before any destination
+    // verdict, but the limit belongs to Internet datagram sockets: another
+    // fd type must keep the kernel's own semantics for the same call.
     let Some(domain) = internet_udp_domain(notif.pid, target_fd, existing.as_ref()) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
+    if len > MAX_UDP_PAYLOAD {
+        seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
+        return;
+    }
     let (dest, route) = match resolve_send_destination(notif.pid, addr, addr_len, existing.as_ref())
     {
         SendDestination::Explicit(dest) => {
@@ -2215,7 +2243,9 @@ fn handle_sendto(
             return;
         }
     };
-    if len > MAX_UDP_PAYLOAD {
+    // With a destination resolved, the IP layer's family-specific ceiling
+    // applies before any user-buffer copy.
+    if len > max_udp_payload_for(dest) {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
         return;
     }
@@ -2245,15 +2275,18 @@ fn handle_sendto(
 /// Imports a message's iovec array and its total length, the two checks Linux
 /// performs before any destination verdict: `copy_msghdr_from_user` faults on
 /// an unreadable array and rejects more than `UIO_MAXIOV` segments, and
-/// `udp_sendmsg` refuses an oversized datagram ahead of reporting a missing
-/// peer. Returns the errno to report on failure, so a caller that runs this
-/// first cannot answer `EDESTADDRREQ` where Linux answers `EFAULT` or
-/// `EMSGSIZE`. Reading the buffers themselves must stay after the destination
-/// verdict, which is where the kernel copies them.
+/// `udp_sendmsg` refuses a datagram over the UDP length field ahead of
+/// reporting a missing peer. Returns the errno to report on failure, so a
+/// caller that runs this first cannot answer `EDESTADDRREQ` where Linux
+/// answers `EFAULT` or `EMSGSIZE`. Reading the buffers themselves must stay
+/// after the destination verdict, which is where the kernel copies them.
 ///
-/// The UDP payload limit makes this valid only once the fd is known to be an
-/// Internet UDP socket; callers must not apply it to a TCP or AF_UNIX fd that
-/// merely tripped the same syscall filter.
+/// This is only the first of two length ceilings: the IP layer's tighter
+/// family-specific limit (`max_udp_payload_for`) surfaces after the
+/// destination verdict, so callers must apply it once `dest` is known. Both
+/// limits are valid only once the fd is known to be an Internet UDP socket;
+/// callers must not apply them to a TCP or AF_UNIX fd that merely tripped the
+/// same syscall filter.
 fn import_send_iovecs(pid: u32, msg: &TargetMsghdr) -> Result<(Vec<TargetIovec>, usize), i32> {
     let iovecs = match read_iovec_targets(pid, msg.iov, msg.iov_len) {
         Ok(iovecs) => iovecs,
@@ -2459,6 +2492,14 @@ fn handle_sendmsg(
         }
     };
 
+    // The iovec import above already applied the pre-destination 0xFFFF
+    // ceiling; with a destination resolved the IP layer's family-specific
+    // limit applies before any user-buffer copy.
+    if total > max_udp_payload_for(dest) {
+        seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
+        return;
+    }
+
     let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
         Ok(payload) => payload,
         Err(_) => {
@@ -2496,6 +2537,7 @@ fn handle_sendmmsg(
     let msgvec = notif.data.args[1];
     let vlen = notif.data.args[2] as usize;
     let flags = notif.data.args[3] as i32;
+
     if msgvec == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
@@ -2580,6 +2622,10 @@ fn handle_sendmmsg(
                 default
             }
         };
+        if total > max_udp_payload_for(dest) {
+            send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EMSGSIZE);
+            return;
+        }
         let payload = match read_iovec_payload(notif.pid, &iovecs, total) {
             Ok(payload) => payload,
             Err(_) => {
