@@ -169,9 +169,13 @@ fn udp_relay_capacity_is_globally_bounded() {
 
     let err = match registry.reserve_relay_slot() {
         Ok(_) => panic!("relay reservation unexpectedly exceeded the limit"),
-        Err(err) => err.to_string(),
+        Err(err) => err,
     };
-    assert!(err.contains("active UDP relay limit"), "{err}");
+    assert!(err.to_string().contains("active UDP relay limit"), "{err}");
+    let cause = err.downcast_ref::<io::Error>().unwrap();
+    assert_eq!(cause.raw_os_error(), Some(libc::ENOBUFS));
+    assert_eq!(udp_send_errno(cause), libc::ENOBUFS);
+    assert_eq!(errno_from_io(cause), libc::ENOBUFS);
 
     drop(slots.pop());
     registry.reserve_relay_slot().unwrap();
@@ -974,6 +978,7 @@ fn udp_send_errors_preserve_local_failures() {
         libc::ENFILE,
         libc::EADDRINUSE,
         libc::ENOMEM,
+        libc::ENOBUFS,
         libc::EPIPE,
     ] {
         assert_eq!(udp_send_errno(&io::Error::from_raw_os_error(errno)), errno);

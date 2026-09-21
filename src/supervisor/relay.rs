@@ -419,7 +419,8 @@ impl UdpRelayRegistry {
                 (active < MAX_UDP_RELAYS).then_some(active + 1)
             });
         if reserved.is_err() {
-            bail!("active UDP relay limit of {MAX_UDP_RELAYS} reached");
+            return Err(io::Error::from_raw_os_error(libc::ENOBUFS))
+                .with_context(|| format!("active UDP relay limit of {MAX_UDP_RELAYS} reached"));
         }
         Ok(RelaySlotGuard {
             registry: self,

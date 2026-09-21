@@ -1567,6 +1567,41 @@ fn lazy_and_dns_udp_queries_report_internet_identity() {
 }
 
 #[test]
+fn udp_relay_limit_reports_enobufs() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_relay_limit");
+    assert!(Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg("tests/probes/udp_relay_limit.c")
+        .arg("-o")
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["stable", "lazy"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                "--udp-socket-mode",
+                mode,
+                "--proxy",
+                "socks5://127.0.0.1:9",
+                "--proxy-local",
+                "--enable-udp",
+                "--",
+            ])
+            .arg(&probe)
+            .arg(mode)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+}
+
+#[test]
 fn stable_udp_reclaims_closed_socket_capacity() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;

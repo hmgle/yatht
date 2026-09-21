@@ -112,7 +112,11 @@ pub(super) fn handle_connect(
                         if cfg.debug {
                             eprintln!("yatht: UDP relay setup failed: {err:#}");
                         }
-                        seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+                        let errno = err
+                            .downcast_ref::<io::Error>()
+                            .map(udp_send_errno)
+                            .unwrap_or(libc::ECONNREFUSED);
+                        seccomp::send_errno(listener_fd, notif.id, errno);
                     }
                 }
                 return;

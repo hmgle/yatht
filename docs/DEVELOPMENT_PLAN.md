@@ -191,7 +191,9 @@ is `socks5://127.0.0.1:1080`.
   route a bounded send budget. Admission backpressure and nonblocking `EAGAIN`
   are per route; total queue capacity is 48 jobs per relay plus three pending
   sends. DNS destinations share the DNS queue, and initial proxy handshakes
-  still block the worker. Relay setup fails closed at the global relay limit.
+  still block the worker. Relay setup fails closed with `ENOBUFS` at the
+  global relay limit; socket, connect, and send handlers preserve the setup
+  error's underlying errno.
   Tests saturate an established DNS TCP stream and require direct and SOCKS5
   echo traffic on the same socket to complete within two seconds (locally
   1–7 ms), in both lazy and stable modes. The pre-fix implementation fails this

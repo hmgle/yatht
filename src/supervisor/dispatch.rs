@@ -886,7 +886,11 @@ pub(super) fn handle_socket(
             if cfg.debug {
                 eprintln!("yatht: stable UDP socket setup failed: {err:#}");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::EMFILE);
+            let errno = err
+                .downcast_ref::<io::Error>()
+                .map(errno_from_io)
+                .unwrap_or(libc::EMFILE);
+            seccomp::send_errno(listener_fd, notif.id, errno);
         }
     }
 }
