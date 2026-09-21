@@ -83,11 +83,16 @@ const BLOCKING_RECV_CHANNEL_BUDGET: usize = 64;
 const LOCAL_BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const TARGET_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
 const TARGET_TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// After the target exits, adopted descendants may still be draining; the
+// monitor polls for them this often only during that tail window.
+const DESCENDANT_REAP_POLL_INTERVAL_MS: libc::c_int = 10;
 
 struct NotificationFailure {
     reported: AtomicBool,
     shutting_down: AtomicBool,
-    tx: channel::Sender<String>,
+    /// Write end of the failure pipe; the monitor waits on its read end, so
+    /// reporting both wakes the monitor and carries the message.
+    report_fd: OwnedFd,
 }
 
 struct BlockingRecvQueue {
@@ -188,7 +193,16 @@ impl NotificationFailure {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self.tx.try_send(format!("{context}: {err}"));
+        // The pipe is empty until this first and only report, so a single
+        // write carries the whole message without blocking.
+        let message = format!("{context}: {err}");
+        let _ = unsafe {
+            libc::write(
+                self.report_fd.as_raw_fd(),
+                message.as_ptr().cast(),
+                message.len(),
+            )
+        };
     }
 }
 
@@ -375,11 +389,11 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     let cfg = Arc::new(cfg);
     let relays = Arc::new(UdpRelayRegistry::default());
     let listener_fd = Arc::new(listener_fd);
-    let (failure_tx, failure_rx) = channel::bounded(1);
+    let (failure_rd, failure_wr) = create_failure_pipe().context("create failure pipe")?;
     let failure = Arc::new(NotificationFailure {
         reported: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
-        tx: failure_tx,
+        report_fd: failure_wr,
     });
     let reactor_failure = Arc::clone(&failure);
     let panic_failure = Arc::clone(&failure);
@@ -430,7 +444,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
         }
     });
 
-    let monitor_result = monitor_target_tree(target.child_mut(), &failure_rx, &failure);
+    let monitor_result = monitor_target_tree(target.child_mut(), failure_rd.as_raw_fd(), &failure);
     failure.shutting_down.store(true, Ordering::Release);
     if let Err(monitor_err) = &monitor_result {
         // The notification loop only drains once every seccomp filter user is
@@ -469,7 +483,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     notification_join_result?;
     reactor_join_result?;
     shutdown_result.context("shut down TCP broker reactor")?;
-    if let Ok(message) = failure_rx.try_recv() {
+    if let Some(message) = take_failure_message(failure_rd.as_raw_fd(), 0) {
         bail!("seccomp notification handling failed during shutdown: {message}");
     }
     target.disarm();
@@ -484,43 +498,127 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
 
 fn monitor_target_tree(
     child: &mut Child,
-    failure_rx: &channel::Receiver<String>,
+    failure_pipe: RawFd,
     failure: &NotificationFailure,
 ) -> Result<ExitStatus> {
+    let pidfd = pidfd_open(child.id(), 0).context("open target pidfd")?;
+    let pidfd_raw = pidfd.as_raw_fd();
     let mut target_status = None;
-    loop {
-        if let Ok(message) = failure_rx.try_recv() {
+    // While the child lives, block on its pidfd and the failure pipe: an
+    // idle supervisor wakes for neither instead of polling on a timer.
+    while target_status.is_none() {
+        if let Some(message) = take_failure_message(failure_pipe, 0) {
             terminate_target_tree(child, &mut target_status)
                 .context("terminate target after notification failure")?;
             bail!("seccomp notification handling failed: {message}");
         }
-
-        if target_status.is_none() {
+        poll_readable(&[pidfd_raw, failure_pipe], -1)?;
+        if let Some(message) = take_failure_message(failure_pipe, 0) {
+            terminate_target_tree(child, &mut target_status)
+                .context("terminate target after notification failure")?;
+            bail!("seccomp notification handling failed: {message}");
+        }
+        if poll_readable(&[pidfd_raw], 0)? != 0 {
             target_status = child.try_wait().context("wait for target")?;
         }
-
-        if let Some(status) = target_status {
-            if !reap_descendants_nonblocking()? {
-                failure.shutting_down.store(true, Ordering::Release);
-                if let Ok(message) = failure_rx.try_recv() {
-                    bail!("seccomp notification handling failed: {message}");
-                }
-                return Ok(status);
-            }
+    }
+    let status = target_status.expect("target exited once the pidfd signaled");
+    // The child is gone but adopted descendants may still be draining. Keep
+    // the short poll only for this tail, which normally lasts milliseconds.
+    loop {
+        if let Some(message) = take_failure_message(failure_pipe, 0) {
+            terminate_target_tree(child, &mut target_status)
+                .context("terminate target after notification failure")?;
+            bail!("seccomp notification handling failed: {message}");
         }
-
-        match failure_rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(message) => {
-                terminate_target_tree(child, &mut target_status)
-                    .context("terminate target after notification failure")?;
+        if !reap_descendants_nonblocking()? {
+            failure.shutting_down.store(true, Ordering::Release);
+            if let Some(message) = take_failure_message(failure_pipe, 0) {
                 bail!("seccomp notification handling failed: {message}");
             }
-            Err(channel::RecvTimeoutError::Timeout) => {}
-            Err(channel::RecvTimeoutError::Disconnected) => {
-                bail!("seccomp notification failure channel disconnected");
+            return Ok(status);
+        }
+        let _ = poll_readable(&[failure_pipe], DESCENDANT_REAP_POLL_INTERVAL_MS);
+    }
+}
+
+/// Creates the nonblocking, close-on-exec pipe that carries the one-shot
+/// notification-failure message from worker threads to the target monitor.
+fn create_failure_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 filled both descriptors on success.
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read, write))
+}
+
+/// Waits until one of `fds` is readable (or hangup/error) and returns the
+/// ready descriptors as a bitmask, bit `i` for `fds[i]`. A timeout of -1
+/// blocks indefinitely.
+fn poll_readable(fds: &[RawFd], timeout_ms: libc::c_int) -> io::Result<u32> {
+    let mut pollfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        let rc = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if rc >= 0 {
+            let mut ready = 0;
+            for (index, pollfd) in pollfds.iter().enumerate() {
+                if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    ready |= 1 << index;
+                }
             }
+            return Ok(ready);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
+}
+
+/// Reads a pending failure message from the pipe without blocking longer
+/// than `timeout_ms`. `None` when nothing was reported in that window.
+fn take_failure_message(fd: RawFd, timeout_ms: libc::c_int) -> Option<String> {
+    if poll_readable(&[fd], timeout_ms).ok()? == 0 {
+        return None;
+    }
+    let mut message = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n > 0 {
+            message.extend_from_slice(&chunk[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    if message.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&message).into_owned())
 }
 
 fn terminate_target_tree(
