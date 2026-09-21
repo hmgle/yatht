@@ -96,7 +96,7 @@ CLI CIDR options extend file CIDR lists. CLI booleans enable their matching
 features. `--proxy-local` disables the default `bypass_local = true` behavior.
 
 The metrics file is opt-in and must not already exist. It contains versioned
-run metadata (schema version 6), TCP broker limits, one setup record per
+run metadata (schema version 7), TCP broker limits, one setup record per
 proxied TCP connection with per-stage timings and its proxy session source
 (cold, warm hit, or warm miss), and a final summary with queue, flow,
 pending-byte, allocated-buffer, relay, syscall, CPU, warm-session-pool, and

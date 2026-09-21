@@ -33,6 +33,26 @@ int main(int argc, char **argv) {
     if (fd < 0) return 6;
     struct timeval timeout = { .tv_sec = 5 };
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) return 7;
+    if (strcmp(argv[3], "dns-cap") == 0) {
+        for (unsigned char i = 0; i < 19; ++i) {
+            unsigned int index = i < 16 ? i : (i < 18 ? 16 : 0);
+            struct sockaddr_in to = dest;
+            to.sin_addr.s_addr = htonl(ntohl(dest.sin_addr.s_addr) + index);
+            unsigned char query[3] = { 0x12, 0x34, i };
+            if (sendto(fd, query, 3, 0, (void *)&to, sizeof(to)) != 3) return 19;
+            /* The seventeenth destination is rejected twice. A final query
+               on the first stream proves both drops have been processed. */
+            if (i == 16 || i == 17) continue;
+            unsigned char response[3];
+            struct sockaddr_in source;
+            socklen_t len = sizeof(source);
+            if (recvfrom(fd, response, 3, 0, (void *)&source, &len) != 3) return 20;
+            if (memcmp(response, query, 3) != 0 || source.sin_addr.s_addr != to.sin_addr.s_addr ||
+                source.sin_port != to.sin_port) return 21;
+        }
+        close(fd);
+        return 0;
+    }
     if (strcmp(argv[3], "dns-sources") == 0) {
         for (unsigned char i = 0; i < 4; ++i) {
             struct sockaddr_in to = dest;

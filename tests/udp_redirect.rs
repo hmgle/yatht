@@ -5825,3 +5825,70 @@ fn stalled_dns_writes_do_not_block_other_udp_routes() {
         server.join().unwrap();
     }
 }
+
+#[test]
+fn dns_stream_limit_counts_drops_without_evicting_healthy_streams() {
+    let (dir, probe) = build_independent_udp_probe();
+    for mode in ["lazy", "stable"] {
+        let metrics = dir.path().join(format!("{mode}.jsonl"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..16 {
+                let (mut stream, _) = listener.accept().unwrap();
+                handlers.push(thread::spawn(move || {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    socks5_greet(&mut stream);
+                    read_socks5_request(&mut stream);
+                    stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                    loop {
+                        let mut frame = [0; 5];
+                        match stream.read_exact(&mut frame) {
+                            Ok(()) => stream.write_all(&frame).unwrap(),
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionReset
+                                ) =>
+                            {
+                                break
+                            }
+                            Err(err) => panic!("DNS stream failed: {err}"),
+                        }
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                "--enable-dns",
+                "--enable-udp",
+                "--udp-socket-mode",
+                mode,
+                "--proxy",
+                &format!("socks5://{address}"),
+                "--metrics-file",
+            ])
+            .arg(&metrics)
+            .arg("--")
+            .arg(&probe)
+            .args(["198.51.100.1", "53", "dns-cap"])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        server.join().unwrap();
+        let events = fs::read_to_string(metrics).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(summary["event"], "run_summary");
+        assert_eq!(summary["udp_dropped_jobs"], 2);
+        assert_eq!(summary["udp_dropped_pending_responses"], 0);
+    }
+}

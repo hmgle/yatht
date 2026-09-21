@@ -119,7 +119,7 @@ is `socks5://127.0.0.1:1080`.
   the larger of 20% or 256 fds, plus setup-worker headroom. Registration has a
   fixed capacity of 128, and buffered relay data shares a 256 MiB global
   pending-byte budget. Rejections are fail-closed and separately classified.
-- Optional JSONL telemetry (schema version 6) uses a bounded writer queue and
+- Optional JSONL telemetry (schema version 7) uses a bounded writer queue and
   records versioned run metadata, detected broker limits, per-flow setup spans
   with stage timings, proxy session outcomes, and socket cookies, and a final
   resource/data/error summary including warm session pool counters. The
@@ -227,7 +227,10 @@ is `socks5://127.0.0.1:1080`.
   stream-capacity rejection, and partial DNS frames discarded on stream errors,
   without requiring debug logging. It excludes synchronous syscall rejections,
   unanswered fully written queries, and teardown cancellation; detached workers
-  mean the final summary is a snapshot. Debug logs retain the failure detail. Generic UDP uses SOCKS5 UDP ASSOCIATE and is unavailable
+  mean the final summary is a snapshot. Debug logs retain the failure detail.
+  A lazy/stable regression retains all 16 healthy streams, submits two queries
+  for a seventeenth destination, then receives a reply on the first stream;
+  the non-debug run summary must report exactly two dropped jobs. Generic UDP uses SOCKS5 UDP ASSOCIATE and is unavailable
   for HTTP CONNECT proxies. Domain-name SOCKS5 response sources are rejected
   instead of borrowing a possibly unrelated last request's destination.
 - Fourth-review regressions require six datagrams to reach a silent direct,
