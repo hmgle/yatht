@@ -216,6 +216,21 @@ is `socks5://127.0.0.1:1080`.
   close. The independent I/O implementation measured about 293 peak threads and
   zero relay workers within the same cleanup window. These are local regression
   measurements, not a hard scheduling or throughput guarantee.
+- Accepted costs from the fourth UDP review (Q3–Q5): stable autobind retains
+  a real ephemeral port on first connect/send even for proxy-only traffic;
+  socket creation alone does not reserve it. The reservation gives coherent
+  bind/getname semantics and is reused if routing later switches to direct.
+  DNS-only filtering also traps `getsockname`, `getpeername`, and `getsockopt`
+  for all target fds. The cost occurs per intercepted syscall, not automatically
+  once per DNS query. A cache miss with an empty cookie registry avoids fd
+  duplication; with live relays, even an unrelated fd can require duplication
+  and cookie verification. Frequent `SO_ERROR` polling can expose that cost.
+  An unrelayed Internet UDP `sendmmsg` batch pre-scans at most 1024 headers
+  (and relevant destinations), stopping at the first proxied destination.
+  This scan disappears after relay creation, but it can repeat for every
+  direct-only batch on a socket that remains unrelayed; it is not universally
+  a one-time first-batch cost. These are documented tradeoffs, without a new
+  bypass that would weaken identity or mixed-routing correctness.
 - All UDP modes rewrite explicit destinations in `sendmmsg(2)` and write each
   successful message length back, including a lazy/DNS socket's first batch.
   A read-only routing scan decides whether the batch needs a relay before any

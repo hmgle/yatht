@@ -204,7 +204,9 @@ external source address. Stable `bind(2)` reserves a real local UDP
 socket immediately, so port zero becomes a kernel-assigned ephemeral port
 before `getsockname(2)` returns; direct sends reuse that reservation.
 Stable sends and connects also reserve an automatic local port before
-returning, so a subsequent `bind(2)` fails with `EINVAL`.
+returning, so a subsequent `bind(2)` fails with `EINVAL`. This reservation is
+made even for proxy-only traffic, where it does not carry the outbound packets;
+a newly created socket without bind/connect/send does not reserve a port.
 The local port is released during relay cleanup after the last alias closes
 (and after its workers exit), rather than synchronously with `close(2)`.
 A proxy's external source port can still differ.
