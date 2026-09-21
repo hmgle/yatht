@@ -142,7 +142,10 @@ is `socks5://127.0.0.1:1080`.
   replacement on the first proxied send. Stable mode (`SUP_UDP_SOCKET_MODE=stable`)
   traps UDP socket creation and uses `SECCOMP_ADDFD_FLAG_SEND` so the target sees
   the injected fd as the `socket(2)` result; `bind(2)` is emulated for the
-  logical endpoint and direct workers reuse that requested local address.
+  logical endpoint by retaining a bound kernel UDP socket. This reserves a
+  port immediately, including ephemeral bind(0), and reports kernel bind errors
+  synchronously. Direct workers clone that socket to preserve its source port.
+  Port release follows relay reclamation and completion of any in-flight job.
   `getsockname(2)` and `getpeername(2)` return the logical local/connected
   destination, while `getsockopt(2)` reports the AF_INET/AF_INET6 UDP domain,
   type, protocol, and a zero socket error.

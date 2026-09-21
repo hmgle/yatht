@@ -924,8 +924,8 @@ pub(super) fn handle_bind(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<U
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return;
     }
-    if !handle.set_local_bind(destination) {
-        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
+    if let Err(err) = handle.set_local_bind(destination) {
+        seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err));
         return;
     }
     seccomp::send_success(listener_fd, notif.id);

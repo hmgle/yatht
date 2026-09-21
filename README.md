@@ -187,8 +187,13 @@ supervisor and virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
-wildcard address with port zero, and an explicitly bound port zero is not
-replaced with a kernel-assigned ephemeral port. Logical operations reject
+wildcard address with port zero. Stable `bind(2)` reserves a real local UDP
+socket immediately, so port zero becomes a kernel-assigned ephemeral port
+before `getsockname(2)` returns; direct sends reuse that reservation.
+The local port is released during relay cleanup after the last alias closes
+(and after any in-flight direct request finishes), rather than synchronously
+with `close(2)`. A proxy's external source port can still differ.
+Logical operations reject
 invalid destination ports and unsupported families before creating a relay.
 AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
 Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations;

@@ -1559,6 +1559,60 @@ fn stable_udp_reclaims_closed_socket_capacity() {
 }
 
 #[test]
+fn stable_udp_getsockname_reports_bound_port() {
+    udp_getsockname_reports_bound_port(true);
+}
+
+#[test]
+fn direct_kernel_udp_getsockname_reports_bound_port() {
+    udp_getsockname_reports_bound_port(false);
+}
+
+fn udp_getsockname_reports_bound_port(stable: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_bound_port");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_bound_port.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for (family, bind) in [("4", "127.0.0.1:0"), ("6", "[::1]:0")] {
+        let server = UdpSocket::bind(bind).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let echo = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut payload = [0; 2];
+                let (n, peer) = server.recv_from(&mut payload).unwrap();
+                assert_eq!(n, 2);
+                assert_eq!(u16::from_be_bytes(payload), peer.port());
+                server.send_to(&payload, peer).unwrap();
+            }
+        });
+        let mut command = if stable {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+            command.args(["--enable-udp", "--udp-socket-mode", "stable", "--"]);
+            command.arg(&probe);
+            command
+        } else {
+            Command::new(&probe)
+        };
+        let output = command.arg(family).arg(port.to_string()).output().unwrap();
+        assert_success(&output);
+        echo.join().unwrap();
+    }
+}
+
+#[test]
 fn stable_udp_reaps_idle_closed_relay_workers() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
