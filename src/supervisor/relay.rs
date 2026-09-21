@@ -137,13 +137,8 @@ impl StableSweepCadence {
 #[derive(Clone)]
 pub(super) struct UdpRelayHandle {
     pub(super) tx: [channel::Sender<UdpJob>; UDP_ROUTE_COUNT],
-    pub(super) wake: Arc<OwnedFd>,
-    pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
-    /// Retains the actual local port reservation, including bind(port=0).
-    pub(super) local_bind: Arc<Mutex<Option<UdpLocalSocket>>>,
+    pub(super) state: Arc<UdpRelayState>,
     pub(super) original_local: Option<Destination>,
-    pub(super) pending_sources: Arc<Mutex<VecDeque<Destination>>>,
-    pub(super) relay_fd: Arc<OwnedFd>,
     pub(super) target_identity: FdIdentity,
     pub(super) target_cookie: u64,
     pub(super) domain: i32,
@@ -151,6 +146,53 @@ pub(super) struct UdpRelayHandle {
     /// answers from the handle rather than from a creation-time invariant.
     pub(super) protocol: i32,
     pub(super) stable: bool,
+}
+
+/// Owned only by registry/caller handles, never by the relay workers.
+pub(super) struct UdpRelayState {
+    pub(super) io: UdpRelayIo,
+}
+
+impl UdpRelayState {
+    pub(super) fn new(relay_socket: OwnedFd) -> io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            io: UdpRelayIo {
+                wake: Arc::new(create_eventfd()?),
+                default_dest: Arc::new(Mutex::new(None)),
+                local_bind: Arc::new(Mutex::new(None)),
+                pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+                relay_fd: Arc::new(relay_socket),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        }))
+    }
+}
+
+impl Drop for UdpRelayState {
+    fn drop(&mut self) {
+        // Channel disconnection neither wakes poll nor releases the reader's
+        // blocking recv. Retire both workers when their last owner disappears.
+        self.io.shutdown();
+    }
+}
+
+impl std::ops::Deref for UdpRelayHandle {
+    type Target = UdpRelayIo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.io
+    }
+}
+
+/// Workers share I/O resources without keeping the owning handle alive.
+#[derive(Clone)]
+pub(super) struct UdpRelayIo {
+    pub(super) wake: Arc<OwnedFd>,
+    pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
+    /// Retains the actual local port reservation, including bind(port=0).
+    pub(super) local_bind: Arc<Mutex<Option<UdpLocalSocket>>>,
+    pub(super) pending_sources: Arc<Mutex<VecDeque<Destination>>>,
+    pub(super) relay_fd: Arc<OwnedFd>,
     pub(super) shutdown: Arc<AtomicBool>,
 }
 
@@ -1079,7 +1121,9 @@ impl UdpRelayHandle {
             .map(|duplicated| self.matches_target_fd(duplicated.as_raw_fd()))
             .unwrap_or(false)
     }
+}
 
+impl UdpRelayIo {
     pub(super) fn shutdown(&self) {
         if !self.shutdown.swap(true, Ordering::SeqCst) {
             wake_eventfd(self.wake.as_raw_fd());
@@ -1132,14 +1176,12 @@ pub(super) fn start_udp_relay(
         protocol,
     } = target;
     let (tx, rx) = udp_job_queues(UDP_JOB_QUEUE_CAPACITY);
+    let state = UdpRelayState::new(relay_socket)?;
+    *state.io.default_dest.lock().unwrap() = default_dest;
     let handle = UdpRelayHandle {
         tx,
-        wake: Arc::new(create_eventfd()?),
-        default_dest: Arc::new(Mutex::new(default_dest)),
-        local_bind: Arc::new(Mutex::new(None)),
+        state,
         original_local: None,
-        pending_sources: Arc::new(Mutex::new(VecDeque::new())),
-        relay_fd: Arc::new(relay_socket),
         target_identity,
         target_cookie,
         domain,
@@ -1149,9 +1191,9 @@ pub(super) fn start_udp_relay(
             protocol
         },
         stable,
-        shutdown: Arc::new(AtomicBool::new(false)),
     };
-    let read = handle.clone();
+    let read = handle.state.io.clone();
+    let reader_tx = handle.tx.clone();
     let reader = thread::Builder::new()
         .name("yatht-udp-relay-read".to_string())
         .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
@@ -1169,7 +1211,7 @@ pub(super) fn start_udp_relay(
                 let Some((dest, route)) = *read.default_dest.lock().unwrap() else {
                     continue;
                 };
-                if read.tx[route.index()]
+                if reader_tx[route.index()]
                     .send(UdpJob {
                         dest,
                         payload: buf[..n].to_vec(),
@@ -1182,7 +1224,7 @@ pub(super) fn start_udp_relay(
                 wake_eventfd(read.wake.as_raw_fd());
             }
         })?;
-    let write = handle.clone();
+    let write = handle.state.io.clone();
     let writer = thread::Builder::new()
         .name("yatht-udp-relay-write".to_string())
         .stack_size(UDP_RELAY_THREAD_STACK_SIZE)

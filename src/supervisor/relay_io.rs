@@ -21,12 +21,7 @@ struct Transports {
 }
 
 impl Transports {
-    fn send(
-        &mut self,
-        cfg: &UdpRelayConfig,
-        handle: &UdpRelayHandle,
-        job: &UdpJob,
-    ) -> Result<bool> {
+    fn send(&mut self, cfg: &UdpRelayConfig, handle: &UdpRelayIo, job: &UdpJob) -> Result<bool> {
         let deadline = proxy::Deadline::after(cfg.timeout);
         match job.route {
             UdpRouteKind::Direct => {
@@ -76,7 +71,7 @@ impl Transports {
         Ok(true)
     }
 
-    fn receive(&mut self, cfg: &UdpRelayConfig, handle: &UdpRelayHandle) {
+    fn receive(&mut self, cfg: &UdpRelayConfig, handle: &UdpRelayIo) {
         if let Some(direct) = &mut self.direct {
             for _ in 0..IO_BATCH {
                 match direct.sock.recv_from(&mut direct.recv_buf) {
@@ -152,7 +147,7 @@ impl Transports {
 
     fn poll(
         &self,
-        handle: &UdpRelayHandle,
+        handle: &UdpRelayIo,
         pending: &[Option<(UdpJob, Instant)>; UDP_ROUTE_COUNT],
         queued: bool,
     ) -> io::Result<()> {
@@ -208,7 +203,7 @@ impl Transports {
 
 pub(super) fn udp_relay_io(
     cfg: UdpRelayConfig,
-    handle: UdpRelayHandle,
+    handle: UdpRelayIo,
     rx: [channel::Receiver<UdpJob>; UDP_ROUTE_COUNT],
 ) {
     let mut transports = Transports::default();
@@ -285,7 +280,7 @@ pub(super) fn udp_relay_io(
     handle.shutdown();
 }
 
-fn deliver(cfg: &UdpRelayConfig, handle: &UdpRelayHandle, response: UdpRelayResponse) {
+fn deliver(cfg: &UdpRelayConfig, handle: &UdpRelayIo, response: UdpRelayResponse) {
     let mut pending = handle.pending_sources.lock().unwrap();
     if pending.len() >= MAX_PENDING_SOURCES {
         cfg.observability.record_udp_pending_response_dropped();

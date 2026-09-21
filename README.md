@@ -192,7 +192,8 @@ errors, and closing/exiting before queued work is forwarded can still lose data.
 `--connect-timeout` bounds proxy setup and stalled writes, not the time allowed
 for a UDP reply. Initial proxy setup remains blocking and can delay both
 forwarding and worker retirement until its deadline. After setup, reaping wakes
-the I/O worker immediately, without waiting for a silent peer. A
+the I/O worker immediately, without waiting for a silent peer. Dropping the
+last supervisor relay handle also shuts down both workers automatically. A
 `sendmmsg(2)` batch that outpaces the relay worker reports only the enqueued
 entries as its sent count — like a kernel socket whose send buffer has filled
 — so a large batch under `MSG_DONTWAIT` can partially commit. A dedicated

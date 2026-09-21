@@ -194,23 +194,18 @@ fn relay_reaping_waits_for_the_last_target_alias(stable: bool) {
     assert!(alias_fd >= 0);
     let alias = unsafe { OwnedFd::from_raw_fd(alias_fd) };
     let (tx, _rx) = udp_job_queues(1);
-    let shutdown = Arc::new(AtomicBool::new(false));
     let target_identity = fd_identity(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
-        wake: Arc::new(create_eventfd().unwrap()),
-        default_dest: Arc::new(Mutex::new(None)),
-        local_bind: Arc::new(Mutex::new(None)),
+        state: UdpRelayState::new(relay).unwrap(),
         original_local: None,
-        pending_sources: Arc::new(Mutex::new(VecDeque::new())),
-        relay_fd: Arc::new(relay),
         target_identity,
         target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
         domain: libc::AF_INET,
         protocol: libc::IPPROTO_UDP,
         stable,
-        shutdown: Arc::clone(&shutdown),
     };
+    let shutdown = Arc::clone(&handle.shutdown);
     registry.active.store(1, Ordering::Release);
     registry
         .by_cookie
@@ -260,24 +255,19 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
             let mut slot = registry.reserve_relay_slot().unwrap();
             let (relay, target) = make_relay_pair().unwrap();
             let (tx, _rx) = udp_job_queues(1);
-            let shutdown = Arc::new(AtomicBool::new(false));
             let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
             let key = relay_key(1, (batch * 32 + index) as RawFd);
             let handle = UdpRelayHandle {
                 tx,
-                wake: Arc::new(create_eventfd().unwrap()),
-                default_dest: Arc::new(Mutex::new(None)),
-                local_bind: Arc::new(Mutex::new(None)),
+                state: UdpRelayState::new(relay).unwrap(),
                 original_local: None,
-                pending_sources: Arc::new(Mutex::new(VecDeque::new())),
-                relay_fd: Arc::new(relay),
                 target_identity: fd_identity(target.as_raw_fd()).unwrap(),
                 target_cookie,
                 domain: libc::AF_INET,
                 protocol: libc::IPPROTO_UDP,
                 stable: true,
-                shutdown: Arc::clone(&shutdown),
             };
+            let shutdown = Arc::clone(&handle.shutdown);
             registry
                 .by_cookie
                 .lock()
@@ -464,23 +454,25 @@ fn close_removes_matching_relay() {
     let registry = UdpRelayRegistry::default();
     let (relay, target) = make_relay_pair().unwrap();
     let (tx, _rx) = udp_job_queues(1);
-    let shutdown = Arc::new(AtomicBool::new(false));
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
-        wake: Arc::new(create_eventfd().unwrap()),
-        default_dest: Arc::new(Mutex::new(None)),
-        local_bind: Arc::new(Mutex::new(None)),
+        state: UdpRelayState::new(relay).unwrap(),
         original_local: None,
-        pending_sources: Arc::new(Mutex::new(VecDeque::new())),
-        relay_fd: Arc::new(relay),
         target_identity: fd_identity(target.as_raw_fd()).unwrap(),
         target_cookie,
         domain: libc::AF_INET,
         protocol: libc::IPPROTO_UDP,
         stable: false,
-        shutdown: Arc::clone(&shutdown),
     };
+    let shutdown = Arc::clone(&handle.shutdown);
+    // Production relays remain owned by the cookie index after an fd cache
+    // entry is removed, until the last target alias closes.
+    registry
+        .by_cookie
+        .lock()
+        .unwrap()
+        .insert(target_cookie, handle.clone());
     let key = relay_key(std::process::id(), target.as_raw_fd());
     registry
         .inner
@@ -585,18 +577,13 @@ fn nonblocking_udp_send_reports_full_job_queue() {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
-        wake: Arc::new(create_eventfd().unwrap()),
-        default_dest: Arc::new(Mutex::new(None)),
-        local_bind: Arc::new(Mutex::new(None)),
+        state: UdpRelayState::new(relay).unwrap(),
         original_local: None,
-        pending_sources: Arc::new(Mutex::new(VecDeque::new())),
-        relay_fd: Arc::new(relay),
         target_identity: fd_identity(target.as_raw_fd()).unwrap(),
         target_cookie,
         domain: libc::AF_INET,
         protocol: libc::IPPROTO_UDP,
         stable: false,
-        shutdown: Arc::new(AtomicBool::new(false)),
     };
     let dest = Destination {
         ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -949,18 +936,13 @@ fn test_relay_handle() -> UdpRelayHandle {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     UdpRelayHandle {
         tx,
-        wake: Arc::new(create_eventfd().unwrap()),
-        default_dest: Arc::new(Mutex::new(None)),
-        local_bind: Arc::new(Mutex::new(None)),
+        state: UdpRelayState::new(relay).unwrap(),
         original_local: None,
-        pending_sources: Arc::new(Mutex::new(VecDeque::new())),
-        relay_fd: Arc::new(relay),
         target_identity: fd_identity(target.as_raw_fd()).unwrap(),
         target_cookie,
         domain: libc::AF_INET,
         protocol: libc::IPPROTO_UDP,
         stable: false,
-        shutdown: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -1007,6 +989,74 @@ fn udp_send_errors_preserve_local_failures() {
 }
 
 #[test]
+fn idle_udp_workers_retire_when_last_handle_is_dropped() {
+    udp_workers_retire_when_last_handle_is_dropped(false);
+}
+
+#[test]
+fn active_udp_workers_retire_when_last_handle_is_dropped() {
+    udp_workers_retire_when_last_handle_is_dropped(true);
+}
+
+fn udp_workers_retire_when_last_handle_is_dropped(send_datagram: bool) {
+    let (relay, target) = make_relay_pair().unwrap();
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    echo.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    set_socket_recv_timeout(target.as_raw_fd(), Duration::from_secs(3)).unwrap();
+    let dest = Destination {
+        ip: echo.local_addr().unwrap().ip(),
+        port: echo.local_addr().unwrap().port(),
+    };
+    let handle = start_udp_relay(
+        build_udp_relay_config(&test_config(false), Observability::default()),
+        relay,
+        Some((dest, UdpRouteKind::Direct)),
+        RelayTargetInfo {
+            identity: fd_identity(target.as_raw_fd()).unwrap(),
+            cookie: socket_cookie(target.as_raw_fd()).unwrap(),
+            domain: libc::AF_INET,
+            protocol: libc::IPPROTO_UDP,
+        },
+        false,
+    )
+    .unwrap();
+    let shutdown = Arc::clone(&handle.shutdown);
+    let relay_fd = Arc::downgrade(&handle.relay_fd);
+    let remaining = handle.clone();
+    drop(handle);
+    assert!(!shutdown.load(Ordering::SeqCst));
+
+    if send_datagram {
+        // Exercise both workers through the connected socket, then leave
+        // them waiting for more input with a live target-side endpoint.
+        assert!(send_relay_response(target.as_raw_fd(), b"ping"));
+        let mut payload = [0; 4];
+        let (n, peer) = echo.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..n], b"ping");
+        echo.send_to(b"pong", peer).unwrap();
+        assert_eq!(
+            recv_relay_socket(target.as_raw_fd(), &mut payload).unwrap(),
+            4
+        );
+        assert_eq!(&payload, b"pong");
+    }
+
+    // No explicit shutdown and no target-side close: dropping the final
+    // owner must wake poll and recv and release both workers' fd references.
+    drop(remaining);
+    assert!(shutdown.load(Ordering::SeqCst));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while relay_fd.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "UDP workers retained the relay fd"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(target);
+}
+
+#[test]
 fn udp_worker_counts_failed_jobs_without_debug_logging() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("metrics.jsonl");
@@ -1019,10 +1069,10 @@ fn udp_worker_counts_failed_jobs_without_debug_logging() {
     let (relay, target) = make_relay_pair().unwrap();
     set_socket_recv_timeout(target.as_raw_fd(), Duration::from_secs(3)).unwrap();
     let mut handle = test_relay_handle();
-    handle.relay_fd = Arc::new(relay);
+    handle.state = UdpRelayState::new(relay).unwrap();
     let (tx, rx) = udp_job_queues(16);
     handle.tx = tx;
-    let worker_handle = handle.clone();
+    let worker_handle = handle.state.io.clone();
     let worker = thread::spawn(move || relay_io::udp_relay_io(cfg, worker_handle, rx));
     let dest = Destination {
         ip: IpAddr::V4(Ipv4Addr::LOCALHOST),

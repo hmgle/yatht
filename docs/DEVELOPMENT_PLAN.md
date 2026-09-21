@@ -198,6 +198,12 @@ is `socks5://127.0.0.1:1080`.
   probe. A stalled DNS stream is discarded at its write deadline, including
   its partial frame; later queries reconnect, so persistent stalls can still
   cause repeated connections and drops, now visible in udp_dropped_jobs.
+  Registry/caller handles own relay lifetime separately from worker I/O
+  resources. Dropping the last handle wakes the I/O poll and shuts down the
+  reader socket; workers cannot keep their own owner alive. Explicit shutdown
+  still retires reaped relays immediately even if a caller retains a handle.
+  This avoids relying on channel disconnection, which cannot wake eventfd poll
+  and previously could not occur while the I/O worker held its own senders.
 - Proxied sendto/sendmsg/sendmmsg apply a conservative SOCKS5 envelope ceiling
   after destination and route resolution, including connected nameless sends:
   65507 minus a 10-byte IPv4 or 22-byte IPv6 destination header. IPv4-mapped
