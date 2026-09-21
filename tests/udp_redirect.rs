@@ -1833,15 +1833,22 @@ fn stable_udp_connected_socket_reports_logical_peer() {
 
 #[test]
 fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
-    udp_sendmmsg_routes_first_batch("stable");
+    udp_sendmmsg_routes_first_batch("stable", false, false);
 }
 
 #[test]
 fn lazy_udp_sendmmsg_creates_relay_on_first_batch() {
-    udp_sendmmsg_routes_first_batch("lazy");
+    udp_sendmmsg_routes_first_batch("lazy", false, false);
 }
 
-fn udp_sendmmsg_routes_first_batch(mode: &str) {
+#[test]
+fn lazy_udp_first_sendmmsg_preserves_mixed_routes_and_connected_peer() {
+    for connected in [false, true] {
+        udp_sendmmsg_routes_first_batch("lazy", true, connected);
+    }
+}
+
+fn udp_sendmmsg_routes_first_batch(mode: &str, mixed: bool, connected: bool) {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
@@ -1853,6 +1860,21 @@ fn udp_sendmmsg_routes_first_batch(mode: &str) {
     let udp_addr = udp.local_addr().unwrap();
     let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 12), 4466));
     let (payload_tx, payload_rx) = mpsc::channel();
+    let direct = mixed.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let direct_port = direct
+        .as_ref()
+        .map(|socket| socket.local_addr().unwrap().port());
+    let direct_thread = direct.map(|socket| {
+        thread::spawn(move || {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0; 64];
+            let (n, peer) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"batch-one");
+            socket.send_to(b"batch-one-ok", peer).unwrap();
+        })
+    });
 
     let socks_thread = thread::spawn(move || {
         let (mut client, _) = tcp.accept().unwrap();
@@ -1863,7 +1885,10 @@ fn udp_sendmmsg_routes_first_batch(mode: &str) {
             .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
             .unwrap();
 
-        for response in [b"batch-one-ok".as_slice(), b"batch-two-ok".as_slice()] {
+        for response in [b"batch-one-ok".as_slice(), b"batch-two-ok".as_slice()]
+            .into_iter()
+            .skip(usize::from(mixed))
+        {
             let mut packet = vec![0_u8; 2048];
             let (n, peer) = udp.recv_from(&mut packet).unwrap();
             packet.truncate(n);
@@ -1877,7 +1902,14 @@ fn udp_sendmmsg_routes_first_batch(mode: &str) {
         let _ = client.read(&mut keepalive);
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    if let Some(port) = direct_port {
+        command.env("YATHT_TEST_DIRECT_PORT", port.to_string());
+    }
+    if connected {
+        command.env("YATHT_TEST_CONNECTED", "1");
+    }
+    let output = command
         .arg("--udp-socket-mode")
         .arg(mode)
         .arg("--proxy")
@@ -1894,15 +1926,20 @@ fn udp_sendmmsg_routes_first_batch(mode: &str) {
         String::from_utf8_lossy(&output.stdout),
         "batch-one-ok:batch-two-ok"
     );
-    assert_eq!(
-        payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        (destination, b"batch-one".to_vec())
-    );
+    if !mixed {
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (destination, b"batch-one".to_vec())
+        );
+    }
     assert_eq!(
         payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         (destination, b"batch-two".to_vec())
     );
     socks_thread.join().unwrap();
+    if let Some(thread) = direct_thread {
+        thread.join().unwrap();
+    }
 }
 
 #[test]
@@ -2356,6 +2393,18 @@ int main(int argc, char **argv) {
         send_msgs[i].msg_hdr.msg_namelen = sizeof(dest);
         send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
         send_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    struct sockaddr_in direct = { .sin_family = AF_INET,
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    const char *direct_port = getenv("YATHT_TEST_DIRECT_PORT");
+    if (direct_port) {
+        direct.sin_port = htons(atoi(direct_port));
+        send_msgs[0].msg_hdr.msg_name = &direct;
+        if (getenv("YATHT_TEST_CONNECTED")) {
+            if (connect(fd, (struct sockaddr *)&direct, sizeof(direct))) return 17;
+            send_msgs[0].msg_hdr.msg_name = NULL;
+            send_msgs[0].msg_hdr.msg_namelen = 0;
+        }
     }
     /* A later unsupported family must neither bypass the proxy for the
        entire fresh batch nor discard the successfully sent prefix. */

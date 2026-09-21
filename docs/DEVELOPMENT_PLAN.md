@@ -196,8 +196,9 @@ is `socks5://127.0.0.1:1080`.
   A read-only routing scan decides whether the batch needs a relay before any
   entry is sent; mixed batches then resolve names against the known UDP domain
   and preserve partial completion without continuing a proxied prefix.
-  Stable mode writes each
-  successful message length back to the target array. Stable `recvmmsg(2)` runs
+  Regression probes verify direct prefixes (named or using a connected peer),
+  proxied entries, and a final invalid name in the same first batch.
+  Stable `recvmmsg(2)` runs
   through the receive reactor, retains partial batch progress across readiness
   waits, and writes each entry's payload length, flags, and numeric source.
   `recvfrom(2)`, `recvmsg(2)`, and `recvmmsg(2)` atomically pair responses with
