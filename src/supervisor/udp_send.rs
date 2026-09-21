@@ -339,12 +339,14 @@ pub(super) fn handle_sendmmsg(
     let vlen = notif.data.args[2] as usize;
     let flags = notif.data.args[3] as i32;
 
-    if msgvec == 0 {
-        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
-        return;
-    }
+    // The kernel clamps vlen and reads no entry when it is zero, so a null
+    // msgvec with an empty batch still succeeds.
     if vlen == 0 {
         seccomp::send_success(listener_fd, notif.id);
+        return;
+    }
+    if msgvec == 0 {
+        seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
     }
     let vlen = vlen.min(UIO_MAXIOV);

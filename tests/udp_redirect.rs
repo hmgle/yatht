@@ -3503,6 +3503,18 @@ static int check_sendmmsg_on_relayed_socket(void) {
     return close(fd);
 }
 
+/* An empty sendmmsg batch reads no entry, so a null msgvec succeeds; a
+ * non-empty one still faults reading the array. */
+static int check_sendmmsg_empty_batch(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    errno = 0;
+    if (sendmmsg(fd, NULL, 0, 0) != 0) { close(fd); return -1; }
+    errno = 0;
+    if (sendmmsg(fd, NULL, 1, 0) != -1 || errno != EFAULT) { close(fd); return -1; }
+    return close(fd);
+}
+
 /* A dropped AF_UNSPEC name hands the datagram to the connected peer. Linux
  * only reaches a v4-mapped peer from the IPv4 fast path, which this call
  * bypasses, so the peer here is IPv6 to keep the check portable. */
@@ -3534,6 +3546,7 @@ int main(int argc, char **argv) {
     if (check_datagram_size_limits() != 0) return 9;
     if (check_sendmmsg_vlen_clamp() != 0) return 10;
     if (check_sendmmsg_on_relayed_socket() != 0) return 11;
+    if (check_sendmmsg_empty_batch() != 0) return 12;
     if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 8;
     return 0;
 }
