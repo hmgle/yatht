@@ -19,7 +19,7 @@ pub(super) fn handle_sendto(
     // destination-length check below instead. The common small null-address
     // send takes this fast path without classifying the fd.
     if addr == 0 && len <= MAX_UDP_PAYLOAD {
-        send_without_destination(listener_fd, &notif, existing.as_ref());
+        send_without_destination(listener_fd, &notif, existing.as_ref(), len);
         return;
     }
     // `udp_sendmsg` refuses an oversized datagram before any destination
@@ -141,17 +141,25 @@ pub(super) fn validate_iovec_segment_lengths(iovecs: &[TargetIovec]) -> Result<(
 /// Answers a send whose call carries no destination pointer at all. The kernel
 /// drops such a name before the injected AF_UNIX endpoint sees it, so a relayed
 /// socket can simply continue and let its connected peer carry the datagram;
-/// an unconnected one fails with `EDESTADDRREQ`.
+/// an unconnected one fails with `EDESTADDRREQ`, and a datagram over the
+/// connected peer's family-specific ceiling fails with `EMSGSIZE` — the IP
+/// layer checks it after resolving the peer but before copying any payload.
 pub(super) fn send_without_destination(
     listener_fd: RawFd,
     notif: &SeccompNotif,
     handle: Option<&UdpRelayHandle>,
+    len: usize,
 ) {
-    match handle {
-        Some(handle) if handle.default_destination().is_none() => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ);
+    match handle.map(|handle| handle.default_destination()) {
+        None => seccomp::send_continue(listener_fd, notif.id),
+        Some(None) => seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ),
+        Some(Some((dest, _))) => {
+            if len > max_udp_payload_for(dest) {
+                seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
+            } else {
+                seccomp::send_continue(listener_fd, notif.id);
+            }
         }
-        _ => seccomp::send_continue(listener_fd, notif.id),
     }
 }
 
@@ -245,7 +253,7 @@ pub(super) fn handle_sendmsg(
     // `sendmsg(2)` drops a zero-length name, so both cases leave the datagram
     // without an explicit destination.
     if msg.name == 0 || msg.name_len == 0 {
-        send_without_destination(listener_fd, &notif, existing.as_ref());
+        send_without_destination(listener_fd, &notif, existing.as_ref(), total);
         return;
     }
 

@@ -3410,6 +3410,25 @@ static int check_datagram_size_limits(void) {
         close(fd); return -1;
     }
 
+    /* A connected socket sending with no name still hits the family ceiling
+     * of its recorded peer once the datagram is over the UDP length field. */
+    if (close(fd) != 0) return -1;
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&ipv4, sizeof(ipv4)) != 0) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, payload, 65508, 0, NULL, 0) != -1 || errno != EMSGSIZE) {
+        close(fd); return -1;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &ipv4;
+    msg.msg_namelen = 0;
+    msg.msg_iov = split;
+    msg.msg_iovlen = 2;
+    errno = 0;
+    if (sendmsg(fd, &msg, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
+    if (close(fd) != 0) return -1;
+
     /* A dual-stack socket sending a v4-mapped name keeps the IPv4 ceiling. */
     fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
