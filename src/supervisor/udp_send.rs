@@ -351,9 +351,49 @@ pub(super) fn handle_sendmmsg(
     }
     let vlen = vlen.min(UIO_MAXIOV);
 
-    let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) else {
+    let mut existing = relays.lookup_handle(notif.pid, target_fd, true);
+    let Some(domain) = internet_udp_domain(notif.pid, target_fd, existing.as_ref()) else {
         seccomp::send_continue(listener_fd, notif.id);
         return;
+    };
+    // Decide before sending any entry whether this batch needs virtualization.
+    // Once any entry needs a proxy, direct entries must use the same relay;
+    // continuing the batch after partial emulation would resend its prefix.
+    if existing.is_none() && !(0..vlen).any(|index| {
+        let Some(ptr) = msgvec.checked_add((index * X86_64_MMSGHDR_SIZE) as u64) else {
+            return false;
+        };
+        let Ok(msg) = read_msghdr(notif.pid, ptr) else {
+            return false;
+        };
+        msg.name != 0
+            && msg.name_len != 0
+            && matches!(
+                resolve_udp_send_destination(notif.pid, msg.name, msg.name_len as usize, domain),
+                SendDestination::Explicit(dest) if udp_route_for(&cfg, dest).is_some()
+            )
+    }) {
+        seccomp::send_continue(listener_fd, notif.id);
+        return;
+    }
+    // A previously direct-connected lazy socket can first need a relay in a
+    // named batch. Preserve its peer for unnamed entries in that same batch.
+    let plain_peer = if existing.is_none() {
+        duplicate_remote_fd(notif.pid, target_fd)
+            .ok()
+            .and_then(|fd| UdpSocket::from(fd).peer_addr().ok())
+            .map(|addr| {
+                let dest = Destination {
+                    ip: addr.ip(),
+                    port: addr.port(),
+                };
+                (
+                    dest,
+                    udp_route_for(&cfg, dest).unwrap_or(UdpRouteKind::Direct),
+                )
+            })
+    } else {
+        None
     };
     let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
@@ -379,14 +419,9 @@ pub(super) fn handle_sendmmsg(
             }
         };
         let named = if msg.name != 0 && msg.name_len != 0 {
-            match resolve_send_destination(
-                notif.pid,
-                msg.name,
-                msg.name_len as usize,
-                Some(&handle),
-            ) {
+            match resolve_udp_send_destination(notif.pid, msg.name, msg.name_len as usize, domain) {
                 SendDestination::Explicit(dest) => {
-                    if let Err(errno) = validate_send_destination(handle.domain, dest) {
+                    if let Err(errno) = validate_send_destination(domain, dest) {
                         send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
                         return;
                     }
@@ -395,10 +430,8 @@ pub(super) fn handle_sendmmsg(
                         udp_route_for(&cfg, dest).unwrap_or(UdpRouteKind::Direct),
                     ))
                 }
-                // A dropped name falls back to the connected peer, exactly as
-                // an unnamed entry does. `Continue` needs a plain fd, which
-                // this relayed path never sees.
-                SendDestination::ConnectedPeer | SendDestination::Continue => None,
+                SendDestination::ConnectedPeer => None,
+                SendDestination::Continue => unreachable!("UDP domain is known"),
                 SendDestination::Errno(errno) => {
                     send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
                     return;
@@ -410,7 +443,10 @@ pub(super) fn handle_sendmmsg(
         let (dest, route) = match named {
             Some(target) => target,
             None => {
-                let default = *handle.default_dest.lock().unwrap();
+                let default = existing
+                    .as_ref()
+                    .and_then(UdpRelayHandle::default_destination)
+                    .or(plain_peer);
                 let Some(default) = default else {
                     send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EDESTADDRREQ);
                     return;
@@ -432,6 +468,16 @@ pub(super) fn handle_sendmmsg(
         if !seccomp::notif_id_valid(listener_fd, notif.id) {
             return;
         }
+        if existing.is_none() {
+            existing = relay_for_send(&cfg, &relays, listener_fd, &notif, target_fd, None);
+            let Some(handle) = existing.as_ref() else {
+                return;
+            };
+            if let Some((peer, route)) = plain_peer {
+                handle.set_default_dest(peer, route);
+            }
+        }
+        let handle = existing.as_ref().expect("relay initialized above");
         if let Err(err) = handle.send(dest, payload, route, nonblocking) {
             let errno = if err.kind() == io::ErrorKind::WouldBlock {
                 libc::EAGAIN
@@ -574,6 +620,27 @@ pub(super) fn resolve_send_destination(
         }
         Err(errno) if handle.is_some() => SendDestination::Errno(errno),
         Err(_) => SendDestination::Continue,
+    }
+}
+
+/// Resolve all names locally once classification has established a UDP domain.
+/// In particular, a later unsupported name must not continue a proxied batch.
+fn resolve_udp_send_destination(
+    pid: u32,
+    addr: u64,
+    addr_len: usize,
+    domain: i32,
+) -> SendDestination {
+    match read_send_name(pid, addr, addr_len) {
+        Ok(SendName::Explicit(dest)) => SendDestination::Explicit(dest),
+        Ok(SendName::SocketRelative { family, raw }) => {
+            match resolve_send_name(&raw, family, domain) {
+                Ok(Some(dest)) => SendDestination::Explicit(dest),
+                Ok(None) => SendDestination::ConnectedPeer,
+                Err(errno) => SendDestination::Errno(errno),
+            }
+        }
+        Err(errno) => SendDestination::Errno(errno),
     }
 }
 

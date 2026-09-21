@@ -160,7 +160,7 @@ preserve aliases created before that point. Pass `--udp-socket-mode=stable`
 with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
-every mode once a relay exists, while `recvmmsg(2)` and the socket-query paths
+every mode, including the first proxied batch, while `recvmmsg(2)` and the socket-query paths
 described below remain stable-mode features. Active UDP relay creation is
 capped at 128, with a bounded 16-datagram input queue per relay. A
 `sendmmsg(2)` batch that outpaces the relay worker reports only the enqueued
@@ -178,7 +178,9 @@ creation while capacity remains.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. `sendmmsg(2)` entries are rewritten and virtualized in every
-mode once a relay exists. Stable mode serves `recvmmsg(2)` through the receive
+mode, creating a lazy/DNS relay when the first batch needs proxy routing.
+Mixed direct/proxy batches retain per-entry routing and partial-error results.
+Stable mode serves `recvmmsg(2)` through the receive
 supervisor and virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer

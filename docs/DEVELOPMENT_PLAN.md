@@ -178,7 +178,12 @@ is `socks5://127.0.0.1:1080`.
 - DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
   DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
   SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
-- Stable mode rewrites explicit destinations in `sendmmsg(2)` and writes each
+- All UDP modes rewrite explicit destinations in `sendmmsg(2)` and write each
+  successful message length back, including a lazy/DNS socket's first batch.
+  A read-only routing scan decides whether the batch needs a relay before any
+  entry is sent; mixed batches then resolve names against the known UDP domain
+  and preserve partial completion without continuing a proxied prefix.
+  Stable mode writes each
   successful message length back to the target array. Stable `recvmmsg(2)` runs
   through the receive reactor, retains partial batch progress across readiness
   waits, and writes each entry's payload length, flags, and numeric source.

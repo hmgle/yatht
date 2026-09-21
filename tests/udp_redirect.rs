@@ -1658,6 +1658,15 @@ fn stable_udp_connected_socket_reports_logical_peer() {
 
 #[test]
 fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
+    udp_sendmmsg_routes_first_batch("stable");
+}
+
+#[test]
+fn lazy_udp_sendmmsg_creates_relay_on_first_batch() {
+    udp_sendmmsg_routes_first_batch("lazy");
+}
+
+fn udp_sendmmsg_routes_first_batch(mode: &str) {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
@@ -1695,7 +1704,7 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
         .arg("--udp-socket-mode")
-        .arg("stable")
+        .arg(mode)
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1719,6 +1728,49 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
         (destination, b"batch-two".to_vec())
     );
     socks_thread.join().unwrap();
+}
+
+#[test]
+fn dns_sendmmsg_creates_relay_on_first_batch() {
+    let (_probe_dir, probe) = build_udp_mmsg_probe();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut client, _) = socks.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socks5_greet(&mut client);
+        let _ = read_socks5_request(&mut client);
+        client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        for query in [b"batch-one", b"batch-two"] {
+            let mut len = [0; 2];
+            client.read_exact(&mut len).unwrap();
+            let mut payload = vec![0; u16::from_be_bytes(len) as usize];
+            client.read_exact(&mut payload).unwrap();
+            assert_eq!(payload, query);
+            client.write_all(&12_u16.to_be_bytes()).unwrap();
+            client.write_all(query).unwrap();
+            client.write_all(b"-ok").unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args([
+            "--proxy",
+            &format!("socks5://{socks_addr}"),
+            "--enable-dns",
+            "--",
+        ])
+        .arg(probe)
+        .arg("198.51.100.12:53")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "batch-one-ok:batch-two-ok"
+    );
+    server.join().unwrap();
 }
 
 #[test]
@@ -2122,7 +2174,7 @@ int main(int argc, char **argv) {
         { .iov_base = first, .iov_len = sizeof(first) - 1 },
         { .iov_base = second, .iov_len = sizeof(second) - 1 },
     };
-    struct mmsghdr send_msgs[2];
+    struct mmsghdr send_msgs[3];
     memset(send_msgs, 0, sizeof(send_msgs));
     for (int i = 0; i < 2; ++i) {
         send_msgs[i].msg_hdr.msg_name = &dest;
@@ -2130,7 +2182,14 @@ int main(int argc, char **argv) {
         send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
         send_msgs[i].msg_hdr.msg_iovlen = 1;
     }
-    if (sendmmsg(fd, send_msgs, 2, 0) != 2) return 7;
+    /* A later unsupported family must neither bypass the proxy for the
+       entire fresh batch nor discard the successfully sent prefix. */
+    struct sockaddr bad_name = { .sa_family = AF_UNIX };
+    send_msgs[2].msg_hdr = send_msgs[0].msg_hdr;
+    send_msgs[2].msg_hdr.msg_name = &bad_name;
+    send_msgs[2].msg_hdr.msg_namelen = sizeof(bad_name);
+    send_msgs[2].msg_len = 12345;
+    if (sendmmsg(fd, send_msgs, 3, 0) != 2 || send_msgs[2].msg_len != 12345) return 7;
 
     /* An oversized named entry reports the first message's error. */
     static char big[65508];
