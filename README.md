@@ -163,6 +163,14 @@ transport exists, its receive path runs independently, including delayed,
 reordered, and multiple responses. Different direct/proxy peers have no shared
 response ordering guarantee. Ancillary data, connected-peer receive filtering,
 and pre-existing epoll registrations are not preserved.
+SOCKS5 sends intercepted through `sendto`, `sendmsg`, or `sendmmsg` reject
+payloads above 65497 bytes for IPv4 destinations or 65485 bytes for IPv6
+(including IPv4-mapped IPv6) with `EMSGSIZE`. These conservative limits reserve
+the 10/22-byte SOCKS5 header within a 65507-byte outer UDP envelope, before the
+association reveals the relay address. They also apply to IPv6 relay transports;
+direct and DNS paths retain their native destination-family limits. Smaller
+path-MTU limits or other asynchronous send failures remain possible and are
+counted by `udp_dropped_jobs` when observed by the worker.
 Emulated receives report `msg_controllen = 0` when returning no ancillary data.
 The default lazy mode creates the relay on the first proxied send and does not
 preserve aliases created before that point. Aliases made after replacement

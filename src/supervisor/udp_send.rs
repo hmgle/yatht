@@ -69,7 +69,7 @@ pub(super) fn handle_sendto(
     };
     // With a destination resolved, the IP layer's family-specific ceiling
     // applies before any user-buffer copy.
-    if len > max_udp_payload_for(dest) {
+    if len > max_udp_payload_for_route(dest, route) {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
         return;
     }
@@ -150,8 +150,8 @@ pub(super) fn send_without_destination(
     match handle.map(|handle| handle.default_destination()) {
         None => seccomp::send_continue(listener_fd, notif.id),
         Some(None) => seccomp::send_errno(listener_fd, notif.id, libc::EDESTADDRREQ),
-        Some(Some((dest, _))) => {
-            if len > max_udp_payload_for(dest) {
+        Some(Some((dest, route))) => {
+            if len > max_udp_payload_for_route(dest, route) {
                 seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
             } else {
                 seccomp::send_continue(listener_fd, notif.id);
@@ -297,7 +297,7 @@ pub(super) fn handle_sendmsg(
     // The iovec import above already applied the pre-destination 0xFFFF
     // ceiling; with a destination resolved the IP layer's family-specific
     // limit applies before any user-buffer copy.
-    if total > max_udp_payload_for(dest) {
+    if total > max_udp_payload_for_route(dest, route) {
         seccomp::send_errno(listener_fd, notif.id, libc::EMSGSIZE);
         return;
     }
@@ -452,7 +452,7 @@ pub(super) fn handle_sendmmsg(
                 default
             }
         };
-        if total > max_udp_payload_for(dest) {
+        if total > max_udp_payload_for_route(dest, route) {
             send_mmsg_result_or_errno(listener_fd, notif.id, sent, libc::EMSGSIZE);
             return;
         }
@@ -726,5 +726,18 @@ pub(super) fn udp_send_errno(err: &io::Error) -> i32 {
         io::ErrorKind::WouldBlock => libc::EAGAIN,
         io::ErrorKind::BrokenPipe if err.raw_os_error().is_none() => libc::ECONNREFUSED,
         _ => errno_from_io(err),
+    }
+}
+
+/// Use an IPv4-sized outer envelope for SOCKS5, even before UDP ASSOCIATE
+/// reveals its relay address. This conservative ceiling also fits IPv6 relay
+/// transports. The SOCKS address header follows the logical destination type,
+/// including the 22-byte header for IPv4-mapped IPv6 destinations.
+pub(super) fn max_udp_payload_for_route(dest: Destination, route: UdpRouteKind) -> usize {
+    let native = max_udp_payload_for(dest);
+    if route == UdpRouteKind::Generic {
+        native.min(MAX_IPV4_UDP_PAYLOAD - if dest.ip.is_ipv4() { 10 } else { 22 })
+    } else {
+        native
     }
 }

@@ -5631,3 +5631,86 @@ fn pipelined_dns_replies_keep_original_destinations_with_reused_ids() {
     assert_success(&output);
     server.join().unwrap();
 }
+
+#[test]
+fn udp_payload_limits_include_socks_headers_without_reducing_direct_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_payload_limit");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_payload_limit.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["lazy", "stable"] {
+        for (ip, direct_limit, proxy_limit) in [
+            ("127.0.0.1", 65507, 65497),
+            ("::ffff:127.0.0.1", 65507, 65485),
+            ("::1", 65527, 65485),
+        ] {
+            for proxied in [false, true] {
+                for batch_first in [false, true] {
+                    let udp = UdpSocket::bind(if !proxied && ip == "::1" {
+                        "[::1]:0"
+                    } else {
+                        "127.0.0.1:0"
+                    })
+                    .unwrap();
+                    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let port = udp.local_addr().unwrap().port();
+                    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let socks_addr = socks.local_addr().unwrap();
+                    let server = thread::spawn(move || {
+                        let mut control = if proxied {
+                            let (mut stream, _) = socks.accept().unwrap();
+                            socks5_greet(&mut stream);
+                            read_socks5_request(&mut stream);
+                            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+                            reply.extend_from_slice(&port.to_be_bytes());
+                            stream.write_all(&reply).unwrap();
+                            Some(stream)
+                        } else {
+                            None
+                        };
+                        for _ in 0..2 {
+                            let mut buf = vec![0; 65535];
+                            let (n, peer) = udp.recv_from(&mut buf).unwrap();
+                            udp.send_to(&buf[..n], peer).unwrap();
+                        }
+                        if let Some(stream) = control.as_mut() {
+                            let _ = stream.read(&mut [0]);
+                        }
+                    });
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+                    command.args([
+                        "--enable-udp",
+                        "--udp-socket-mode",
+                        mode,
+                        "--proxy",
+                        &format!("socks5://{socks_addr}"),
+                    ]);
+                    if proxied {
+                        command.arg("--proxy-local");
+                    }
+                    let output = command
+                        .arg("--")
+                        .arg(&probe)
+                        .arg(ip)
+                        .arg(port.to_string())
+                        .arg(if proxied { proxy_limit } else { direct_limit }.to_string())
+                        .arg(if batch_first { "1" } else { "0" })
+                        .output()
+                        .unwrap();
+                    assert_success(&output);
+                    server.join().unwrap();
+                }
+            }
+        }
+    }
+}

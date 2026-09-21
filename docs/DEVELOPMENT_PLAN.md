@@ -188,6 +188,14 @@ is `socks5://127.0.0.1:1080`.
   workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
   sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
   full, and relay setup fails closed when the global limit is reached.
+- Proxied sendto/sendmsg/sendmmsg apply a conservative SOCKS5 envelope ceiling
+  after destination and route resolution, including connected nameless sends:
+  65507 minus a 10-byte IPv4 or 22-byte IPv6 destination header. IPv4-mapped
+  IPv6 still uses the IPv6 header. This avoids acknowledging known oversized
+  jobs before UDP ASSOCIATE reveals the relay's transport family; IPv6 relays
+  also use the conservative ceiling. Direct and DNS limits are unchanged.
+  Boundary tests cover named/unnamed sends, first lazy batches, partial batches,
+  IPv4, mapped IPv6, and native IPv6, with successful payload echo at the limit.
 - Relay I/O uses nonblocking direct/SOCKS5 sockets and a readiness loop with
   an eventfd for job publication, disconnect, and shutdown. Sends never wait for
   replies. Each pass bounds send and receive work to keep both directions and
