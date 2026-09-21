@@ -1480,6 +1480,60 @@ fn stable_udp_socket_survives_bind_dup_close_and_fork() {
 }
 
 #[test]
+fn lazy_udp_socket_survives_bind_dup_close_and_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_lazy_alias");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_lazy_alias.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = udp.local_addr().unwrap().port().to_be_bytes();
+    udp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let server = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _ = read_socks5_request(&mut client);
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+        for _ in 0..5 {
+            let mut packet = [0; 128];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            let (_, payload) = parse_udp_packet(&packet[..n]);
+            assert_eq!(payload, b"alias");
+            udp.send_to(&packet[..n], peer).unwrap();
+        }
+        let _ = client.read(&mut [0]);
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args([
+            "--udp-socket-mode",
+            "lazy",
+            "--enable-udp",
+            "--proxy",
+            &format!("socks5://{tcp_addr}"),
+            "--",
+        ])
+        .arg(probe)
+        .arg("198.51.100.11:4455")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    server.join().unwrap();
+}
+
+#[test]
 fn stable_udp_reclaims_closed_socket_capacity() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;

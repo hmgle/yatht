@@ -58,27 +58,27 @@ pub(super) enum StableSocketCreation {
 pub(super) struct UdpRelayRegistry {
     pub(super) observability: Observability,
     pub(super) inner: Mutex<HashMap<RelayKey, RelayState>>,
-    pub(super) stable_by_cookie: Mutex<HashMap<u64, UdpRelayHandle>>,
+    pub(super) by_cookie: Mutex<HashMap<u64, UdpRelayHandle>>,
     pub(super) created: Condvar,
     pub(super) active: AtomicUsize,
     pub(super) stable_addfd_unsupported: AtomicBool,
-    pub(super) stable_reap_warning_reported: AtomicBool,
-    pub(super) reaper: StableRelayReaper,
+    pub(super) reap_warning_reported: AtomicBool,
+    pub(super) reaper: RelayReaper,
 }
 
 #[derive(Default)]
-pub(super) struct StableRelayReaper {
-    pub(super) state: Mutex<StableRelayReaperState>,
+pub(super) struct RelayReaper {
+    pub(super) state: Mutex<RelayReaperState>,
     pub(super) signal: Condvar,
 }
 
 #[derive(Default)]
-pub(super) struct StableRelayReaperState {
+pub(super) struct RelayReaperState {
     pub(super) stop: bool,
     pub(super) published: bool,
 }
 
-/// Sweep cadence for the stable relay reaper. Consecutive sweeps that reclaim
+/// Sweep cadence for the relay reaper. Consecutive sweeps that reclaim
 /// nothing extend the wait geometrically once the grace window passes, so a
 /// quiet supervisor stops re-reading the host-wide `/proc/net/unix`. Capacity
 /// is never lost to a long interval: exhausted admission sweeps on demand.
@@ -230,7 +230,6 @@ pub(super) fn valid_relay_locked(
     key: RelayKey,
     pid: u32,
     fd: RawFd,
-    active: &AtomicUsize,
 ) -> Option<UdpRelayHandle> {
     let handle = match relays.get(&key) {
         Some(RelayState::Ready(handle)) => handle.clone(),
@@ -241,14 +240,8 @@ pub(super) fn valid_relay_locked(
     if handle.target_fd_matches(pid, fd) {
         Some(handle)
     } else {
-        if let Some(RelayState::Ready(stale)) = relays.remove(&key) {
-            if !stale.stable {
-                stale.shutdown();
-                let _ = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                });
-            }
-        }
+        // The cookie index owns the relay until its final target alias closes.
+        relays.remove(&key);
         None
     }
 }
@@ -285,16 +278,16 @@ impl UdpRelayRegistry {
         }
     }
 
-    /// Closes stable relays whose target socket is gone. Only relays that were
+    /// Closes relays whose target socket is gone. Only relays that were
     /// already published when the sweep started are eligible: `/proc/net/unix`
     /// is generated as it is read, so a socket that a concurrent
     /// `create_stable` opens while the read is in flight can be missing from
     /// the snapshot even though it is alive. Taking the candidate list before
     /// the read keeps such a relay from being shut down at birth and from
     /// releasing an admission slot its creator still holds.
-    pub(super) fn reap_closed_stable(&self) -> io::Result<usize> {
+    pub(super) fn reap_closed_relays(&self) -> io::Result<usize> {
         let candidates = self
-            .stable_by_cookie
+            .by_cookie
             .lock()
             .unwrap()
             .iter()
@@ -306,7 +299,7 @@ impl UdpRelayRegistry {
 
         let live_inodes = unix_socket_inodes()?;
         let removed = {
-            let mut stable = self.stable_by_cookie.lock().unwrap();
+            let mut stable = self.by_cookie.lock().unwrap();
             let mut closed = Vec::new();
             for (cookie, identity) in &candidates {
                 if live_inodes.contains(&identity.ino) {
@@ -361,35 +354,32 @@ impl UdpRelayRegistry {
         })
     }
 
-    pub(super) fn reap_closed_stable_best_effort(&self, debug: bool) -> usize {
-        match self.reap_closed_stable() {
+    pub(super) fn reap_closed_relays_best_effort(&self, debug: bool) -> usize {
+        match self.reap_closed_relays() {
             Ok(reclaimed) => {
-                self.stable_reap_warning_reported
-                    .store(false, Ordering::Release);
+                self.reap_warning_reported.store(false, Ordering::Release);
                 reclaimed
             }
             Err(err) => {
-                let first = !self
-                    .stable_reap_warning_reported
-                    .swap(true, Ordering::AcqRel);
+                let first = !self.reap_warning_reported.swap(true, Ordering::AcqRel);
                 if debug && first {
-                    eprintln!("yatht: stable UDP relay cleanup skipped: {err}");
+                    eprintln!("yatht: UDP relay cleanup skipped: {err}");
                 }
                 0
             }
         }
     }
 
-    /// Restores the base sweep cadence. A newly published stable relay is the
+    /// Restores the base sweep cadence. A newly published relay is the
     /// only event the supervisor can observe that makes a quiet process worth
     /// sweeping often again; the target-side close the sweep looks for happens
     /// entirely outside its view.
-    pub(super) fn notify_stable_relay_published(&self) {
+    pub(super) fn notify_relay_published(&self) {
         self.reaper.state.lock().unwrap().published = true;
         self.reaper.signal.notify_all();
     }
 
-    pub(super) fn stop_stable_relay_reaper(&self) {
+    pub(super) fn stop_relay_reaper(&self) {
         self.reaper.state.lock().unwrap().stop = true;
         self.reaper.signal.notify_all();
     }
@@ -398,7 +388,7 @@ impl UdpRelayRegistry {
     /// been requested. The remaining wait is always measured from the same
     /// start, so a steady stream of newly published relays can only shorten
     /// it and can never postpone a sweep indefinitely.
-    pub(super) fn wait_for_next_stable_sweep(&self, cadence: &mut StableSweepCadence) -> bool {
+    pub(super) fn wait_for_next_relay_sweep(&self, cadence: &mut StableSweepCadence) -> bool {
         let start = Instant::now();
         let mut state = self.reaper.state.lock().unwrap();
         loop {
@@ -416,12 +406,12 @@ impl UdpRelayRegistry {
         }
     }
 
-    /// Reserves an admission slot for a stable socket. The common path never
+    /// Reserves an admission slot for a relay. The common path never
     /// scans procfs; only an exhausted budget sweeps, and it then retries
     /// briefly because `/proc/net/unix` can lag the final close of a
     /// target-side alias performed by another thread. The wait sits entirely
     /// on the already-slow path.
-    pub(super) fn reserve_stable_relay_slot(&self, debug: bool) -> Result<RelaySlotGuard<'_>> {
+    pub(super) fn reserve_reaped_relay_slot(&self, debug: bool) -> Result<RelaySlotGuard<'_>> {
         let mut last = match self.reserve_relay_slot() {
             Ok(slot) => return Ok(slot),
             Err(err) => err,
@@ -430,7 +420,7 @@ impl UdpRelayRegistry {
             if attempt > 0 {
                 thread::sleep(STABLE_RELAY_REAP_INTERVAL);
             }
-            self.reap_closed_stable_best_effort(debug);
+            self.reap_closed_relays_best_effort(debug);
             match self.reserve_relay_slot() {
                 Ok(slot) => return Ok(slot),
                 Err(err) => last = err,
@@ -447,8 +437,8 @@ impl UdpRelayRegistry {
             });
     }
 
-    pub(super) fn remove_stable_cookie_if_current(&self, cookie: u64, target_identity: FdIdentity) {
-        let mut stable = self.stable_by_cookie.lock().unwrap();
+    pub(super) fn remove_cookie_if_current(&self, cookie: u64, target_identity: FdIdentity) {
+        let mut stable = self.by_cookie.lock().unwrap();
         if matches!(stable.get(&cookie), Some(current) if current.target_identity == target_identity)
         {
             stable.remove(&cookie);
@@ -467,7 +457,7 @@ impl UdpRelayRegistry {
             return Ok(StableSocketCreation::Unsupported);
         }
 
-        let mut slot = self.reserve_stable_relay_slot(cfg.debug)?;
+        let mut slot = self.reserve_reaped_relay_slot(cfg.debug)?;
         let (relay_socket, target_fd) =
             make_relay_pair().context("create stable UDP relay datagram socketpair")?;
         if socket_type & libc::SOCK_NONBLOCK != 0 {
@@ -496,11 +486,11 @@ impl UdpRelayRegistry {
         // Publish the primary identity before ADDFD+SEND wakes the target. If
         // the target immediately uses a dup/fork alias before the fd cache is
         // populated, lookup can still recover the relay by SO_COOKIE.
-        self.stable_by_cookie
+        self.by_cookie
             .lock()
             .unwrap()
             .insert(target_cookie, handle.clone());
-        self.notify_stable_relay_published();
+        self.notify_relay_published();
         let mut addfd = SeccompNotifAddfd {
             id: notif.id,
             flags: seccomp::ADDFD_FLAG_SEND,
@@ -515,7 +505,7 @@ impl UdpRelayRegistry {
         let target_fd_number = match seccomp::notif_addfd(listener_fd, &mut addfd) {
             Ok(fd) => fd,
             Err(err) => {
-                self.remove_stable_cookie_if_current(target_cookie, target_identity);
+                self.remove_cookie_if_current(target_cookie, target_identity);
                 handle.shutdown();
                 if err.raw_os_error() == Some(libc::EINVAL) {
                     self.stable_addfd_unsupported.store(true, Ordering::Release);
@@ -562,7 +552,7 @@ impl UdpRelayRegistry {
         let mut slot = {
             let mut relays = self.inner.lock().unwrap();
             loop {
-                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd, &self.active) {
+                if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
                     if let Some((dest, route)) = default_dest {
                         handle.set_default_dest(dest, route);
                     }
@@ -577,7 +567,14 @@ impl UdpRelayRegistry {
                     }
                     // Free to claim: publish the marker and build below.
                     _ => {
-                        let slot = self.reserve_relay_slot()?;
+                        // Admission may reap, which also locks the alias map.
+                        drop(relays);
+                        let slot = self.reserve_reaped_relay_slot(cfg.debug)?;
+                        relays = self.inner.lock().unwrap();
+                        if relays.contains_key(&key) {
+                            drop(slot);
+                            continue;
+                        }
                         relays.insert(key, RelayState::Creating);
                         break slot;
                     }
@@ -640,6 +637,13 @@ impl UdpRelayRegistry {
             handle.shutdown();
             return Err(err).context("inject UDP relay fd");
         }
+        // Publish while our target duplicate still pins the inode and before
+        // waking waiters on the alias cache. A sweep cannot reap this socket.
+        self.by_cookie
+            .lock()
+            .unwrap()
+            .insert(handle.target_cookie, handle.clone());
+        self.notify_relay_published();
         drop(target_fd);
 
         // Publish the ready relay and hand the marker off to Ready in one
@@ -691,13 +695,12 @@ impl UdpRelayRegistry {
                 return RelayLookup::Ready(handle, duplicated);
             }
             self.remove_ready_if_current(key, handle.target_identity);
-            return RelayLookup::Missing;
         }
 
-        // `(tgid, fd)` is only a cache for stable sockets. A dup or fork alias
+        // `(tgid, fd)` is only a cache. A dup or fork alias
         // misses that cache, so duplicate the notifying fd and recover the
         // primary relay by the kernel socket cookie.
-        if self.stable_by_cookie.lock().unwrap().is_empty() {
+        if self.by_cookie.lock().unwrap().is_empty() {
             return RelayLookup::Missing;
         }
         let duplicated = match duplicate_remote_fd(pid, fd) {
@@ -707,7 +710,7 @@ impl UdpRelayRegistry {
         let Some(cookie) = socket_cookie(duplicated.as_raw_fd()) else {
             return RelayLookup::Missing;
         };
-        let handle = self.stable_by_cookie.lock().unwrap().get(&cookie).cloned();
+        let handle = self.by_cookie.lock().unwrap().get(&cookie).cloned();
         let Some(handle) = handle else {
             return RelayLookup::Missing;
         };
@@ -794,47 +797,32 @@ impl UdpRelayRegistry {
 
     pub(super) fn remove_alias(&self, pid: u32, fd: RawFd) {
         let key = relay_key(pid, fd);
-        let removed = self.inner.lock().unwrap().remove(&key);
-        if let Some(RelayState::Ready(handle)) = removed {
-            self.finish_removed_handle(handle);
-        }
+        self.inner.lock().unwrap().remove(&key);
         self.created.notify_all();
     }
 
     pub(super) fn remove_ready_if_current(&self, key: RelayKey, target_identity: FdIdentity) {
-        let removed = {
+        {
             let mut relays = self.inner.lock().unwrap();
             if matches!(relays.get(&key), Some(RelayState::Ready(current)) if current.target_identity == target_identity)
             {
-                relays.remove(&key)
-            } else {
-                None
+                relays.remove(&key);
             }
-        };
-        if let Some(RelayState::Ready(handle)) = removed {
-            self.finish_removed_handle(handle);
-        }
-    }
-
-    pub(super) fn finish_removed_handle(&self, handle: UdpRelayHandle) {
-        if !handle.stable {
-            handle.shutdown();
-            self.release_relay_slot();
         }
     }
 }
 
-/// Reclaims stable relays whose target socket is gone. The scan reads the
+/// Reclaims relays whose target socket is gone. The scan reads the
 /// host-wide `/proc/net/unix`, whose size and parse cost track the machine
 /// rather than the relays this supervisor owns, so it runs on its own thread
 /// instead of on the blocking-receive reactor where a multi-millisecond stall
 /// would delay already-ready receives and armed `SO_RCVTIMEO`/`recvmmsg`
 /// deadlines.
-pub(super) fn stable_relay_reaper(relays: Arc<UdpRelayRegistry>, debug: bool) {
+pub(super) fn udp_relay_reaper(relays: Arc<UdpRelayRegistry>, debug: bool) {
     lower_current_thread_priority(STABLE_RELAY_REAPER_NICE);
     let mut cadence = StableSweepCadence::default();
-    while relays.wait_for_next_stable_sweep(&mut cadence) {
-        cadence.record_sweep(relays.reap_closed_stable_best_effort(debug));
+    while relays.wait_for_next_relay_sweep(&mut cadence) {
+        cadence.record_sweep(relays.reap_closed_relays_best_effort(debug));
     }
 }
 

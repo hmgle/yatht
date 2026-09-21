@@ -179,6 +179,15 @@ fn udp_relay_capacity_is_globally_bounded() {
 
 #[test]
 fn stable_relay_reaping_waits_for_the_last_target_alias() {
+    relay_reaping_waits_for_the_last_target_alias(true);
+}
+
+#[test]
+fn lazy_relay_reaping_waits_for_the_last_target_alias() {
+    relay_reaping_waits_for_the_last_target_alias(false);
+}
+
+fn relay_reaping_waits_for_the_last_target_alias(stable: bool) {
     let registry = UdpRelayRegistry::default();
     let (relay, target) = make_relay_pair().unwrap();
     let alias_fd = unsafe { libc::dup(target.as_raw_fd()) };
@@ -197,24 +206,24 @@ fn stable_relay_reaping_waits_for_the_last_target_alias() {
         target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
         domain: libc::AF_INET,
         protocol: libc::IPPROTO_UDP,
-        stable: true,
+        stable,
         shutdown: Arc::clone(&shutdown),
     };
     registry.active.store(1, Ordering::Release);
     registry
-        .stable_by_cookie
+        .by_cookie
         .lock()
         .unwrap()
         .insert(handle.target_cookie, handle);
 
     drop(target);
-    assert_eq!(registry.reap_closed_stable().unwrap(), 0);
+    assert_eq!(registry.reap_closed_relays().unwrap(), 0);
     assert_eq!(registry.active.load(Ordering::Acquire), 1);
 
     drop(alias);
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        if registry.reap_closed_stable().unwrap() == 1 {
+        if registry.reap_closed_relays().unwrap() == 1 {
             break;
         }
         assert!(
@@ -239,7 +248,7 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
     let reaper_stop = Arc::clone(&stop);
     let reaper = thread::spawn(move || {
         while !reaper_stop.load(Ordering::Relaxed) {
-            reaper_registry.reap_closed_stable().unwrap();
+            reaper_registry.reap_closed_relays().unwrap();
         }
     });
 
@@ -266,7 +275,7 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
                 shutdown: Arc::clone(&shutdown),
             };
             registry
-                .stable_by_cookie
+                .by_cookie
                 .lock()
                 .unwrap()
                 .insert(target_cookie, handle.clone());
@@ -288,18 +297,14 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
                 "sweep closed a live stable relay"
             );
             assert!(
-                registry
-                    .stable_by_cookie
-                    .lock()
-                    .unwrap()
-                    .contains_key(cookie),
+                registry.by_cookie.lock().unwrap().contains_key(cookie),
                 "sweep dropped a live stable relay"
             );
         }
         assert_eq!(registry.active.load(Ordering::Acquire), live.len());
 
         for (_, _, cookie, key) in &live {
-            registry.stable_by_cookie.lock().unwrap().remove(cookie);
+            registry.by_cookie.lock().unwrap().remove(cookie);
             registry.inner.lock().unwrap().remove(key);
             registry.release_relay_slot();
         }
@@ -338,12 +343,12 @@ fn stable_sweep_cadence_caps_and_restarts() {
 }
 
 #[test]
-fn stable_relay_reaper_stops_without_waiting_out_its_interval() {
+fn udp_relay_reaper_stops_without_waiting_out_its_interval() {
     let registry = Arc::new(UdpRelayRegistry::default());
     let reaper_registry = Arc::clone(&registry);
-    let reaper = thread::spawn(move || stable_relay_reaper(reaper_registry, false));
+    let reaper = thread::spawn(move || udp_relay_reaper(reaper_registry, false));
 
-    registry.stop_stable_relay_reaper();
+    registry.stop_relay_reaper();
     let start = Instant::now();
     reaper.join().unwrap();
 
@@ -366,11 +371,11 @@ fn publishing_a_relay_shortens_a_backed_off_sweep_wait() {
     let publisher_registry = Arc::clone(&registry);
     let publisher = thread::spawn(move || {
         thread::sleep(Duration::from_millis(20));
-        publisher_registry.notify_stable_relay_published();
+        publisher_registry.notify_relay_published();
     });
 
     let start = Instant::now();
-    assert!(registry.wait_for_next_stable_sweep(&mut cadence));
+    assert!(registry.wait_for_next_relay_sweep(&mut cadence));
     let waited = start.elapsed();
     publisher.join().unwrap();
 
@@ -389,14 +394,14 @@ fn a_steady_publish_rate_cannot_postpone_a_sweep() {
     let publisher_stop = Arc::clone(&stop);
     let publisher = thread::spawn(move || {
         while !publisher_stop.load(Ordering::Relaxed) {
-            publisher_registry.notify_stable_relay_published();
+            publisher_registry.notify_relay_published();
             thread::sleep(Duration::from_millis(10));
         }
     });
 
     let mut cadence = StableSweepCadence::default();
     let start = Instant::now();
-    assert!(registry.wait_for_next_stable_sweep(&mut cadence));
+    assert!(registry.wait_for_next_relay_sweep(&mut cadence));
     let waited = start.elapsed();
     stop.store(true, Ordering::Relaxed);
     publisher.join().unwrap();
@@ -447,7 +452,7 @@ fn relay_lookup_removes_stale_entry_when_dup_fails() {
         RelayLookup::Missing
     ));
     assert!(!registry.inner.lock().unwrap().contains_key(&key));
-    assert!(handle.shutdown.load(Ordering::SeqCst));
+    assert!(!handle.shutdown.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -480,7 +485,7 @@ fn close_removes_matching_relay() {
     registry.remove_for_close(std::process::id(), target.as_raw_fd());
 
     assert!(!registry.inner.lock().unwrap().contains_key(&key));
-    assert!(shutdown.load(Ordering::SeqCst));
+    assert!(!shutdown.load(Ordering::SeqCst));
 }
 
 #[test]

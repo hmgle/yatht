@@ -156,7 +156,9 @@ Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
 multiple responses, ancillary data, or pre-existing epoll registrations. The
 default lazy mode creates the relay on the first proxied send and does not
-preserve aliases created before that point. Pass `--udp-socket-mode=stable`
+preserve aliases created before that point. Aliases made after replacement
+share the relay, which survives until the last alias closes.
+Pass `--udp-socket-mode=stable`
 with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in

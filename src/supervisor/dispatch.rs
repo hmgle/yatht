@@ -38,12 +38,12 @@ pub(super) fn notification_loop(
         }));
     }
     let mut reaper_thread = None;
-    if cfg.enable_udp && cfg.udp_socket_mode == UdpSocketMode::Stable {
+    if cfg.enable_udp || cfg.enable_dns {
         let reaper_relays = Arc::clone(&relays);
         let reaper_debug = cfg.debug;
         match thread::Builder::new()
             .name("yatht-udp-reap".to_string())
-            .spawn(move || stable_relay_reaper(reaper_relays, reaper_debug))
+            .spawn(move || udp_relay_reaper(reaper_relays, reaper_debug))
         {
             Ok(thread) => reaper_thread = Some(thread),
             Err(err) => {
@@ -63,9 +63,9 @@ pub(super) fn notification_loop(
             Err(err) => {
                 failure.report("create blocking receive wake fd", err);
                 drop(tx);
-                relays.stop_stable_relay_reaper();
+                relays.stop_relay_reaper();
                 join_notification_workers(worker_threads, &failure);
-                join_stable_relay_reaper(reaper_thread, &failure);
+                join_udp_relay_reaper(reaper_thread, &failure);
                 return;
             }
         };
@@ -175,7 +175,7 @@ pub(super) fn notification_loop(
     }
     drop(tx);
     drop(blocking_queue);
-    relays.stop_stable_relay_reaper();
+    relays.stop_relay_reaper();
     join_notification_workers(worker_threads, &failure);
     if blocking_thread.is_some_and(|thread| thread.join().is_err()) {
         failure.report(
@@ -183,10 +183,10 @@ pub(super) fn notification_loop(
             io::Error::other("blocking receive reactor panicked"),
         );
     }
-    join_stable_relay_reaper(reaper_thread, &failure);
+    join_udp_relay_reaper(reaper_thread, &failure);
 }
 
-pub(super) fn join_stable_relay_reaper(
+pub(super) fn join_udp_relay_reaper(
     reaper_thread: Option<thread::JoinHandle<()>>,
     failure: &NotificationFailure,
 ) {

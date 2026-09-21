@@ -146,9 +146,11 @@ is `socks5://127.0.0.1:1080`.
   `getsockname(2)` and `getpeername(2)` return the logical local/connected
   destination, while `getsockopt(2)` reports the AF_INET/AF_INET6 UDP domain,
   type, protocol, and a zero socket error.
-  Stable relay state is keyed by the injected endpoint's `SO_COOKIE`, with
+  All relay state is keyed by the injected endpoint's `SO_COOKIE`, with
   `(tgid, fd)` as a fast alias cache, so dup/fork aliases can recover after a
-  descriptor-number change. A low-frequency reactor sweep checks AF_UNIX
+  descriptor-number change, including aliases created after lazy replacement.
+  Removing an alias cache entry never shuts down its relay. A dedicated
+  low-frequency reaper in both DNS and generic UDP modes checks AF_UNIX
   inodes in `/proc/net/unix` and reclaims a relay only after its last target-side
   open file description has disappeared. Capacity-bound admission sweeps and
   retries briefly; normal socket creation avoids procfs, and read failures
