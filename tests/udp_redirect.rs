@@ -3665,16 +3665,18 @@ static int check_datagram_size_limits(void) {
     memset(&ipv4, 0, sizeof(ipv4));
     ipv4.sin_family = AF_INET;
     ipv4.sin_port = htons(9);
-    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+    if (inet_pton(AF_INET, "127.0.0.1", &ipv4.sin_addr) != 1) return -1;
 
     struct sockaddr_in6 mapped;
     memset(&mapped, 0, sizeof(mapped));
     mapped.sin6_family = AF_INET6;
     mapped.sin6_port = htons(9);
-    if (inet_pton(AF_INET6, "::ffff:203.0.113.1", &mapped.sin6_addr) != 1) return -1;
+    if (inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped.sin6_addr) != 1) return -1;
 
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
+    /* Use direct loopback routing to test the native IP ceiling. Proxied
+     * envelope limits are covered separately by udp_payload_limit.c. */
     /* 65507 sits at the IPv4 ceiling: it must not be answered EMSGSIZE. */
     errno = 0;
     if (sendto(fd, payload, 65507, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) == -1 &&
