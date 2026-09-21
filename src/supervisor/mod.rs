@@ -1652,7 +1652,7 @@ fn handle_socket(
         return;
     }
 
-    match relays.create_stable(listener_fd, &cfg, &notif, socket_type) {
+    match relays.create_stable(listener_fd, &cfg, &notif, socket_type, protocol) {
         Ok(StableSocketCreation::Injected) => {}
         Ok(StableSocketCreation::Unsupported) => {
             if cfg.debug {
@@ -1857,7 +1857,7 @@ fn handle_getsockopt(listener_fd: RawFd, notif: SeccompNotif, relays: Arc<UdpRel
     let value = match option {
         libc::SO_DOMAIN => handle.domain,
         libc::SO_TYPE => libc::SOCK_DGRAM,
-        libc::SO_PROTOCOL => libc::IPPROTO_UDP,
+        libc::SO_PROTOCOL => handle.protocol,
         libc::SO_ERROR => 0,
         _ => unreachable!("getsockopt option filtered above"),
     };
@@ -3297,6 +3297,7 @@ struct FdIdentity {
 struct UdpTargetSnapshot {
     identity: FdIdentity,
     domain: i32,
+    protocol: i32,
     flags: TargetFdFlags,
     rcvtimeo: Option<Duration>,
 }
@@ -3388,6 +3389,9 @@ struct UdpRelayHandle {
     target_identity: FdIdentity,
     target_cookie: u64,
     domain: i32,
+    /// Protocol recorded at relay creation (UDP today) so `SO_PROTOCOL`
+    /// answers from the handle rather than from a creation-time invariant.
+    protocol: i32,
     stable: bool,
     shutdown: Arc<AtomicBool>,
 }
@@ -3712,6 +3716,7 @@ impl UdpRelayRegistry {
         cfg: &EffectiveConfig,
         notif: &SeccompNotif,
         socket_type: i32,
+        protocol: i32,
     ) -> Result<StableSocketCreation> {
         if self.stable_addfd_unsupported.load(Ordering::Acquire) {
             return Ok(StableSocketCreation::Unsupported);
@@ -3724,17 +3729,21 @@ impl UdpRelayRegistry {
             set_nonblocking(target_fd.as_raw_fd())
                 .context("set stable UDP relay target nonblocking")?;
         }
-        let target_identity =
-            fd_identity(target_fd.as_raw_fd()).context("stat stable UDP relay target socket")?;
-        let target_cookie = socket_cookie(target_fd.as_raw_fd())
-            .context("read stable UDP relay target SO_COOKIE")?;
+        let target = RelayTargetInfo {
+            identity: fd_identity(target_fd.as_raw_fd())
+                .context("stat stable UDP relay target socket")?,
+            cookie: socket_cookie(target_fd.as_raw_fd())
+                .context("read stable UDP relay target SO_COOKIE")?,
+            domain: notif.data.args[0] as i32,
+            protocol,
+        };
+        let target_cookie = target.cookie;
+        let target_identity = target.identity;
         let handle = start_udp_relay(
             build_udp_relay_config(cfg),
             relay_socket,
             None,
-            target_identity,
-            target_cookie,
-            notif.data.args[0] as i32,
+            target,
             true,
         )
         .context("start stable UDP relay workers")?;
@@ -3873,18 +3882,15 @@ impl UdpRelayRegistry {
         {
             bail!("UDP target fd changed before relay injection");
         }
-        let target_cookie =
-            socket_cookie(target_fd.as_raw_fd()).context("read UDP relay target SO_COOKIE")?;
-        let handle = start_udp_relay(
-            relay_cfg,
-            relay_socket,
-            default_dest,
-            target_identity,
-            target_cookie,
-            target_snapshot.domain,
-            false,
-        )
-        .context("start bounded UDP relay workers")?;
+        let target = RelayTargetInfo {
+            identity: target_identity,
+            cookie: socket_cookie(target_fd.as_raw_fd())
+                .context("read UDP relay target SO_COOKIE")?,
+            domain: target_snapshot.domain,
+            protocol: target_snapshot.protocol,
+        };
+        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target, false)
+            .context("start bounded UDP relay workers")?;
         if let Err(err) = seccomp::notif_addfd(listener_fd, &mut addfd) {
             handle.shutdown();
             return Err(err).context("inject UDP relay fd");
@@ -4292,15 +4298,29 @@ fn udp_domain_logical_address(domain: i32, dest: Destination) -> Destination {
     }
 }
 
+/// What a relay needs to know about the injected endpoint it publishes:
+/// descriptor identity for staleness checks, `SO_COOKIE` for alias recovery,
+/// and the logical domain/protocol the target socket reports.
+struct RelayTargetInfo {
+    identity: FdIdentity,
+    cookie: u64,
+    domain: i32,
+    protocol: i32,
+}
+
 fn start_udp_relay(
     cfg: UdpRelayConfig,
     relay_socket: OwnedFd,
     default_dest: Option<(Destination, UdpRouteKind)>,
-    target_identity: FdIdentity,
-    target_cookie: u64,
-    domain: i32,
+    target: RelayTargetInfo,
     stable: bool,
 ) -> io::Result<UdpRelayHandle> {
+    let RelayTargetInfo {
+        identity: target_identity,
+        cookie: target_cookie,
+        domain,
+        protocol,
+    } = target;
     let relay_fd = Arc::new(relay_socket);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
@@ -4416,6 +4436,13 @@ fn start_udp_relay(
         target_identity,
         target_cookie,
         domain,
+        // socket(AF_INET*, SOCK_DGRAM, 0) reports IPPROTO_UDP; normalize the
+        // default so the recorded protocol always matches SO_PROTOCOL.
+        protocol: if protocol == 0 {
+            libc::IPPROTO_UDP
+        } else {
+            protocol
+        },
         stable,
         shutdown,
     })
@@ -5504,8 +5531,11 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
         }
         Err(err) => return Err(err).context("duplicate UDP target fd"),
     };
-    if socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
-        || socket_protocol_from_fd(target.as_raw_fd()) != Some(libc::IPPROTO_UDP)
+    let Some(protocol) = socket_protocol_from_fd(target.as_raw_fd()) else {
+        return Ok(None);
+    };
+    if protocol != libc::IPPROTO_UDP
+        || socket_type_from_fd(target.as_raw_fd()) != Some(libc::SOCK_DGRAM)
     {
         return Ok(None);
     }
@@ -5521,6 +5551,7 @@ fn inspect_udp_target(pid: u32, fd: RawFd) -> Result<Option<UdpTargetSnapshot>> 
     Ok(Some(UdpTargetSnapshot {
         identity: fd_identity(target.as_raw_fd()).context("stat UDP target fd")?,
         domain,
+        protocol,
         flags,
         rcvtimeo: socket_recv_timeout(target.as_raw_fd()),
     }))
@@ -6214,6 +6245,7 @@ mod tests {
             target_identity,
             target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
             domain: libc::AF_INET,
+            protocol: libc::IPPROTO_UDP,
             stable: true,
             shutdown: Arc::clone(&shutdown),
         };
@@ -6278,6 +6310,7 @@ mod tests {
                     target_identity: fd_identity(target.as_raw_fd()).unwrap(),
                     target_cookie,
                     domain: libc::AF_INET,
+                    protocol: libc::IPPROTO_UDP,
                     stable: true,
                     shutdown: Arc::clone(&shutdown),
                 };
@@ -6482,6 +6515,7 @@ mod tests {
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             target_cookie,
             domain: libc::AF_INET,
+            protocol: libc::IPPROTO_UDP,
             stable: false,
             shutdown: Arc::clone(&shutdown),
         };
@@ -6596,6 +6630,7 @@ mod tests {
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             target_cookie,
             domain: libc::AF_INET,
+            protocol: libc::IPPROTO_UDP,
             stable: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
@@ -6949,6 +6984,7 @@ mod tests {
             target_identity: fd_identity(target.as_raw_fd()).unwrap(),
             target_cookie,
             domain: libc::AF_INET,
+            protocol: libc::IPPROTO_UDP,
             stable: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
