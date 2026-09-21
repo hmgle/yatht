@@ -114,6 +114,7 @@ impl StableSweepCadence {
 #[derive(Clone)]
 pub(super) struct UdpRelayHandle {
     pub(super) tx: channel::Sender<UdpJob>,
+    pub(super) wake: Arc<OwnedFd>,
     pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     /// Retains the actual local port reservation, including bind(port=0).
     pub(super) local_bind: Arc<Mutex<Option<UdpLocalSocket>>>,
@@ -970,6 +971,7 @@ impl UdpRelayHandle {
         if local.as_ref().is_some_and(|bound| !bound.port_locked) {
             *local = None;
         }
+        wake_eventfd(self.wake.as_raw_fd());
     }
 
     pub(super) fn accepts_destination(&self, dest: Destination) -> bool {
@@ -1017,16 +1019,19 @@ impl UdpRelayHandle {
             route,
         };
         if nonblocking {
-            return self.tx.try_send(job).map_err(|err| match err {
+            self.tx.try_send(job).map_err(|err| match err {
                 channel::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
                 channel::TrySendError::Disconnected(_) => {
                     io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited")
                 }
-            });
+            })?;
+        } else {
+            self.tx.send(job).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited")
+            })?;
         }
-        self.tx
-            .send(job)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited"))
+        wake_eventfd(self.wake.as_raw_fd());
+        Ok(())
     }
 
     /// Duplicates the target fd from the *currently notifying* thread rather than
@@ -1052,6 +1057,7 @@ impl UdpRelayHandle {
 
     pub(super) fn shutdown(&self) {
         if !self.shutdown.swap(true, Ordering::SeqCst) {
+            wake_eventfd(self.wake.as_raw_fd());
             let _ = unsafe { libc::shutdown(self.relay_fd.as_raw_fd(), libc::SHUT_RDWR) };
         }
     }
@@ -1100,132 +1106,71 @@ pub(super) fn start_udp_relay(
         domain,
         protocol,
     } = target;
-    let relay_fd = Arc::new(relay_socket);
-    let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
-    let default_dest = Arc::new(Mutex::new(default_dest));
-    let local_bind = Arc::new(Mutex::new(None));
-    let pending_sources = Arc::new(Mutex::new(VecDeque::new()));
-
-    let read_fd = Arc::clone(&relay_fd);
-    let read_tx = tx.clone();
-    let read_default_dest = Arc::clone(&default_dest);
-    let read_shutdown = Arc::clone(&shutdown);
-    let reader = thread::Builder::new()
-        .name("yatht-udp-relay-read".to_string())
-        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
-        .spawn(move || {
-            let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
-            loop {
-                let n = match recv_relay_socket(read_fd.as_raw_fd(), &mut buf) {
-                    Ok(n) => n,
-                    // A signal can interrupt the blocking recv; retry rather than
-                    // terminating the reader, which would silently break the
-                    // connected-UDP return path (target recvfrom would hang).
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                if read_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Some((dest, route)) = *read_default_dest.lock().unwrap() else {
-                    continue;
-                };
-                let payload = buf[..n].to_vec();
-                if read_tx
-                    .send(UdpJob {
-                        dest,
-                        payload,
-                        route,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })?;
-
-    let write_pending_sources = Arc::clone(&pending_sources);
-    let write_local_bind = Arc::clone(&local_bind);
-    let write_fd = Arc::clone(&relay_fd);
-    let write_shutdown = Arc::clone(&shutdown);
-    let writer = thread::Builder::new()
-        .name("yatht-udp-relay-write".to_string())
-        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
-        .spawn(move || {
-            let mut dns_tcp = None;
-            let mut socks_udp = None;
-            let mut direct_udp = None;
-            for job in rx {
-                if write_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                match forward_udp_job(
-                    &cfg,
-                    &mut dns_tcp,
-                    &mut socks_udp,
-                    &mut direct_udp,
-                    &write_local_bind,
-                    job,
-                ) {
-                    Ok(Some(response)) => {
-                        let mut pending = write_pending_sources.lock().unwrap();
-                        // Drop the response if the target is not draining fast
-                        // enough. The socketpair send below uses MSG_DONTWAIT, so a
-                        // successful send means the datagram is actually queued.
-                        if pending.len() >= MAX_PENDING_SOURCES {
-                            if cfg.debug {
-                                eprintln!("yatht: UDP relay pending queue full, dropping response");
-                            }
-                            cfg.observability.record_udp_pending_response_dropped();
-                            continue;
-                        }
-                        pending.push_back(response.source);
-                        if !send_relay_response(write_fd.as_raw_fd(), &response.payload) {
-                            let _ = pending.pop_back();
-                            if write_shutdown.load(Ordering::SeqCst) {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        if cfg.debug {
-                            eprintln!("yatht: UDP relay forward failed: {err:#}");
-                        }
-                    }
-                }
-            }
-        });
-    if let Err(err) = writer {
-        shutdown.store(true, Ordering::SeqCst);
-        let _ = unsafe { libc::shutdown(relay_fd.as_raw_fd(), libc::SHUT_RDWR) };
-        drop(reader);
-        return Err(err);
-    }
-    drop(reader);
-    drop(writer);
-
-    Ok(UdpRelayHandle {
+    let handle = UdpRelayHandle {
         tx,
-        default_dest,
-        local_bind,
+        wake: Arc::new(create_eventfd()?),
+        default_dest: Arc::new(Mutex::new(default_dest)),
+        local_bind: Arc::new(Mutex::new(None)),
         original_local: None,
-        pending_sources,
-        relay_fd,
+        pending_sources: Arc::new(Mutex::new(VecDeque::new())),
+        relay_fd: Arc::new(relay_socket),
         target_identity,
         target_cookie,
         domain,
-        // socket(AF_INET*, SOCK_DGRAM, 0) reports IPPROTO_UDP; normalize the
-        // default so the recorded protocol always matches SO_PROTOCOL.
         protocol: if protocol == 0 {
             libc::IPPROTO_UDP
         } else {
             protocol
         },
         stable,
-        shutdown,
-    })
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+    let read = handle.clone();
+    let reader = thread::Builder::new()
+        .name("yatht-udp-relay-read".to_string())
+        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut buf = vec![0_u8; MAX_UDP_PAYLOAD];
+            loop {
+                let n = match recv_relay_socket(read.relay_fd.as_raw_fd(), &mut buf) {
+                    Ok(n) => n,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if read.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some((dest, route)) = *read.default_dest.lock().unwrap() else {
+                    continue;
+                };
+                if read
+                    .tx
+                    .send(UdpJob {
+                        dest,
+                        payload: buf[..n].to_vec(),
+                        route,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                wake_eventfd(read.wake.as_raw_fd());
+            }
+        })?;
+    let write = handle.clone();
+    let writer = thread::Builder::new()
+        .name("yatht-udp-relay-write".to_string())
+        .stack_size(UDP_RELAY_THREAD_STACK_SIZE)
+        .spawn(move || super::relay_io::udp_relay_io(cfg, write, rx));
+    if let Err(err) = writer {
+        handle.shutdown();
+        drop(reader);
+        return Err(err);
+    }
+    drop(reader);
+    drop(writer);
+    Ok(handle)
 }
 
 pub(super) fn recv_relay_socket(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
@@ -1262,88 +1207,14 @@ pub(super) fn send_relay_response(fd: RawFd, response: &[u8]) -> bool {
     }
 }
 
-pub(super) fn forward_udp_job(
-    cfg: &UdpRelayConfig,
-    dns_tcp: &mut Option<proxy::DnsTcpConnection>,
-    socks_udp: &mut Option<proxy::Socks5UdpAssociation>,
-    direct_udp: &mut Option<DirectUdpSocket>,
-    local_bind: &Mutex<Option<UdpLocalSocket>>,
-    job: UdpJob,
-) -> Result<Option<UdpRelayResponse>> {
-    let deadline = proxy::Deadline::after(cfg.timeout);
-    // The route was decided by the notification handler, which has the full
-    // routing table. Honour it verbatim so a datagram bound for a direct route
-    // is never accidentally tunnelled through the proxy (and vice versa).
-    match job.route {
-        UdpRouteKind::Dns => forward_dns_tcp(cfg, dns_tcp, &job.payload, deadline).map(|payload| {
-            Some(UdpRelayResponse {
-                source: job.dest,
-                payload,
-            })
-        }),
-        UdpRouteKind::Generic => {
-            if socks_udp.is_none() {
-                *socks_udp = Some(proxy::Socks5UdpAssociation::connect(&cfg.proxy, deadline)?);
-            }
-            socks_udp
-                .as_mut()
-                .expect("SOCKS5 UDP association initialized")
-                .send_datagram(job.dest, &job.payload, deadline)
-                .map(|response| {
-                    response.map(|response| UdpRelayResponse {
-                        source: response.source,
-                        payload: response.payload,
-                    })
-                })
-        }
-        UdpRouteKind::Direct => {
-            forward_direct_udp(direct_udp, local_bind, job.dest, &job.payload, cfg.timeout)
-        }
-    }
-}
-
-pub(super) fn forward_dns_tcp(
-    cfg: &UdpRelayConfig,
-    dns_tcp: &mut Option<proxy::DnsTcpConnection>,
-    payload: &[u8],
-    deadline: proxy::Deadline,
-) -> Result<Vec<u8>> {
-    if dns_tcp.is_none() {
-        *dns_tcp = Some(proxy::DnsTcpConnection::connect(
-            &cfg.proxy,
-            cfg.dns_server,
-            deadline,
-        )?);
-    }
-
-    match dns_tcp
-        .as_mut()
-        .expect("DNS-over-TCP connection initialized")
-        .query(payload, deadline)
-    {
-        Ok(response) => Ok(response),
-        Err(first_err) => {
-            *dns_tcp = None;
-            let mut fresh = proxy::DnsTcpConnection::connect(&cfg.proxy, cfg.dns_server, deadline)
-                .with_context(|| format!("reconnect DNS-over-TCP after {first_err:#}"))?;
-            let response = fresh.query(payload, deadline)?;
-            *dns_tcp = Some(fresh);
-            Ok(response)
-        }
-    }
-}
-
-/// Sends a datagram straight to its destination on a plain UDP socket, reusing a
-/// cached duplicate of the socket that reserves the relay's local port.
-/// Mirrors the single request/response model of the proxy paths: one datagram is
-/// read back (within the timeout) so the connected-UDP return path stays fed.
-pub(super) fn forward_direct_udp(
+/// Sends without waiting for a reply. The I/O loop drains this socket
+/// independently, retaining the reserved local port and dual-stack behavior.
+pub(super) fn send_direct_udp(
     direct_udp: &mut Option<DirectUdpSocket>,
     local_bind: &Mutex<Option<UdpLocalSocket>>,
     dest: Destination,
     payload: &[u8],
-    timeout: Duration,
-) -> Result<Option<UdpRelayResponse>> {
+) -> Result<()> {
     let default_bind = Destination {
         ip: if dest.ip.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -1375,8 +1246,7 @@ pub(super) fn forward_direct_udp(
     if let Some(sock) = socket {
         // Clone the reserved socket rather than binding again: it must retain
         // the port reported immediately after bind(0), including dual stack.
-        sock.set_read_timeout(Some(timeout))?;
-        sock.set_write_timeout(Some(timeout))?;
+        sock.set_nonblocking(true)?;
         *direct_udp = Some(DirectUdpSocket {
             sock,
             recv_buf: vec![0_u8; MAX_UDP_PAYLOAD],
@@ -1390,21 +1260,7 @@ pub(super) fn forward_direct_udp(
         .sock
         .send_to(payload, SocketAddr::new(dest.ip, dest.port))?;
 
-    match state.sock.recv_from(&mut state.recv_buf) {
-        Ok((n, source)) => Ok(Some(UdpRelayResponse {
-            source: Destination {
-                ip: source.ip(),
-                port: source.port(),
-            },
-            payload: state.recv_buf[..n].to_vec(),
-        })),
-        Err(err)
-            if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut =>
-        {
-            Ok(None)
-        }
-        Err(err) => Err(err.into()),
-    }
+    Ok(())
 }
 
 pub(super) fn make_relay_pair() -> io::Result<(OwnedFd, OwnedFd)> {

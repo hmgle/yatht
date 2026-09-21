@@ -30,6 +30,7 @@ mod connect;
 mod dispatch;
 mod proc_mem;
 mod relay;
+mod relay_io;
 mod udp_recv;
 mod udp_send;
 

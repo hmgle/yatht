@@ -18,7 +18,7 @@ using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 - Relays TCP flows through a bounded-budget epoll broker, with opt-in
   experimental splice and warm proxy-session data paths.
 - Redirects UDP/53 DNS queries as DNS-over-TCP when `--enable-dns` is set.
-- Redirects request/response UDP through SOCKS5 UDP ASSOCIATE when
+- Redirects UDP through SOCKS5 UDP ASSOCIATE when
   experimental `--enable-udp` is set.
 - Works without `LD_PRELOAD` or `ptrace`, including for static binaries that
   ignore preload-based tools.
@@ -152,9 +152,12 @@ local broker leg rather than the requested remote peer. Route-affecting options
 such as `SO_BINDTODEVICE` can also prevent the target socket from reaching the
 loopback broker.
 
-Generic UDP redirection is experimental and currently models one request with
-at most one response. It does not preserve unsolicited, delayed, reordered, or
-multiple responses, ancillary data, or pre-existing epoll registrations.
+Generic UDP redirection is experimental. Direct and SOCKS5 relay sends do not
+wait for responses: silent peers do not throttle subsequent datagrams. Once a
+transport exists, its receive path runs independently, including delayed,
+reordered, and multiple responses. Different direct/proxy peers have no shared
+response ordering guarantee. Ancillary data, connected-peer receive filtering,
+and pre-existing epoll registrations are not preserved.
 Emulated receives report `msg_controllen = 0` when returning no ancillary data.
 The default lazy mode creates the relay on the first proxied send and does not
 preserve aliases created before that point. Aliases made after replacement
@@ -165,7 +168,13 @@ the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
 every mode, including the first proxied batch; receive-supervisor handling of
 `recvmmsg(2)` remains a stable-mode feature. Active UDP relay creation is
-capped at 128, with a bounded 16-datagram input queue per relay. A
+capped at 128, with a bounded 16-datagram input queue per relay. Successful
+sends acknowledge queue admission, not remote delivery; queue overflow, network
+errors, and closing/exiting before queued work is forwarded can still lose data.
+`--connect-timeout` bounds proxy setup and stalled writes, not the time allowed
+for a UDP reply. Initial proxy setup remains blocking and can delay both
+forwarding and worker retirement until its deadline. After setup, reaping wakes
+the I/O worker immediately, without waiting for a silent peer. A
 `sendmmsg(2)` batch that outpaces the relay worker reports only the enqueued
 entries as its sent count — like a kernel socket whose send buffer has filled
 — so a large batch under `MSG_DONTWAIT` can partially commit. A dedicated
@@ -197,8 +206,8 @@ before `getsockname(2)` returns; direct sends reuse that reservation.
 Stable sends and connects also reserve an automatic local port before
 returning, so a subsequent `bind(2)` fails with `EINVAL`.
 The local port is released during relay cleanup after the last alias closes
-(and after any in-flight direct request finishes), rather than synchronously
-with `close(2)`. A proxy's external source port can still differ.
+(and after its workers exit), rather than synchronously with `close(2)`.
+A proxy's external source port can still differ.
 Logical operations reject invalid destination ports and unsupported families
 before creating a relay.
 AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
@@ -233,6 +242,16 @@ are armed, the earlier deadline keeps its own expiry result. Lazy replacement
 transfers a pre-existing `SO_RCVTIMEO` to the injected endpoint. SOCKS5
 domain-name response sources, `msg_control` data, error queues, and other
 IP-level option semantics remain limited.
+
+DNS-over-TCP pipelines queries without waiting for earlier answers and retains
+partial TCP frames across readiness events. Each relay keeps at most 16 streams,
+one per original DNS destination, so reordered replies retain the correct source
+even when destinations reuse transaction IDs. Each stream buffers at most one
+outgoing and one incoming frame; failed streams are discarded and later queries
+reconnect. In-flight queries are not automatically replayed after failure.
+Requests exceeding the stream limit are dropped (reported with `--debug`).
+SOCKS5 replies with domain-name sources are also dropped because no numeric
+source address can be reported reliably.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

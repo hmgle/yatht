@@ -198,6 +198,7 @@ fn relay_reaping_waits_for_the_last_target_alias(stable: bool) {
     let target_identity = fd_identity(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
+        wake: Arc::new(create_eventfd().unwrap()),
         default_dest: Arc::new(Mutex::new(None)),
         local_bind: Arc::new(Mutex::new(None)),
         original_local: None,
@@ -264,6 +265,7 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
             let key = relay_key(1, (batch * 32 + index) as RawFd);
             let handle = UdpRelayHandle {
                 tx,
+                wake: Arc::new(create_eventfd().unwrap()),
                 default_dest: Arc::new(Mutex::new(None)),
                 local_bind: Arc::new(Mutex::new(None)),
                 original_local: None,
@@ -466,6 +468,7 @@ fn close_removes_matching_relay() {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
+        wake: Arc::new(create_eventfd().unwrap()),
         default_dest: Arc::new(Mutex::new(None)),
         local_bind: Arc::new(Mutex::new(None)),
         original_local: None,
@@ -582,6 +585,7 @@ fn nonblocking_udp_send_reports_full_job_queue() {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
+        wake: Arc::new(create_eventfd().unwrap()),
         default_dest: Arc::new(Mutex::new(None)),
         local_bind: Arc::new(Mutex::new(None)),
         original_local: None,
@@ -937,6 +941,7 @@ fn test_relay_handle() -> UdpRelayHandle {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     UdpRelayHandle {
         tx,
+        wake: Arc::new(create_eventfd().unwrap()),
         default_dest: Arc::new(Mutex::new(None)),
         local_bind: Arc::new(Mutex::new(None)),
         original_local: None,

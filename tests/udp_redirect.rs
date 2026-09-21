@@ -1922,10 +1922,14 @@ fn udp_sendmmsg_routes_first_batch(mode: &str, mixed: bool, connected: bool) {
         .unwrap();
 
     assert_success(&output);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "batch-one-ok:batch-two-ok"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut responses = stdout.split(':').collect::<Vec<_>>();
+    if mixed {
+        // Independent direct/proxy peers have no cross-transport reply order.
+        // Both requests and their route assertions below must still succeed.
+        responses.sort_unstable();
+    }
+    assert_eq!(responses, ["batch-one-ok", "batch-two-ok"]);
     if !mixed {
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -5366,4 +5370,264 @@ fn assert_success(output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn build_independent_udp_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_independent_io");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_independent_io.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    (dir, probe)
+}
+
+#[test]
+fn stable_direct_udp_sends_without_waiting_for_responses() {
+    independent_udp_io("stable", "direct");
+}
+
+#[test]
+fn stable_socks_udp_sends_without_waiting_for_responses() {
+    independent_udp_io("stable", "socks");
+}
+
+#[test]
+fn lazy_socks_udp_sends_without_waiting_for_responses() {
+    independent_udp_io("lazy", "socks");
+}
+
+#[test]
+fn dns_udp_pipelines_queries_and_preserves_partial_frames() {
+    independent_udp_io("lazy", "dns");
+}
+
+fn independent_udp_io(mode: &str, route: &str) {
+    let (_dir, probe) = build_independent_udp_probe();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let destination = if route == "dns" {
+        "198.51.100.12:53".parse().unwrap()
+    } else {
+        udp_addr
+    };
+    let route_owned = route.to_string();
+    let server = thread::spawn(move || {
+        let mut control = if route_owned == "direct" {
+            None
+        } else {
+            let (mut stream, _) = socks.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socks5_greet(&mut stream);
+            read_socks5_request(&mut stream);
+            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+            reply.extend_from_slice(&udp_addr.port().to_be_bytes());
+            stream.write_all(&reply).unwrap();
+            Some(stream)
+        };
+        let mut peer = None;
+        let started = Instant::now();
+        for i in 0..6 {
+            let query = if route_owned == "dns" {
+                let stream = control.as_mut().unwrap();
+                let mut frame = [0; 4];
+                stream.read_exact(&mut frame).unwrap();
+                assert_eq!(&frame[..2], &[0, 2]);
+                frame[2..].to_vec()
+            } else {
+                let mut buf = [0; 64];
+                let (n, source) = udp.recv_from(&mut buf).unwrap();
+                peer = Some(source);
+                if route_owned == "socks" {
+                    parse_udp_packet(&buf[..n]).1.to_vec()
+                } else {
+                    buf[..n].to_vec()
+                }
+            };
+            assert_eq!(query, [i, 0]);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "burst serialized on replies"
+        );
+        thread::sleep(Duration::from_millis(250));
+        for i in [5, 4, 3, 2, 1, 0, 6] {
+            let response = [i, 1];
+            match route_owned.as_str() {
+                "dns" => {
+                    let stream = control.as_mut().unwrap();
+                    // Split both the length prefix and payload across wakes.
+                    for byte in [0, 2, i, 1] {
+                        stream.write_all(&[byte]).unwrap();
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                "socks" => {
+                    udp.send_to(&encode_udp_packet(destination, &response), peer.unwrap())
+                        .unwrap();
+                }
+                _ => {
+                    udp.send_to(&response, peer.unwrap()).unwrap();
+                }
+            }
+        }
+        if let Some(mut control) = control {
+            let _ = control.read(&mut [0]);
+        }
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    command.args([
+        "--proxy",
+        &format!("socks5://{socks_addr}"),
+        "--udp-socket-mode",
+        mode,
+    ]);
+    if route == "dns" {
+        command.arg("--enable-dns");
+    } else {
+        command.arg("--enable-udp");
+    }
+    if route == "socks" {
+        command.arg("--proxy-local");
+    }
+    let output = command
+        .arg("--")
+        .arg(probe)
+        .arg(destination.ip().to_string())
+        .arg(destination.port().to_string())
+        .arg("burst")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "independent-io-ok\n"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn stable_udp_silent_peer_churn_reaps_workers_without_response_timeout() {
+    let (_dir, probe) = build_independent_udp_probe();
+    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = sink.local_addr().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args(["--enable-udp", "--udp-socket-mode", "stable", "--"])
+        .arg(probe)
+        .arg(destination.ip().to_string())
+        .arg(destination.port().to_string())
+        .arg("churn")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let pid = child.id();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "ready\n");
+    let baseline = process_thread_count(pid);
+    child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let sampler = thread::spawn(move || {
+        let mut peak = 0;
+        while done_rx.try_recv().is_err() {
+            peak = peak.max(process_thread_count(pid));
+            thread::sleep(Duration::from_millis(5));
+        }
+        peak
+    });
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "closed\n");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let remaining = loop {
+        let count = process_udp_relay_thread_count(pid);
+        if count == 0 || Instant::now() >= deadline {
+            break count;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    done_tx.send(()).unwrap();
+    let peak = sampler.join().unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert!(child.wait().unwrap().success());
+    eprintln!("2000 silent UDP sockets: baseline={baseline}, peak={peak}, relay workers after reap={remaining}");
+    // Two workers per admitted relay plus supervisor threads and a small
+    // scheduling margin. The old path retained ~2000 blocked writers.
+    assert!(peak < 400, "retired UDP workers accumulated: {peak}");
+    assert!(
+        remaining == 0,
+        "closed UDP workers waited for the peer: {remaining}"
+    );
+}
+
+fn process_udp_relay_thread_count(pid: u32) -> usize {
+    fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path().join("comm")).ok())
+        .filter(|name| name.starts_with("yatht-udp-relay"))
+        .count()
+}
+
+#[test]
+fn pipelined_dns_replies_keep_original_destinations_with_reused_ids() {
+    let (_dir, probe) = build_independent_udp_probe();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handlers = Vec::new();
+        for first in 0..2 {
+            let (mut stream, _) = socks.accept().unwrap();
+            let barrier = Arc::clone(&barrier);
+            handlers.push(thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socks5_greet(&mut stream);
+                read_socks5_request(&mut stream);
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                for index in [first, first + 2] {
+                    let mut query = [0; 5];
+                    stream.read_exact(&mut query).unwrap();
+                    assert_eq!(query, [0, 3, 0x12, 0x34, index]);
+                }
+                barrier.wait();
+                for index in [first + 2, first] {
+                    stream.write_all(&[0, 3, 0x12, 0x34, index]).unwrap();
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args([
+            "--enable-dns",
+            "--proxy",
+            &format!("socks5://{socks_addr}"),
+            "--",
+        ])
+        .arg(probe)
+        .args(["198.51.100.12", "53", "dns-sources"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    server.join().unwrap();
 }

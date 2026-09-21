@@ -2,6 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,8 +79,14 @@ pub fn dial_with_deadline(
     }
 }
 
+/// A pipelined DNS stream. A partially written query and partially received
+/// frame survive readiness wakes; neither direction waits for the other.
 pub struct DnsTcpConnection {
     stream: TcpStream,
+    outgoing: Vec<u8>,
+    written: usize,
+    incoming: Vec<u8>,
+    write_deadline: Option<Deadline>,
 }
 
 impl DnsTcpConnection {
@@ -89,32 +96,83 @@ impl DnsTcpConnection {
         deadline: Deadline,
     ) -> Result<Self> {
         let stream = dial_with_deadline(proxy, dns_server, deadline, &mut DialTimings::default())?;
-        Ok(Self { stream })
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            stream,
+            outgoing: Vec::new(),
+            written: 0,
+            incoming: Vec::new(),
+            write_deadline: None,
+        })
     }
 
-    pub fn query(&mut self, query: &[u8], deadline: Deadline) -> Result<Vec<u8>> {
-        dns_query_over_stream(&mut self.stream, query, deadline)
-    }
-}
-
-fn dns_query_over_stream(
-    stream: &mut TcpStream,
-    query: &[u8],
-    deadline: Deadline,
-) -> Result<Vec<u8>> {
-    if query.len() > u16::MAX as usize {
-        bail!("DNS query is too large");
+    pub fn fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 
-    write_all_with_deadline(stream, &(query.len() as u16).to_be_bytes(), deadline)?;
-    write_all_with_deadline(stream, query, deadline)?;
+    pub fn wants_write(&self) -> bool {
+        !self.outgoing.is_empty()
+    }
 
-    let mut len_buf = [0_u8; 2];
-    read_exact_with_deadline(stream, &mut len_buf, deadline)?;
-    let response_len = u16::from_be_bytes(len_buf) as usize;
-    let mut response = vec![0_u8; response_len];
-    read_exact_with_deadline(stream, &mut response, deadline)?;
-    Ok(response)
+    /// Returns false when a previous query still has bytes awaiting TCP space.
+    pub fn send_query(&mut self, query: &[u8], deadline: Deadline) -> Result<bool> {
+        if self.wants_write() {
+            return Ok(false);
+        }
+        if query.len() > u16::MAX as usize {
+            bail!("DNS query is too large");
+        }
+        self.outgoing
+            .extend_from_slice(&(query.len() as u16).to_be_bytes());
+        self.outgoing.extend_from_slice(query);
+        self.write_deadline = Some(deadline);
+        self.flush()?;
+        Ok(true)
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        while self.written < self.outgoing.len() {
+            self.write_deadline
+                .expect("queued query has a deadline")
+                .remaining()?;
+            match self.stream.write(&self.outgoing[self.written..]) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(n) => self.written += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        self.outgoing.clear();
+        self.written = 0;
+        self.write_deadline = None;
+        Ok(())
+    }
+
+    pub fn recv_response(&mut self) -> Result<Option<Vec<u8>>> {
+        loop {
+            let frame_len = if self.incoming.len() < 2 {
+                2
+            } else {
+                2 + u16::from_be_bytes([self.incoming[0], self.incoming[1]]) as usize
+            };
+            if self.incoming.len() >= 2 && self.incoming.len() == frame_len {
+                let payload = self.incoming.split_off(2);
+                self.incoming.clear();
+                return Ok(Some(payload));
+            }
+            let mut buf = [0_u8; 8192];
+            // Never consume bytes from the following frame.
+            let needed = (frame_len - self.incoming.len()).min(buf.len());
+            match self.stream.read(&mut buf[..needed]) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+                Ok(n) => self.incoming.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
 }
 
 pub struct Socks5UdpAssociation {
@@ -162,6 +220,7 @@ impl Socks5UdpAssociation {
         };
         let udp = UdpSocket::bind(bind)?;
         udp.connect(relay)?;
+        udp.set_nonblocking(true)?;
 
         Ok(Self {
             _control: control,
@@ -170,31 +229,29 @@ impl Socks5UdpAssociation {
         })
     }
 
-    pub fn send_datagram(
-        &mut self,
-        dest: Destination,
-        payload: &[u8],
-        deadline: Deadline,
-    ) -> Result<Option<Socks5UdpResponse>> {
-        let packet = encode_socks5_udp(dest, payload)?;
-        self.udp.set_write_timeout(Some(deadline.remaining()?))?;
-        self.udp.send(&packet)?;
+    pub fn fd(&self) -> RawFd {
+        self.udp.as_raw_fd()
+    }
 
-        self.udp.set_read_timeout(Some(deadline.remaining()?))?;
+    pub fn send_datagram(&self, dest: Destination, payload: &[u8]) -> Result<()> {
+        let packet = encode_socks5_udp(dest, payload)?;
+        self.udp.send(&packet)?;
+        Ok(())
+    }
+
+    pub fn recv_datagram(&mut self) -> Result<Option<Socks5UdpResponse>> {
         match self.udp.recv(&mut self.recv_buf) {
             Ok(n) => {
                 let (source, payload) = decode_socks5_udp_response(&self.recv_buf[..n])?;
+                // A response is independent of any send. Guessing the source
+                // from the most recent destination misattributes late replies.
+                let source = source.context("SOCKS5 domain-name UDP sources are unsupported")?;
                 Ok(Some(Socks5UdpResponse {
-                    source: source.unwrap_or(dest),
+                    source,
                     payload: payload.to_vec(),
                 }))
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Ok(None)
-            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(err) => Err(err.into()),
         }
     }
@@ -843,5 +900,61 @@ mod tests {
         assert_eq!(v6[..4], [0x05, 0x01, 0x00, 0x04]);
         assert_eq!(v6[4..20], Ipv6Addr::LOCALHOST.octets());
         assert_eq!(v6[20..], [0x00, 0x50]);
+    }
+
+    #[test]
+    fn pipelined_dns_preserves_frames_across_write_backpressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let size = 4096_i32;
+        // SAFETY: size is a valid integer socket option for this live socket.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const i32).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        stream.set_nonblocking(true).unwrap();
+        let mut connection = DnsTcpConnection {
+            stream,
+            outgoing: Vec::new(),
+            written: 0,
+            incoming: Vec::new(),
+            write_deadline: None,
+        };
+        let payload = vec![0x5a; 65535];
+        let mut sent = 0;
+        let deadline = Deadline::after(Duration::from_secs(5));
+        while !connection.wants_write() {
+            assert!(sent < 128, "failed to fill the TCP send buffer");
+            assert!(connection.send_query(&payload, deadline).unwrap());
+            sent += 1;
+        }
+        assert!(!connection
+            .send_query(b"must-not-be-enqueued", deadline)
+            .unwrap());
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let reader = thread::spawn(move || {
+            for _ in 0..sent {
+                let mut prefix = [0; 2];
+                peer.read_exact(&mut prefix).unwrap();
+                assert_eq!(u16::from_be_bytes(prefix), 65535);
+                let mut data = vec![0; 65535];
+                peer.read_exact(&mut data).unwrap();
+                assert!(data.iter().all(|byte| *byte == 0x5a));
+            }
+        });
+        while connection.wants_write() {
+            connection.flush().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        reader.join().unwrap();
     }
 }

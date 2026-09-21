@@ -145,7 +145,7 @@ is `socks5://127.0.0.1:1080`.
   logical endpoint by retaining a bound kernel UDP socket. This reserves a
   port immediately, including ephemeral bind(0), and reports kernel bind errors
   synchronously. Direct workers clone that socket to preserve its source port.
-  Port release follows relay reclamation and completion of any in-flight job.
+  Port release follows relay reclamation and worker exit.
   Stable connect/send paths reserve an automatic port synchronously, preventing
   bind-after-send races with the writer. Disconnect clears automatic and
   bind(0) reservations; nonzero explicit ports remain locked. Direct socket
@@ -188,9 +188,34 @@ is `socks5://127.0.0.1:1080`.
   workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
   sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
   full, and relay setup fails closed when the global limit is reached.
-- DNS redirection forwards UDP/53 payloads to `dns_server` using a reused
-  DNS-over-TCP connection through the configured TCP proxy. Generic UDP uses
-  SOCKS5 UDP ASSOCIATE and is unavailable for HTTP CONNECT proxies.
+- Relay I/O uses nonblocking direct/SOCKS5 sockets and a readiness loop with
+  an eventfd for job publication, disconnect, and shutdown. Sends never wait for
+  replies. Each pass bounds send and receive work to keep both directions and
+  shutdown responsive; quiet relays sleep until an event, while stalled writes
+  check deadlines at most 100 ms apart. Source metadata remains atomically paired
+  with each delivered datagram. Delayed, reordered, and multiple replies are
+  independent of subsequent sends. Proxy establishment still blocks up to
+  `connect_timeout`; the relay/thread cap is not a hard bound on retiring workers
+  stuck in that initial handshake. Accepted jobs can still be lost at teardown.
+- DNS redirection pipelines UDP/53 payloads to `dns_server` over TCP through the
+  configured proxy. Up to 16 streams per relay, keyed by original destination,
+  preserve reply sources without rewriting transaction IDs or guessing request
+  order. Nonblocking framing retains at most one outgoing and one incoming frame
+  per stream and bounds stalled writes with `connect_timeout`. EOF/write errors
+  remove a stream; later queries reconnect, without replaying ambiguous partial
+  writes or outstanding requests. Exceeding the stream limit drops the job with
+  a debug diagnostic. Generic UDP uses SOCKS5 UDP ASSOCIATE and is unavailable
+  for HTTP CONNECT proxies. Domain-name SOCKS5 response sources are rejected
+  instead of borrowing a possibly unrelated last request's destination.
+- Fourth-review regressions require six datagrams to reach a silent direct,
+  SOCKS5, or DNS peer before it returns any answers, then verify delayed,
+  reversed, and extra responses without new sends. DNS tests split TCP frames,
+  force write backpressure, and reuse transaction IDs across original sources.
+  A 2000-socket silent-peer churn probe on Linux 6.12.85 reproduced 2141 peak
+  threads on `5dbe3a2`, with 2000 relay workers still alive three seconds after
+  close. The independent I/O implementation measured about 293 peak threads and
+  zero relay workers within the same cleanup window. These are local regression
+  measurements, not a hard scheduling or throughput guarantee.
 - All UDP modes rewrite explicit destinations in `sendmmsg(2)` and write each
   successful message length back, including a lazy/DNS socket's first batch.
   A read-only routing scan decides whether the batch needs a relay before any
