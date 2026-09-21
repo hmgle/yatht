@@ -997,3 +997,67 @@ fn udp_send_errors_preserve_local_failures() {
         libc::ECONNREFUSED
     );
 }
+
+#[test]
+fn udp_worker_counts_failed_jobs_without_debug_logging() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metrics.jsonl");
+    let metrics = ObservabilityRuntime::start(Some(&path)).unwrap();
+    let mut cfg = build_udp_relay_config(&test_config(false), metrics.observability());
+    // Generic UDP cannot use HTTP, so this deterministically fails setup.
+    cfg.proxy = crate::config::ProxyConfig::Http {
+        endpoint: crate::config::ProxyEndpoint::new("127.0.0.1:9".into()),
+    };
+    let (relay, target) = make_relay_pair().unwrap();
+    set_socket_recv_timeout(target.as_raw_fd(), Duration::from_secs(3)).unwrap();
+    let mut handle = test_relay_handle();
+    handle.relay_fd = Arc::new(relay);
+    let (tx, rx) = channel::bounded(16);
+    handle.tx = tx;
+    let worker_handle = handle.clone();
+    let worker = thread::spawn(move || relay_io::udp_relay_io(cfg, worker_handle, rx));
+    let dest = Destination {
+        ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port: 9,
+    };
+    handle
+        .send(dest, vec![1], UdpRouteKind::Generic, false)
+        .unwrap();
+    handle
+        .send(
+            Destination { port: 0, ..dest },
+            vec![2],
+            UdpRouteKind::Direct,
+            false,
+        )
+        .unwrap();
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    echo.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    handle
+        .send(
+            Destination {
+                port: echo.local_addr().unwrap().port(),
+                ..dest
+            },
+            vec![3],
+            UdpRouteKind::Direct,
+            false,
+        )
+        .unwrap();
+    let mut payload = [0; 1];
+    let (_, peer) = echo.recv_from(&mut payload).unwrap();
+    assert_eq!(payload, [3]);
+    echo.send_to(&payload, peer).unwrap();
+    assert_eq!(
+        recv_relay_socket(target.as_raw_fd(), &mut payload).unwrap(),
+        1
+    );
+    handle.shutdown();
+    worker.join().unwrap();
+    metrics.finish().unwrap();
+    let contents = fs::read_to_string(path).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+    assert_eq!(summary["udp_dropped_jobs"], 2);
+    assert_eq!(summary["udp_dropped_pending_responses"], 0);
+}

@@ -203,8 +203,13 @@ is `socks5://127.0.0.1:1080`.
   order. Nonblocking framing retains at most one outgoing and one incoming frame
   per stream and bounds stalled writes with `connect_timeout`. EOF/write errors
   remove a stream; later queries reconnect, without replaying ambiguous partial
-  writes or outstanding requests. Exceeding the stream limit drops the job with
-  a debug diagnostic. Generic UDP uses SOCKS5 UDP ASSOCIATE and is unavailable
+  writes or outstanding requests. Healthy streams are not evicted: exceeding
+  the stream limit drops the job until a slot is released by failure or close.
+  `udp_dropped_jobs` counts terminal forwarding failures, send deadlines,
+  stream-capacity rejection, and partial DNS frames discarded on stream errors,
+  without requiring debug logging. It excludes synchronous syscall rejections,
+  unanswered fully written queries, and teardown cancellation; detached workers
+  mean the final summary is a snapshot. Debug logs retain the failure detail. Generic UDP uses SOCKS5 UDP ASSOCIATE and is unavailable
   for HTTP CONNECT proxies. Domain-name SOCKS5 response sources are rejected
   instead of borrowing a possibly unrelated last request's destination.
 - Fourth-review regressions require six datagrams to reach a silent direct,

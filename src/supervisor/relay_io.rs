@@ -133,12 +133,16 @@ impl Transports {
                     ),
                     Ok(None) => break,
                     Err(err) => {
+                        if stream.connection.wants_write() {
+                            cfg.observability.record_udp_job_dropped();
+                        }
                         log_error(cfg, &err);
                         return false;
                     }
                 }
             }
             if let Err(err) = stream.connection.flush() {
+                cfg.observability.record_udp_job_dropped();
                 log_error(cfg, &err);
                 return false;
             }
@@ -239,6 +243,7 @@ pub(super) fn udp_relay_io(
                 },
             };
             if started.elapsed() >= cfg.timeout {
+                cfg.observability.record_udp_job_dropped();
                 log_error(&cfg, &anyhow!("UDP relay send deadline exceeded"));
                 continue;
             }
@@ -259,6 +264,7 @@ pub(super) fn udp_relay_io(
                 break;
             }
             if let Err(err) = result {
+                cfg.observability.record_udp_job_dropped();
                 log_error(&cfg, &err);
             }
         }

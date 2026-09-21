@@ -100,7 +100,12 @@ run metadata (schema version 6), TCP broker limits, one setup record per
 proxied TCP connection with per-stage timings and its proxy session source
 (cold, warm hit, or warm miss), and a final summary with queue, flow,
 pending-byte, allocated-buffer, relay, syscall, CPU, warm-session-pool, and
-failure counters. Event delivery uses a bounded queue; the final
+failure counters. `udp_dropped_jobs` counts accepted datagrams that workers
+fail to forward (setup/send errors, expired writes, DNS stream capacity, or an
+incomplete DNS frame lost with its stream), independently of `--debug`.
+It excludes synchronous syscall errors, missing replies, and jobs abandoned at
+process teardown; the summary is a snapshot, since UDP workers are detached.
+Event delivery uses a bounded queue; the final
 `dropped_metric_events` counter reports any records discarded under pressure.
 
 The TCP broker admits at most 16,384 active flows and reduces that limit when
@@ -251,7 +256,10 @@ one per original DNS destination, so reordered replies retain the correct source
 even when destinations reuse transaction IDs. Each stream buffers at most one
 outgoing and one incoming frame; failed streams are discarded and later queries
 reconnect. In-flight queries are not automatically replayed after failure.
-Requests exceeding the stream limit are dropped (reported with `--debug`).
+Requests exceeding the stream limit are dropped and counted in
+`udp_dropped_jobs` (details with `--debug`). Streams are not evicted while
+healthy, so a long-lived relay that fills all slots rejects new destinations
+until a stream fails or the relay closes.
 SOCKS5 replies with domain-name sources are also dropped because no numeric
 source address can be reported reliably.
 
