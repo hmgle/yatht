@@ -153,7 +153,7 @@ impl Transports {
     fn poll(
         &self,
         handle: &UdpRelayHandle,
-        pending: Option<&UdpJob>,
+        pending: &[Option<(UdpJob, Instant)>; UDP_ROUTE_COUNT],
         queued: bool,
     ) -> io::Result<()> {
         let mut fds = vec![libc::pollfd {
@@ -171,23 +171,20 @@ impl Transports {
         if let Some(direct) = &self.direct {
             add(
                 direct.sock.as_raw_fd(),
-                pending.is_some_and(|job| job.route == UdpRouteKind::Direct),
+                pending[UdpRouteKind::Direct.index()].is_some(),
             );
         }
         if let Some(socks) = &self.socks {
-            add(
-                socks.fd(),
-                pending.is_some_and(|job| job.route == UdpRouteKind::Generic),
-            );
+            add(socks.fd(), pending[UdpRouteKind::Generic.index()].is_some());
         }
         for stream in &self.dns {
             add(stream.connection.fd(), stream.connection.wants_write());
         }
         // The periodic wake checks stalled write deadlines. Data and shutdown
         // wake immediately; this is not a per-packet response wait.
-        let timeout = if queued && pending.is_none() {
+        let timeout = if queued {
             0
-        } else if pending.is_some()
+        } else if pending.iter().any(Option::is_some)
             || self
                 .dns
                 .iter()
@@ -212,10 +209,10 @@ impl Transports {
 pub(super) fn udp_relay_io(
     cfg: UdpRelayConfig,
     handle: UdpRelayHandle,
-    rx: channel::Receiver<UdpJob>,
+    rx: [channel::Receiver<UdpJob>; UDP_ROUTE_COUNT],
 ) {
     let mut transports = Transports::default();
-    let mut pending: Option<(UdpJob, Instant)> = None;
+    let mut pending: [Option<(UdpJob, Instant)>; UDP_ROUTE_COUNT] = std::array::from_fn(|_| None);
     while !handle.shutdown.load(Ordering::SeqCst) {
         let _ = drain_eventfd(handle.wake.as_raw_fd());
         // AF_UNSPEC disconnect can release an automatic bind. Do not keep
@@ -231,48 +228,55 @@ pub(super) fn udp_relay_io(
             }
         }
         transports.receive(&cfg, &handle);
-        for _ in 0..IO_BATCH {
-            if handle.shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            let (job, started) = match pending.take() {
-                Some(job) => job,
-                None => match rx.try_recv() {
-                    Ok(job) => (job, Instant::now()),
-                    Err(_) => break,
-                },
-            };
-            if started.elapsed() >= cfg.timeout {
-                cfg.observability.record_udp_job_dropped();
-                log_error(&cfg, &anyhow!("UDP relay send deadline exceeded"));
-                continue;
-            }
-            let result = transports.send(&cfg, &handle, &job);
-            let blocked = matches!(&result, Ok(false))
-                || result
-                    .as_ref()
-                    .err()
-                    .and_then(|err| err.downcast_ref::<io::Error>())
-                    .is_some_and(|err| {
-                        matches!(
-                            err.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        )
-                    });
-            if blocked {
-                pending = Some((job, started));
-                break;
-            }
-            if let Err(err) = result {
-                cfg.observability.record_udp_job_dropped();
-                log_error(&cfg, &err);
+        // Preserve FIFO within each route, but never let an unwritable
+        // transport prevent another route from sending its admitted jobs.
+        for (rx, pending) in rx.iter().zip(pending.iter_mut()) {
+            for _ in 0..IO_BATCH {
+                if handle.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (job, started) = match pending.take() {
+                    Some(job) => job,
+                    None => match rx.try_recv() {
+                        Ok(job) => (job, Instant::now()),
+                        Err(_) => break,
+                    },
+                };
+                if started.elapsed() >= cfg.timeout {
+                    cfg.observability.record_udp_job_dropped();
+                    log_error(&cfg, &anyhow!("UDP relay send deadline exceeded"));
+                    continue;
+                }
+                let result = transports.send(&cfg, &handle, &job);
+                let blocked = matches!(&result, Ok(false))
+                    || result
+                        .as_ref()
+                        .err()
+                        .and_then(|err| err.downcast_ref::<io::Error>())
+                        .is_some_and(|err| {
+                            matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            )
+                        });
+                if blocked {
+                    *pending = Some((job, started));
+                    break;
+                }
+                if let Err(err) = result {
+                    cfg.observability.record_udp_job_dropped();
+                    log_error(&cfg, &err);
+                }
             }
         }
-        if let Err(err) = transports.poll(
-            &handle,
-            pending.as_ref().map(|(job, _)| job),
-            !rx.is_empty(),
-        ) {
+        if handle.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let runnable = rx
+            .iter()
+            .zip(&pending)
+            .any(|(rx, pending)| !rx.is_empty() && pending.is_none());
+        if let Err(err) = transports.poll(&handle, &pending, runnable) {
             log_error(&cfg, &err.into());
             break;
         }

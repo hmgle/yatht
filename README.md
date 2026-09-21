@@ -181,7 +181,12 @@ the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
 every mode, including the first proxied batch; receive-supervisor handling of
 `recvmmsg(2)` remains a stable-mode feature. Active UDP relay creation is
-capped at 128, with a bounded 16-datagram input queue per relay. Successful
+capped at 128, with separate bounded 16-datagram input queues for direct,
+SOCKS5, and DNS traffic in each relay. Each route has its own pending send;
+a stalled established transport does not block sends on other routes. Queues
+apply backpressure independently (or `EAGAIN` for nonblocking sends). A thread
+blocked sending to a full DNS queue must still return before it can issue its
+next call, and all DNS destinations share one route queue. Successful
 sends acknowledge queue admission, not remote delivery; queue overflow, network
 errors, and closing/exiting before queued work is forwarded can still lose data.
 `--connect-timeout` bounds proxy setup and stalled writes, not the time allowed

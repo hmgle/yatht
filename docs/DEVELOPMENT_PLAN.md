@@ -185,9 +185,19 @@ is `socks5://127.0.0.1:1080`.
   closing `close_range(2)`, `dup2(2)`, and `dup3(2)` synchronize with relay
   creation so a concurrent descriptor change cannot cross the injection window.
 - UDP relay admission is globally capped at 128. Each relay uses two fallible
-  workers with explicit 512 KiB stacks and a bounded 16-job queue. Blocking
-  sends apply backpressure; nonblocking sends return `EAGAIN` when the queue is
-  full, and relay setup fails closed when the global limit is reached.
+  workers with explicit 512 KiB stacks and three bounded 16-job queues (direct,
+  SOCKS5, DNS). Each route keeps one pending send and retains FIFO order;
+  blocked sends stop only their own route's dispatch. Each pass gives every
+  route a bounded send budget. Admission backpressure and nonblocking `EAGAIN`
+  are per route; total queue capacity is 48 jobs per relay plus three pending
+  sends. DNS destinations share the DNS queue, and initial proxy handshakes
+  still block the worker. Relay setup fails closed at the global relay limit.
+  Tests saturate an established DNS TCP stream and require direct and SOCKS5
+  echo traffic on the same socket to complete within two seconds (locally
+  1–7 ms), in both lazy and stable modes. The pre-fix implementation fails this
+  probe. A stalled DNS stream is discarded at its write deadline, including
+  its partial frame; later queries reconnect, so persistent stalls can still
+  cause repeated connections and drops, now visible in udp_dropped_jobs.
 - Proxied sendto/sendmsg/sendmmsg apply a conservative SOCKS5 envelope ceiling
   after destination and route resolution, including connected nameless sends:
   65507 minus a 10-byte IPv4 or 22-byte IPv6 destination header. IPv4-mapped

@@ -5716,3 +5716,112 @@ fn udp_payload_limits_include_socks_headers_without_reducing_direct_limits() {
         }
     }
 }
+
+#[test]
+fn stalled_dns_writes_do_not_block_other_udp_routes() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_route_backpressure");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_route_backpressure.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["lazy", "stable"] {
+        let direct = UdpSocket::bind("127.0.0.1:0").unwrap();
+        direct
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let direct_port = direct.local_addr().unwrap().port();
+        let echo = thread::spawn(move || {
+            let mut buf = [0; 64];
+            let (n, peer) = direct.recv_from(&mut buf).unwrap();
+            direct.send_to(&buf[..n], peer).unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(6);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(err) => panic!("proxy accept failed: {err}"),
+                    }
+                }
+            };
+            let mut dns = accept();
+            let size = 4096_i32;
+            // SAFETY: size points to a live integer option value for this fd.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        dns.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        (&size as *const i32).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            socks5_greet(&mut dns);
+            read_socks5_request(&mut dns);
+            dns.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            let mut warmup = [0; 4];
+            dns.read_exact(&mut warmup).unwrap();
+            dns.write_all(&warmup).unwrap();
+            // Retain the stream but never drain further queries.
+            let mut socks = accept();
+            socks5_greet(&mut socks);
+            read_socks5_request(&mut socks);
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+            reply.extend_from_slice(&udp.local_addr().unwrap().port().to_be_bytes());
+            socks.write_all(&reply).unwrap();
+            let mut packet = [0; 64];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            udp.send_to(&packet[..n], peer).unwrap();
+            let _ = socks.read(&mut [0]);
+            drop(dns);
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                "--enable-dns",
+                "--enable-udp",
+                "--udp-socket-mode",
+                mode,
+                "--proxy",
+                &format!("socks5://{proxy_addr}"),
+                "--",
+            ])
+            .arg(&probe)
+            .arg(direct_port.to_string())
+            .output()
+            .unwrap();
+        assert_success(&output);
+        eprintln!("{mode}: {}", String::from_utf8_lossy(&output.stdout));
+        echo.join().unwrap();
+        server.join().unwrap();
+    }
+}

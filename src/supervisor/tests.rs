@@ -193,7 +193,7 @@ fn relay_reaping_waits_for_the_last_target_alias(stable: bool) {
     let alias_fd = unsafe { libc::dup(target.as_raw_fd()) };
     assert!(alias_fd >= 0);
     let alias = unsafe { OwnedFd::from_raw_fd(alias_fd) };
-    let (tx, _rx) = channel::bounded(1);
+    let (tx, _rx) = udp_job_queues(1);
     let shutdown = Arc::new(AtomicBool::new(false));
     let target_identity = fd_identity(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
@@ -259,7 +259,7 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
         for index in 0..32_usize {
             let mut slot = registry.reserve_relay_slot().unwrap();
             let (relay, target) = make_relay_pair().unwrap();
-            let (tx, _rx) = channel::bounded(1);
+            let (tx, _rx) = udp_job_queues(1);
             let shutdown = Arc::new(AtomicBool::new(false));
             let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
             let key = relay_key(1, (batch * 32 + index) as RawFd);
@@ -463,7 +463,7 @@ fn relay_lookup_removes_stale_entry_when_dup_fails() {
 fn close_removes_matching_relay() {
     let registry = UdpRelayRegistry::default();
     let (relay, target) = make_relay_pair().unwrap();
-    let (tx, _rx) = channel::bounded(1);
+    let (tx, _rx) = udp_job_queues(1);
     let shutdown = Arc::new(AtomicBool::new(false));
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
@@ -581,7 +581,7 @@ fn relay_socketpair_send_reports_full_queue() {
 #[test]
 fn nonblocking_udp_send_reports_full_job_queue() {
     let (relay, target) = make_relay_pair().unwrap();
-    let (tx, _rx) = channel::bounded(1);
+    let (tx, _rx) = udp_job_queues(1);
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
@@ -611,6 +611,14 @@ fn nonblocking_udp_send_reports_full_job_queue() {
         .unwrap_err();
 
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    // A saturated DNS route must not consume another route's admission slot.
+    for route in [UdpRouteKind::Direct, UdpRouteKind::Generic] {
+        handle.send(dest, vec![1], route, true).unwrap();
+        assert_eq!(
+            handle.send(dest, vec![2], route, true).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 #[test]
@@ -937,7 +945,7 @@ fn os_list_round_trips() {
 
 fn test_relay_handle() -> UdpRelayHandle {
     let (relay, target) = make_relay_pair().unwrap();
-    let (tx, _rx) = channel::bounded(1);
+    let (tx, _rx) = udp_job_queues(1);
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     UdpRelayHandle {
         tx,
@@ -1012,7 +1020,7 @@ fn udp_worker_counts_failed_jobs_without_debug_logging() {
     set_socket_recv_timeout(target.as_raw_fd(), Duration::from_secs(3)).unwrap();
     let mut handle = test_relay_handle();
     handle.relay_fd = Arc::new(relay);
-    let (tx, rx) = channel::bounded(16);
+    let (tx, rx) = udp_job_queues(16);
     handle.tx = tx;
     let worker_handle = handle.clone();
     let worker = thread::spawn(move || relay_io::udp_relay_io(cfg, worker_handle, rx));

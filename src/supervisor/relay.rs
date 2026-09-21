@@ -13,6 +13,29 @@ pub(super) enum UdpRouteKind {
     Direct,
 }
 
+pub(super) const UDP_ROUTE_COUNT: usize = 3;
+
+impl UdpRouteKind {
+    pub(super) fn index(self) -> usize {
+        match self {
+            Self::Dns => 0,
+            Self::Generic => 1,
+            Self::Direct => 2,
+        }
+    }
+}
+
+pub(super) fn udp_job_queues(
+    capacity: usize,
+) -> (
+    [channel::Sender<UdpJob>; UDP_ROUTE_COUNT],
+    [channel::Receiver<UdpJob>; UDP_ROUTE_COUNT],
+) {
+    let queues: [_; UDP_ROUTE_COUNT] = std::array::from_fn(|_| channel::bounded(capacity));
+    let tx = std::array::from_fn(|index| queues[index].0.clone());
+    (tx, queues.map(|(_, rx)| rx))
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RelayKey {
     pub(super) tgid: u32,
@@ -113,7 +136,7 @@ impl StableSweepCadence {
 
 #[derive(Clone)]
 pub(super) struct UdpRelayHandle {
-    pub(super) tx: channel::Sender<UdpJob>,
+    pub(super) tx: [channel::Sender<UdpJob>; UDP_ROUTE_COUNT],
     pub(super) wake: Arc<OwnedFd>,
     pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     /// Retains the actual local port reservation, including bind(port=0).
@@ -1019,14 +1042,16 @@ impl UdpRelayHandle {
             route,
         };
         if nonblocking {
-            self.tx.try_send(job).map_err(|err| match err {
-                channel::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
-                channel::TrySendError::Disconnected(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited")
-                }
-            })?;
+            self.tx[route.index()]
+                .try_send(job)
+                .map_err(|err| match err {
+                    channel::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
+                    channel::TrySendError::Disconnected(_) => {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited")
+                    }
+                })?;
         } else {
-            self.tx.send(job).map_err(|_| {
+            self.tx[route.index()].send(job).map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "UDP relay worker exited")
             })?;
         }
@@ -1106,7 +1131,7 @@ pub(super) fn start_udp_relay(
         domain,
         protocol,
     } = target;
-    let (tx, rx) = channel::bounded::<UdpJob>(UDP_JOB_QUEUE_CAPACITY);
+    let (tx, rx) = udp_job_queues(UDP_JOB_QUEUE_CAPACITY);
     let handle = UdpRelayHandle {
         tx,
         wake: Arc::new(create_eventfd()?),
@@ -1144,8 +1169,7 @@ pub(super) fn start_udp_relay(
                 let Some((dest, route)) = *read.default_dest.lock().unwrap() else {
                     continue;
                 };
-                if read
-                    .tx
+                if read.tx[route.index()]
                     .send(UdpJob {
                         dest,
                         payload: buf[..n].to_vec(),
