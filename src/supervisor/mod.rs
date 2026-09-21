@@ -599,6 +599,15 @@ fn poll_readable(fds: &[RawFd], timeout_ms: libc::c_int) -> io::Result<u32> {
         if rc >= 0 {
             let mut ready = 0;
             for (index, pollfd) in pollfds.iter().enumerate() {
+                if pollfd.revents & libc::POLLNVAL != 0 {
+                    // An invalid descriptor would return immediately forever;
+                    // surfacing it keeps the monitor from degrading into a
+                    // busy loop over a programming bug.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "poll on a closed descriptor",
+                    ));
+                }
                 if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                     ready |= 1 << index;
                 }
