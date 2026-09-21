@@ -387,7 +387,7 @@ fn run_with_observability(cfg: EffectiveConfig, observability: Observability) ->
     close_fd(parent_sock);
 
     let cfg = Arc::new(cfg);
-    let relays = Arc::new(UdpRelayRegistry::default());
+    let relays = Arc::new(UdpRelayRegistry::with_observability(observability.clone()));
     let listener_fd = Arc::new(listener_fd);
     let (failure_rd, failure_wr) = create_failure_pipe().context("create failure pipe")?;
     let failure = Arc::new(NotificationFailure {
@@ -3325,6 +3325,7 @@ enum StableSocketCreation {
 
 #[derive(Default)]
 struct UdpRelayRegistry {
+    observability: Observability,
     inner: Mutex<HashMap<RelayKey, RelayState>>,
     stable_by_cookie: Mutex<HashMap<u64, UdpRelayHandle>>,
     created: Condvar,
@@ -3409,6 +3410,7 @@ struct UdpRelayResponse {
 
 #[derive(Clone)]
 struct UdpRelayConfig {
+    observability: Observability,
     proxy: crate::config::ProxyConfig,
     dns_server: Destination,
     timeout: Duration,
@@ -3519,7 +3521,7 @@ fn valid_relay_locked(
     }
 }
 
-fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
+fn build_udp_relay_config(cfg: &EffectiveConfig, observability: Observability) -> UdpRelayConfig {
     let dns_server = cfg
         .dns_server
         .map(|addr| Destination {
@@ -3532,6 +3534,7 @@ fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
         });
 
     UdpRelayConfig {
+        observability,
         proxy: cfg.proxy.clone(),
         dns_server,
         timeout: cfg.connect_timeout,
@@ -3540,6 +3543,13 @@ fn build_udp_relay_config(cfg: &EffectiveConfig) -> UdpRelayConfig {
 }
 
 impl UdpRelayRegistry {
+    fn with_observability(observability: Observability) -> Self {
+        Self {
+            observability,
+            ..Self::default()
+        }
+    }
+
     /// Closes stable relays whose target socket is gone. Only relays that were
     /// already published when the sweep started are eligible: `/proc/net/unix`
     /// is generated as it is read, so a socket that a concurrent
@@ -3740,7 +3750,7 @@ impl UdpRelayRegistry {
         let target_cookie = target.cookie;
         let target_identity = target.identity;
         let handle = start_udp_relay(
-            build_udp_relay_config(cfg),
+            build_udp_relay_config(cfg, self.observability.clone()),
             relay_socket,
             None,
             target,
@@ -3854,7 +3864,7 @@ impl UdpRelayRegistry {
             None => return Ok(None),
         };
 
-        let relay_cfg = build_udp_relay_config(cfg);
+        let relay_cfg = build_udp_relay_config(cfg, self.observability.clone());
         let (relay_socket, target_fd) =
             make_relay_pair().context("create UDP relay datagram socketpair")?;
         if target_snapshot.flags.status_flags & libc::O_NONBLOCK != 0 {
@@ -4399,6 +4409,7 @@ fn start_udp_relay(
                             if cfg.debug {
                                 eprintln!("yatht: UDP relay pending queue full, dropping response");
                             }
+                            cfg.observability.record_udp_pending_response_dropped();
                             continue;
                         }
                         pending.push_back(response.source);
