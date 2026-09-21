@@ -353,10 +353,6 @@ pub(super) fn handle_sendmmsg(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    if !handle.stable {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
-    }
     let nonblocking = recv_request_is_nonblocking(notif.pid, target_fd, flags)
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     let mut sent = 0_usize;
@@ -399,7 +395,7 @@ pub(super) fn handle_sendmmsg(
                 }
                 // A dropped name falls back to the connected peer, exactly as
                 // an unnamed entry does. `Continue` needs a plain fd, which
-                // this stable-only path never sees.
+                // this relayed path never sees.
                 SendDestination::ConnectedPeer | SendDestination::Continue => None,
                 SendDestination::Errno(errno) => {
                     send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);

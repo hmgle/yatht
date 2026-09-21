@@ -3438,9 +3438,11 @@ static int check_datagram_size_limits(void) {
     return close(fd);
 }
 
-/* sendmmsg clamps vlen to UIO_MAXIOV instead of rejecting it. The proxy in
- * these runs is a dead endpoint, so a virtualized batch fails fast in the
- * relay worker while the syscall itself still reports every entry sent. */
+/* sendmmsg clamps vlen to UIO_MAXIOV instead of rejecting it. The fresh
+ * socket has no relay yet, so lazy runs take the kernel's own clamp while
+ * stable runs exercise the virtualized one; through the dead proxy the
+ * virtualized batch fails fast in the relay worker and the syscall still
+ * reports every entry sent. */
 static int check_sendmmsg_vlen_clamp(void) {
     struct sockaddr_in ipv4;
     memset(&ipv4, 0, sizeof(ipv4));
@@ -3463,6 +3465,41 @@ static int check_sendmmsg_vlen_clamp(void) {
     }
     errno = 0;
     if (sendmmsg(fd, msgs, 1200, 0) != 1024) { close(fd); return -1; }
+    return close(fd);
+}
+
+/* Once a proxied send has relay-ized the fd (lazily on first send or at
+ * socket creation in stable mode), a named sendmmsg entry must keep UDP
+ * semantics instead of reaching the injected AF_UNIX endpoint, which would
+ * reject the non-AF_UNIX name with EINVAL. */
+static int check_sendmmsg_on_relayed_socket(void) {
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (sendto(fd, "warm", 4, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) == -1 &&
+        (errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ENETDOWN)) {
+        close(fd);
+        return 0;
+    }
+    static char one = 'x';
+    struct iovec iov = { .iov_base = &one, .iov_len = 1 };
+    struct mmsghdr batch;
+    memset(&batch, 0, sizeof(batch));
+    batch.msg_hdr.msg_name = &ipv4;
+    batch.msg_hdr.msg_namelen = sizeof(ipv4);
+    batch.msg_hdr.msg_iov = &iov;
+    batch.msg_hdr.msg_iovlen = 1;
+    errno = 0;
+    if (sendmmsg(fd, &batch, 1, 0) != 1 &&
+        !(errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ENETDOWN)) {
+        close(fd);
+        return -1;
+    }
     return close(fd);
 }
 
@@ -3496,6 +3533,7 @@ int main(int argc, char **argv) {
     if (check_iovec_import_order() != 0) return 7;
     if (check_datagram_size_limits() != 0) return 9;
     if (check_sendmmsg_vlen_clamp() != 0) return 10;
+    if (check_sendmmsg_on_relayed_socket() != 0) return 11;
     if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 8;
     return 0;
 }
