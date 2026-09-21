@@ -394,7 +394,10 @@ pub(super) fn direct_connect_through_relay(
     if !seccomp::notif_id_valid(listener_fd, notif.id) {
         return true;
     }
-    handle.set_default_dest(dest, UdpRouteKind::Direct);
+    if let Err(err) = handle.set_default_dest(dest, UdpRouteKind::Direct) {
+        seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err));
+        return true;
+    }
     seccomp::send_success(listener_fd, notif.id);
     true
 }

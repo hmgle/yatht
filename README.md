@@ -192,6 +192,8 @@ addresses are logical relay state; an unbound socket reports its family's
 wildcard address with port zero. Stable `bind(2)` reserves a real local UDP
 socket immediately, so port zero becomes a kernel-assigned ephemeral port
 before `getsockname(2)` returns; direct sends reuse that reservation.
+Stable sends and connects also reserve an automatic local port before
+returning, so a subsequent `bind(2)` fails with `EINVAL`.
 The local port is released during relay cleanup after the last alias closes
 (and after any in-flight direct request finishes), rather than synchronously
 with `close(2)`. A proxy's external source port can still differ.
@@ -207,7 +209,8 @@ name fails `sendto(2)` and falls back to the connected peer in `sendmsg(2)`, an
 AF_INET6 ones, and any other family is rejected with that socket's error.
 Bind remains strict-family, including Linux's IPv6 length checks and IPv4
 `AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
-`AF_UNSPEC` connect clears the peer, after which destination-free sends fail
+`AF_UNSPEC` connect clears the peer and, in stable mode, releases local ports
+not locked by an explicit nonzero bind. Destination-free sends then fail
 with `EDESTADDRREQ`. Virtualized integer socket options preserve Linux's
 short-buffer truncation and negative-length rejection rules. For
 unconnected request/response traffic, `recvfrom(2)`, `recvmsg(2)`, and each

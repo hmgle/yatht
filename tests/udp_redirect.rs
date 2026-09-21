@@ -1564,6 +1564,40 @@ fn stable_udp_getsockname_reports_bound_port() {
 }
 
 #[test]
+fn stable_udp_rejects_bind_after_send_or_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_autobind");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_autobind.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    assert_success(&Command::new(&probe).output().unwrap());
+    for proxy_local in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+        command.args([
+            "--enable-udp",
+            "--udp-socket-mode",
+            "stable",
+            "--proxy",
+            "socks5://127.0.0.1:9",
+        ]);
+        if proxy_local {
+            command.arg("--proxy-local");
+        }
+        let output = command.arg("--").arg(&probe).output().unwrap();
+        assert_success(&output);
+    }
+}
+
+#[test]
 fn direct_kernel_udp_getsockname_reports_bound_port() {
     udp_getsockname_reports_bound_port(false);
 }

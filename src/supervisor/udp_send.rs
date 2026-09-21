@@ -474,7 +474,10 @@ pub(super) fn handle_sendmmsg(
                 return;
             };
             if let Some((peer, route)) = plain_peer {
-                handle.set_default_dest(peer, route);
+                if let Err(err) = handle.set_default_dest(peer, route) {
+                    seccomp::send_errno(listener_fd, notif.id, errno_from_io(&err));
+                    return;
+                }
             }
         }
         let handle = existing.as_ref().expect("relay initialized above");

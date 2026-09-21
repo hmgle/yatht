@@ -146,6 +146,10 @@ is `socks5://127.0.0.1:1080`.
   port immediately, including ephemeral bind(0), and reports kernel bind errors
   synchronously. Direct workers clone that socket to preserve its source port.
   Port release follows relay reclamation and completion of any in-flight job.
+  Stable connect/send paths reserve an automatic port synchronously, preventing
+  bind-after-send races with the writer. Disconnect clears automatic and
+  bind(0) reservations; nonzero explicit ports remain locked. Direct socket
+  caching checks the reservation's cookie to follow disconnect/rebind changes.
   `getsockname(2)` and `getpeername(2)` return the logical local/connected
   destination, while `getsockopt(2)` reports the AF_INET/AF_INET6 UDP domain,
   type, protocol, and a zero socket error.

@@ -116,7 +116,7 @@ pub(super) struct UdpRelayHandle {
     pub(super) tx: channel::Sender<UdpJob>,
     pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     /// Retains the actual local port reservation, including bind(port=0).
-    pub(super) local_bind: Arc<Mutex<Option<UdpSocket>>>,
+    pub(super) local_bind: Arc<Mutex<Option<UdpLocalSocket>>>,
     pub(super) pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     pub(super) relay_fd: Arc<OwnedFd>,
     pub(super) target_identity: FdIdentity,
@@ -152,6 +152,12 @@ pub(super) struct UdpRelayConfig {
 pub(super) struct DirectUdpSocket {
     pub(super) sock: UdpSocket,
     pub(super) recv_buf: Vec<u8>,
+    pub(super) cookie: u64,
+}
+
+pub(super) struct UdpLocalSocket {
+    pub(super) socket: UdpSocket,
+    pub(super) port_locked: bool,
 }
 
 pub(super) fn relay_key(pid: u32, fd: RawFd) -> RelayKey {
@@ -536,7 +542,7 @@ impl UdpRelayRegistry {
         // fd identity, but it no longer returns an unused duplicate to ensure().
         if let Some(handle) = self.lookup_handle(pid, fd, true) {
             if let Some((dest, route)) = default_dest {
-                handle.set_default_dest(dest, route);
+                handle.set_default_dest(dest, route)?;
             }
             return Ok(Some(handle));
         }
@@ -554,7 +560,7 @@ impl UdpRelayRegistry {
             loop {
                 if let Some(handle) = valid_relay_locked(&mut relays, key, pid, fd) {
                     if let Some((dest, route)) = default_dest {
-                        handle.set_default_dest(dest, route);
+                        handle.set_default_dest(dest, route)?;
                     }
                     return Ok(Some(handle));
                 }
@@ -899,7 +905,7 @@ impl UdpRelayHandle {
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|socket| socket.local_addr().ok())
+            .and_then(|local| local.socket.local_addr().ok())
             .map(|addr| Destination {
                 ip: addr.ip(),
                 port: addr.port(),
@@ -921,12 +927,25 @@ impl UdpRelayHandle {
         }
     }
 
-    pub(super) fn set_default_dest(&self, dest: Destination, route: UdpRouteKind) {
+    pub(super) fn set_default_dest(
+        &self,
+        dest: Destination,
+        route: UdpRouteKind,
+    ) -> io::Result<()> {
+        self.autobind()?;
         *self.default_dest.lock().unwrap() = Some((dest, route));
+        Ok(())
     }
 
     pub(super) fn clear_default_dest(&self) {
         *self.default_dest.lock().unwrap() = None;
+        // Linux disconnect releases an automatically selected local port, but
+        // retains one explicitly locked by bind(nonzero_port). bind(0) does
+        // not set SOCK_BINDPORT_LOCK, even though it reserves a port eagerly.
+        let mut local = self.local_bind.lock().unwrap();
+        if local.as_ref().is_some_and(|bound| !bound.port_locked) {
+            *local = None;
+        }
     }
 
     pub(super) fn accepts_destination(&self, dest: Destination) -> bool {
@@ -938,7 +957,23 @@ impl UdpRelayHandle {
         if current.is_some() {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        *current = Some(UdpSocket::bind(SocketAddr::new(bind.ip, bind.port))?);
+        *current = Some(UdpLocalSocket {
+            socket: UdpSocket::bind(SocketAddr::new(bind.ip, bind.port))?,
+            port_locked: bind.port != 0,
+        });
+        Ok(())
+    }
+
+    pub(super) fn autobind(&self) -> io::Result<()> {
+        if self.stable {
+            let mut local = self.local_bind.lock().unwrap();
+            if local.is_none() {
+                *local = Some(UdpLocalSocket {
+                    socket: UdpSocket::bind(SocketAddr::new(self.unspecified_destination().ip, 0))?,
+                    port_locked: false,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -949,6 +984,9 @@ impl UdpRelayHandle {
         route: UdpRouteKind,
         nonblocking: bool,
     ) -> io::Result<()> {
+        // Reserve synchronously, before acknowledging a send or queueing work.
+        // A following bind must already observe the socket as bound.
+        self.autobind()?;
         let job = UdpJob {
             dest,
             payload,
@@ -1204,7 +1242,7 @@ pub(super) fn forward_udp_job(
     dns_tcp: &mut Option<proxy::DnsTcpConnection>,
     socks_udp: &mut Option<proxy::Socks5UdpAssociation>,
     direct_udp: &mut Option<DirectUdpSocket>,
-    local_bind: &Mutex<Option<UdpSocket>>,
+    local_bind: &Mutex<Option<UdpLocalSocket>>,
     job: UdpJob,
 ) -> Result<Option<UdpRelayResponse>> {
     let deadline = proxy::Deadline::after(cfg.timeout);
@@ -1276,7 +1314,7 @@ pub(super) fn forward_dns_tcp(
 /// read back (within the timeout) so the connected-UDP return path stays fed.
 pub(super) fn forward_direct_udp(
     direct_udp: &mut Option<DirectUdpSocket>,
-    local_bind: &Mutex<Option<UdpSocket>>,
+    local_bind: &Mutex<Option<UdpLocalSocket>>,
     dest: Destination,
     payload: &[u8],
     timeout: Duration,
@@ -1289,24 +1327,35 @@ pub(super) fn forward_direct_udp(
         },
         port: 0,
     };
-    if direct_udp.is_none() {
+    let (cookie, socket) = {
+        let mut bound = local_bind.lock().unwrap();
+        if bound.is_none() {
+            *bound = Some(UdpLocalSocket {
+                socket: UdpSocket::bind(SocketAddr::new(default_bind.ip, 0))?,
+                port_locked: false,
+            });
+        }
+        let sock = &bound.as_ref().expect("local port reserved above").socket;
+        let cookie = socket_cookie(sock.as_raw_fd()).context("read bound UDP socket cookie")?;
+        let socket = if direct_udp
+            .as_ref()
+            .is_some_and(|state| state.cookie == cookie)
+        {
+            None
+        } else {
+            Some(sock.try_clone()?)
+        };
+        (cookie, socket)
+    };
+    if let Some(sock) = socket {
         // Clone the reserved socket rather than binding again: it must retain
         // the port reported immediately after bind(0), including dual stack.
-        let sock = {
-            let mut bound = local_bind.lock().unwrap();
-            if bound.is_none() {
-                *bound = Some(UdpSocket::bind(SocketAddr::new(default_bind.ip, 0))?);
-            }
-            bound
-                .as_ref()
-                .expect("local port reserved above")
-                .try_clone()?
-        };
         sock.set_read_timeout(Some(timeout))?;
         sock.set_write_timeout(Some(timeout))?;
         *direct_udp = Some(DirectUdpSocket {
             sock,
             recv_buf: vec![0_u8; MAX_UDP_PAYLOAD],
+            cookie,
         });
     }
     let state = direct_udp
