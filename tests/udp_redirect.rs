@@ -2089,6 +2089,7 @@ fn build_udp_mmsg_probe() -> (TempDir, PathBuf) {
         &src,
         r#"
 #define _GNU_SOURCE
+#include <errno.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdlib.h>
@@ -2130,6 +2131,23 @@ int main(int argc, char **argv) {
         send_msgs[i].msg_hdr.msg_iovlen = 1;
     }
     if (sendmmsg(fd, send_msgs, 2, 0) != 2) return 7;
+
+    /* An oversized named entry reports the first message's error. */
+    static char big[65508];
+    memset(big, 'x', sizeof big);
+    struct iovec split[2] = {
+        { .iov_base = big, .iov_len = 60000 },
+        { .iov_base = big, .iov_len = 5508 },
+    };
+    struct mmsghdr oversized;
+    memset(&oversized, 0, sizeof(oversized));
+    oversized.msg_hdr.msg_name = &dest;
+    oversized.msg_hdr.msg_namelen = sizeof(dest);
+    oversized.msg_hdr.msg_iov = split;
+    oversized.msg_hdr.msg_iovlen = 2;
+    errno = 0;
+    if (sendmmsg(fd, &oversized, 1, 0) != -1 || errno != EMSGSIZE) return 16;
+
     if (send_msgs[0].msg_len != sizeof(first) - 1 ||
         send_msgs[1].msg_len != sizeof(second) - 1) return 8;
 
@@ -3382,6 +3400,7 @@ static int check_datagram_size_limits(void) {
     msg.msg_namelen = sizeof(ipv4);
     msg.msg_iov = split;
     msg.msg_iovlen = 2;
+
     errno = 0;
     if (sendmsg(fd, &msg, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
 
@@ -3400,6 +3419,34 @@ static int check_datagram_size_limits(void) {
     return close(fd);
 }
 
+/* sendmmsg clamps vlen to UIO_MAXIOV instead of rejecting it. The proxy in
+ * these runs is a dead endpoint, so a virtualized batch fails fast in the
+ * relay worker while the syscall itself still reports every entry sent. */
+static int check_sendmmsg_vlen_clamp(void) {
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    static struct mmsghdr msgs[1200];
+    static struct iovec iovs[1200];
+    static char one = 'x';
+    for (int i = 0; i < 1200; ++i) {
+        iovs[i].iov_base = &one;
+        iovs[i].iov_len = 1;
+        msgs[i].msg_hdr.msg_name = &ipv4;
+        msgs[i].msg_hdr.msg_namelen = sizeof(ipv4);
+        msgs[i].msg_hdr.msg_iov = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    errno = 0;
+    if (sendmmsg(fd, msgs, 1200, 0) != 1024) { close(fd); return -1; }
+    return close(fd);
+}
+
 /* A dropped AF_UNSPEC name hands the datagram to the connected peer. Linux
  * only reaches a v4-mapped peer from the IPv4 fast path, which this call
  * bypasses, so the peer here is IPv6 to keep the check portable. */
@@ -3413,7 +3460,6 @@ static int check_connected_unspecified_name(const char *port) {
     int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) { close(fd); return -1; }
-
     struct sockaddr_in6 unspecified;
     memset(&unspecified, 0, sizeof(unspecified));
     unspecified.sin6_family = AF_UNSPEC;
@@ -3430,6 +3476,7 @@ int main(int argc, char **argv) {
     if (check_connected_unspecified_name(argv[1]) != 0) return 6;
     if (check_iovec_import_order() != 0) return 7;
     if (check_datagram_size_limits() != 0) return 9;
+    if (check_sendmmsg_vlen_clamp() != 0) return 10;
     if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 8;
     return 0;
 }
@@ -3885,6 +3932,20 @@ int main(void) {
     errno = 0;
     if (recvmmsg(fd, NULL, 0, MSG_DONTWAIT, NULL) != 0) return 3;
 
+    /* vlen above UIO_MAXIOV is clamped to 1024, not rejected. */
+    static struct mmsghdr clamp_msgs[1200];
+    static struct iovec clamp_iov[1200];
+    static char clamp_buf[1];
+    for (int i = 0; i < 1200; ++i) {
+        clamp_iov[i].iov_base = clamp_buf;
+        clamp_iov[i].iov_len = sizeof(clamp_buf);
+        clamp_msgs[i].msg_hdr.msg_iov = &clamp_iov[i];
+        clamp_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    errno = 0;
+    if (recvmmsg(fd, clamp_msgs, 1200, MSG_DONTWAIT, NULL) != -1 ||
+        errno != EAGAIN) return 15;
+
     errno = 0;
     if (recvmmsg(fd, NULL, 1, MSG_DONTWAIT, NULL) != -1 || errno != EFAULT) return 4;
 
@@ -4055,8 +4116,10 @@ int main(void) {
     if (recvmmsg(fd, &msg, 1, 0, &timeout) != 0) return 3;
     if (timeout.tv_sec != 0 || timeout.tv_nsec != 0) return 11;
     errno = 0;
+    /* vlen above UIO_MAXIOV is clamped, so the call proceeds to the usual
+       nonblocking empty-queue verdict instead of failing with EINVAL. */
     if (recvmmsg(fd, &msg, 1025, MSG_DONTWAIT, NULL) != -1 ||
-        errno != EINVAL) return 4;
+        errno != EAGAIN) return 4;
 
     /* A short explicit timespec still returns zero ahead of a longer armed
        SO_RCVTIMEO: the earlier deadline keeps its own expiry result. */

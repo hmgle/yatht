@@ -227,7 +227,10 @@ const X86_64_MSGHDR_FLAGS_OFFSET: u64 = 48;
 const X86_64_MMSGHDR_SIZE: usize = 64;
 const X86_64_MMSGHDR_LEN_OFFSET: u64 = 56;
 const X86_64_TIMESPEC_SIZE: usize = 16;
-const MAX_RECVMMSG_VLEN: usize = 1_024;
+/// The kernel's `UIO_MAXIOV`: an iovec array may hold at most this many
+/// segments (more is an error from `iovec_from_user`), while a `sendmmsg` or
+/// `recvmmsg` batch length above it is silently clamped, not rejected.
+const UIO_MAXIOV: usize = 1024;
 const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 const CLOSE_RANGE_KNOWN_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
@@ -2546,10 +2549,7 @@ fn handle_sendmmsg(
         seccomp::send_success(listener_fd, notif.id);
         return;
     }
-    if vlen > 1024 {
-        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
-        return;
-    }
+    let vlen = vlen.min(UIO_MAXIOV);
 
     let Some(handle) = relays.lookup_handle(notif.pid, target_fd, true) else {
         seccomp::send_continue(listener_fd, notif.id);
@@ -2997,10 +2997,7 @@ fn handle_recvmmsg_once(
         seccomp::send_success(listener_fd, notif.id);
         return RecvHandling::Completed;
     }
-    if vlen > MAX_RECVMMSG_VLEN {
-        seccomp::send_errno(listener_fd, notif.id, libc::EINVAL);
-        return RecvHandling::Completed;
-    }
+    let vlen = vlen.min(UIO_MAXIOV);
     if msgvec == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return RecvHandling::Completed;
@@ -4748,7 +4745,7 @@ struct RelayRecvfrom {
 }
 
 fn read_iovec_targets(pid: u32, iov_ptr: u64, iov_len: u64) -> io::Result<Vec<TargetIovec>> {
-    if iov_len > 1024 {
+    if iov_len > UIO_MAXIOV as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "too many iovecs",
