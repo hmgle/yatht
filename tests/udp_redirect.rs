@@ -1534,6 +1534,39 @@ fn lazy_udp_socket_survives_bind_dup_close_and_fork() {
 }
 
 #[test]
+fn lazy_and_dns_udp_queries_report_internet_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_lazy_identity");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_lazy_identity.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for enable in ["--enable-udp", "--enable-dns"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                enable,
+                "--udp-socket-mode",
+                "lazy",
+                "--proxy",
+                "socks5://127.0.0.1:9",
+                "--",
+            ])
+            .arg(&probe)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+}
+
+#[test]
 fn stable_udp_reclaims_closed_socket_capacity() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;

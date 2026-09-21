@@ -117,6 +117,7 @@ pub(super) struct UdpRelayHandle {
     pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     /// Retains the actual local port reservation, including bind(port=0).
     pub(super) local_bind: Arc<Mutex<Option<UdpLocalSocket>>>,
+    pub(super) original_local: Option<Destination>,
     pub(super) pending_sources: Arc<Mutex<VecDeque<Destination>>>,
     pub(super) relay_fd: Arc<OwnedFd>,
     pub(super) target_identity: FdIdentity,
@@ -637,8 +638,30 @@ impl UdpRelayRegistry {
             domain: target_snapshot.domain,
             protocol: target_snapshot.protocol,
         };
-        let handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target, false)
+        let original = UdpSocket::from(current_target);
+        let original_local = original
+            .local_addr()
+            .context("read original UDP local address")?;
+        let default_dest = default_dest.or_else(|| {
+            original.peer_addr().ok().map(|addr| {
+                let dest = Destination {
+                    ip: addr.ip(),
+                    port: addr.port(),
+                };
+                (
+                    dest,
+                    udp_route_for(cfg, dest).unwrap_or(UdpRouteKind::Direct),
+                )
+            })
+        });
+        let mut handle = start_udp_relay(relay_cfg, relay_socket, default_dest, target, false)
             .context("start bounded UDP relay workers")?;
+        // Lazy replacement does not preserve the original kernel bind. Keep
+        // its address for logical queries until a direct worker has a port.
+        handle.original_local = Some(Destination {
+            ip: original_local.ip(),
+            port: original_local.port(),
+        });
         if let Err(err) = seccomp::notif_addfd(listener_fd, &mut addfd) {
             handle.shutdown();
             return Err(err).context("inject UDP relay fd");
@@ -910,6 +933,7 @@ impl UdpRelayHandle {
                 ip: addr.ip(),
                 port: addr.port(),
             })
+            .or(self.original_local)
     }
 
     pub(super) fn default_destination(&self) -> Option<(Destination, UdpRouteKind)> {
@@ -1186,6 +1210,7 @@ pub(super) fn start_udp_relay(
         tx,
         default_dest,
         local_bind,
+        original_local: None,
         pending_sources,
         relay_fd,
         target_identity,

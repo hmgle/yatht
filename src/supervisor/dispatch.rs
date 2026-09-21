@@ -943,10 +943,6 @@ pub(super) fn handle_getsockname(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    if !handle.stable {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
-    }
     if addr_len_ptr == 0 {
         seccomp::send_errno(listener_fd, notif.id, libc::EFAULT);
         return;
@@ -1000,10 +996,6 @@ pub(super) fn handle_getpeername(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    if !handle.stable {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
-    }
     let Some(peer) = handle.default_destination().map(|(dest, _)| dest) else {
         seccomp::send_errno(listener_fd, notif.id, libc::ENOTCONN);
         return;
@@ -1052,10 +1044,6 @@ pub(super) fn handle_getsockopt(
         seccomp::send_continue(listener_fd, notif.id);
         return;
     };
-    if !handle.stable {
-        seccomp::send_continue(listener_fd, notif.id);
-        return;
-    }
     if level != libc::SOL_SOCKET
         || !matches!(
             option,

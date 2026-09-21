@@ -156,16 +156,15 @@ Generic UDP redirection is experimental and currently models one request with
 at most one response. It does not preserve unsolicited, delayed, reordered, or
 multiple responses, ancillary data, or pre-existing epoll registrations.
 Emulated receives report `msg_controllen = 0` when returning no ancillary data.
-The
-default lazy mode creates the relay on the first proxied send and does not
+The default lazy mode creates the relay on the first proxied send and does not
 preserve aliases created before that point. Aliases made after replacement
 share the relay, which survives until the last alias closes.
-Pass `--udp-socket-mode=stable`
-with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
+Pass `--udp-socket-mode=stable` with `--enable-udp` to inject an endpoint at
+`socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
-every mode, including the first proxied batch, while `recvmmsg(2)` and the socket-query paths
-described below remain stable-mode features. Active UDP relay creation is
+every mode, including the first proxied batch; receive-supervisor handling of
+`recvmmsg(2)` remains a stable-mode feature. Active UDP relay creation is
 capped at 128, with a bounded 16-datagram input queue per relay. A
 `sendmmsg(2)` batch that outpaces the relay worker reports only the enqueued
 entries as its sent count — like a kernel socket whose send buffer has filled
@@ -184,12 +183,15 @@ UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
 `recvmsg(2)`. `sendmmsg(2)` entries are rewritten and virtualized in every
 mode, creating a lazy/DNS relay when the first batch needs proxy routing.
 Mixed direct/proxy batches retain per-entry routing and partial-error results.
-Stable mode serves `recvmmsg(2)` through the receive
-supervisor and virtualizes `getsockname(2)`, `getpeername(2)`, and the common
+Stable mode serves `recvmmsg(2)` through the receive supervisor. Every relay
+mode virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
-wildcard address with port zero. Stable `bind(2)` reserves a real local UDP
+wildcard address with port zero. Lazy/DNS queries preserve the local address
+observed before replacement until a direct worker allocates a local socket;
+that snapshot does not reserve the original port or describe the proxy's
+external source address. Stable `bind(2)` reserves a real local UDP
 socket immediately, so port zero becomes a kernel-assigned ephemeral port
 before `getsockname(2)` returns; direct sends reuse that reservation.
 Stable sends and connects also reserve an automatic local port before
@@ -197,8 +199,8 @@ returning, so a subsequent `bind(2)` fails with `EINVAL`.
 The local port is released during relay cleanup after the last alias closes
 (and after any in-flight direct request finishes), rather than synchronously
 with `close(2)`. A proxy's external source port can still differ.
-Logical operations reject
-invalid destination ports and unsupported families before creating a relay.
+Logical operations reject invalid destination ports and unsupported families
+before creating a relay.
 AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
 Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations;
 their logical addresses are reported in the socket's own family, so a
