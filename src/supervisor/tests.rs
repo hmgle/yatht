@@ -976,3 +976,24 @@ fn test_config(enable_dns: bool) -> EffectiveConfig {
         command: Vec::new(),
     }
 }
+
+#[test]
+fn udp_send_errors_preserve_local_failures() {
+    for errno in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::EADDRINUSE,
+        libc::ENOMEM,
+        libc::EPIPE,
+    ] {
+        assert_eq!(udp_send_errno(&io::Error::from_raw_os_error(errno)), errno);
+    }
+    assert_eq!(
+        udp_send_errno(&io::Error::from(io::ErrorKind::WouldBlock)),
+        libc::EAGAIN
+    );
+    assert_eq!(
+        udp_send_errno(&io::Error::new(io::ErrorKind::BrokenPipe, "worker exited")),
+        libc::ECONNREFUSED
+    );
+}

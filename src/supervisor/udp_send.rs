@@ -89,10 +89,7 @@ pub(super) fn handle_sendto(
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     match handle.send(dest, payload, route, nonblocking) {
         Ok(()) => seccomp::send_value(listener_fd, notif.id, len as i64),
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
-        }
-        Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
+        Err(err) => seccomp::send_errno(listener_fd, notif.id, udp_send_errno(&err)),
     }
 }
 
@@ -205,7 +202,11 @@ pub(super) fn relay_for_send(
             if cfg.debug {
                 eprintln!("yatht: UDP relay setup failed: {err:#}");
             }
-            seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED);
+            let errno = err
+                .downcast_ref::<io::Error>()
+                .map(udp_send_errno)
+                .unwrap_or(libc::ECONNREFUSED);
+            seccomp::send_errno(listener_fd, notif.id, errno);
             None
         }
     }
@@ -321,10 +322,7 @@ pub(super) fn handle_sendmsg(
         .unwrap_or(flags & libc::MSG_DONTWAIT != 0);
     match handle.send(dest, payload, route, nonblocking) {
         Ok(()) => seccomp::send_value(listener_fd, notif.id, written),
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            seccomp::send_errno(listener_fd, notif.id, libc::EAGAIN);
-        }
-        Err(_) => seccomp::send_errno(listener_fd, notif.id, libc::ECONNREFUSED),
+        Err(err) => seccomp::send_errno(listener_fd, notif.id, udp_send_errno(&err)),
     }
 }
 
@@ -482,11 +480,7 @@ pub(super) fn handle_sendmmsg(
         }
         let handle = existing.as_ref().expect("relay initialized above");
         if let Err(err) = handle.send(dest, payload, route, nonblocking) {
-            let errno = if err.kind() == io::ErrorKind::WouldBlock {
-                libc::EAGAIN
-            } else {
-                libc::ECONNREFUSED
-            };
+            let errno = udp_send_errno(&err);
             send_mmsg_result_or_errno(listener_fd, notif.id, sent, errno);
             return;
         }
@@ -722,4 +716,15 @@ pub(super) fn internet_udp_domain(
         .map(|handle| handle.domain)
         .or_else(|| remote_udp_domain(pid, fd))?;
     matches!(domain, libc::AF_INET | libc::AF_INET6).then_some(domain)
+}
+
+/// Preserve local socket failures; only a disconnected relay queue keeps the
+/// historical connection-refused verdict. Synthetic queue pressure has no raw
+/// errno, so translate it explicitly rather than falling back to EIO.
+pub(super) fn udp_send_errno(err: &io::Error) -> i32 {
+    match err.kind() {
+        io::ErrorKind::WouldBlock => libc::EAGAIN,
+        io::ErrorKind::BrokenPipe if err.raw_os_error().is_none() => libc::ECONNREFUSED,
+        _ => errno_from_io(err),
+    }
 }
