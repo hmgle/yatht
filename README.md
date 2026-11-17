@@ -48,6 +48,10 @@ target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://example.com
 target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
 
+For experimental UDP with stable descriptor identity, add `--enable-udp
+--udp-socket-mode=stable` before `--` and the target command. Lazy mode remains
+the default. See [CHANGELOG.md](CHANGELOG.md) for release changes.
+
 Use `--` before the target command and its arguments. If `--proxy` is omitted,
 the default proxy is `socks5://127.0.0.1:1080`.
 
@@ -137,7 +141,7 @@ Unsupported values fail startup instead of being ignored.
 
 `SUP_UDP_SOCKET_MODE=lazy|stable` is a deprecated alias for
 `--udp-socket-mode`. It still works but prints a notice and will be removed in
-the next release; it also has the lowest precedence, so the CLI flag and the
+the release after 0.5.0; it also has the lowest precedence, so the CLI flag and the
 configuration key both override it. The mode changes observable socket
 semantics rather than gating an internal data-plane implementation, which is
 why it belongs on the CLI instead of alongside the selectors above.

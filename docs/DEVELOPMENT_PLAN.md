@@ -7,7 +7,8 @@ for trusted Linux processes. The current version
 transparently redirects TCP `connect(2)`, UDP DNS queries, and generic UDP sends
 through one configured proxy without `LD_PRELOAD` and without `ptrace`.
 
-Generic UDP is experimental and limited to a request/response workload. The
+Generic UDP is experimental; sends and receives run independently, including
+delayed, reordered, and multiple responses. The
 seccomp backend is a compatibility tool, not a complete emulation of Linux
 socket semantics or a security boundary.
 
@@ -34,6 +35,7 @@ Options:
   --enable-dns                    Redirect UDP/53 through DNS-over-TCP
   --enable-udp                    Redirect generic UDP through SOCKS5 UDP ASSOCIATE
   --dns-server <addr>             DNS-over-TCP upstream, default 1.1.1.1:53
+  --udp-socket-mode <lazy|stable>  UDP socket identity model, default lazy
   --debug                         Print routing and notification diagnostics
   --metrics-file <path>           Write experimental performance metrics as JSONL
 ```
@@ -50,11 +52,15 @@ debug = false
 enable_dns = false
 enable_udp = false
 dns_server = "1.1.1.1:53"
+udp_socket_mode = "lazy"
 # metrics_file = "/tmp/yatht-metrics.jsonl"
 ```
 
 CLI values override or extend file values. If no proxy is provided, the default
 is `socks5://127.0.0.1:1080`.
+Stable UDP mode requires `--enable-udp`. The deprecated
+`SUP_UDP_SOCKET_MODE` alias remains available for 0.5.0, with lower precedence
+than the CLI flag and TOML key; removal is planned for the following release.
 
 ## Implementation
 
@@ -62,6 +68,8 @@ is `socks5://127.0.0.1:1080`.
   stage.
 - The parent acts as a child subreaper. It preserves the initial target's exit
   status while keeping the listener alive until adopted descendants exit.
+  Normal target-exit monitoring polls a pidfd rather than waking every 10 ms;
+  bounded polling remains in failure cleanup.
 - Failure cleanup sends `SIGKILL` to the target tree and polls the direct child
   and adopted descendants against one shared one-second deadline. If the tree
   cannot be reaped or `/proc` enumeration fails, the supervisor reports both
@@ -141,7 +149,7 @@ is `socks5://127.0.0.1:1080`.
   only one notification pending.
 - UDP redirection injects one end of an AF_UNIX datagram socketpair into the
   target and runs a supervisor relay on the other end. Lazy mode performs this
-  replacement on the first proxied send. Stable mode (`SUP_UDP_SOCKET_MODE=stable`)
+  replacement on the first proxied send. Stable mode (`--udp-socket-mode=stable`)
   traps UDP socket creation and uses `SECCOMP_ADDFD_FLAG_SEND` so the target sees
   the injected fd as the `socket(2)` result; `bind(2)` is emulated for the
   logical endpoint by retaining a bound kernel UDP socket. This reserves a

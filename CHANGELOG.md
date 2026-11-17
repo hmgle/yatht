@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Require Rust 1.95 or newer for building from source; the Linux x86_64,
+  kernel 6.9 baseline is unchanged.
+- Decouple direct, SOCKS5, and DNS sends from response waits. Silent peers no
+  longer throttle subsequent datagrams; delayed, reordered, and multiple
+  responses are received independently. DNS-over-TCP pipelines queries and
+  retains partial frames across readiness events.
+- Isolate backpressure with separate bounded direct, SOCKS5, and DNS queues
+  per relay. Initial proxy setup remains blocking; successful sends acknowledge
+  queue admission rather than delivery.
+- Reclaim relay workers when their last owner disappears and wake established
+  I/O immediately on shutdown, without waiting for a response timeout.
+- Virtualize the first lazy/DNS `sendmmsg(2)` batch, including mixed routing
+  and partial completion. Clamp batch lengths to Linux's `UIO_MAXIOV` and keep
+  kernel descriptor validation for empty send batches.
+- Preserve aliases created after lazy replacement and report logical Internet
+  socket identity for lazy and DNS relays as well as stable relays.
+- Reserve stable UDP bind and automatic ports before reporting success;
+  reject bind-after-send/connect. Disconnect releases unlocked ports before
+  returning, even during proxy setup, while retaining explicitly bound IPs.
+- Preserve the original UDP transport family across direct destination changes,
+  including IPv4/IPv6 switching on dual-stack sockets.
+- Reject oversized UDP sends with `EMSGSIZE`, including conservative SOCKS5
+  payload ceilings of 65497 bytes for IPv4 and 65485 for IPv6 destinations;
+  direct and DNS routes retain their native family limits.
+- Preserve local send/setup error codes and report exhausted relay capacity
+  as `ENOBUFS`. Clear control-data lengths on emulated receives.
+- Count asynchronous UDP forwarding failures in the `udp_dropped_jobs` run
+  summary without requiring debug logs, including DNS stream-capacity drops.
+- Wait for target termination through a pidfd instead of polling every 10 ms,
+  and split the supervisor into focused modules.
 - Sweep closed stable UDP relays on a dedicated low-priority thread instead of
   the blocking-receive reactor, so the host-wide `/proc/net/unix` read no
   longer delays ready receives or armed `SO_RCVTIMEO`/`recvmmsg` deadlines.
