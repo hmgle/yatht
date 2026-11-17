@@ -247,7 +247,9 @@ AF_INET6 ones, and any other family is rejected with that socket's error.
 Bind remains strict-family, including Linux's IPv6 length checks and IPv4
 `AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
 `AF_UNSPEC` connect clears the peer and, in stable mode, releases local ports
-not locked by an explicit nonzero bind. Destination-free sends then fail
+not locked by an explicit nonzero bind while retaining any explicitly bound
+local IP, including after `bind(address, 0)`. Subsequent sends and connects use
+that address when reserving a new port. Destination-free sends then fail
 with `EDESTADDRREQ`. Port release completes before disconnect returns, even
 while the worker is blocked in proxy setup. Virtualized integer socket options
 preserve Linux's short-buffer truncation and negative-length rejection rules. For

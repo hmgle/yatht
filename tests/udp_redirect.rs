@@ -1799,8 +1799,17 @@ fn udp_disconnect_releases_ports_during_stalled_dns_setup() {
         .unwrap()
         .success());
     for relayed in [false, true] {
-        for family in ["4", "6"] {
+        for (family, bind_ip) in [
+            ("4", "0.0.0.0"),
+            ("4", "127.0.0.2"),
+            ("6", "::"),
+            ("6", "::1"),
+        ] {
+            let bind_ip: std::net::IpAddr = bind_ip.parse().unwrap();
             for binding in ["0", "1", "2"] {
+                if binding == "0" && !bind_ip.is_unspecified() {
+                    continue;
+                }
                 let udp = UdpSocket::bind(if family == "4" {
                     "127.0.0.1:0"
                 } else {
@@ -1809,19 +1818,27 @@ fn udp_disconnect_releases_ports_during_stalled_dns_setup() {
                 .unwrap();
                 udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let port = udp.local_addr().unwrap().port();
+                let loopback_ip = udp.local_addr().unwrap().ip();
+                let source_ip = if bind_ip.is_unspecified() {
+                    loopback_ip
+                } else {
+                    bind_ip
+                };
                 let echo = thread::spawn(move || {
-                    for _ in 0..2 {
+                    for round in 0..if binding == "1" { 4 } else { 2 } {
                         let mut query = [0];
                         let Ok((n, peer)) = udp.recv_from(&mut query) else {
                             return;
                         };
+                        assert_eq!(
+                            peer.ip(),
+                            if round == 3 { loopback_ip } else { source_ip },
+                            "direct source address changed"
+                        );
                         udp.send_to(&query[..n], peer).unwrap();
                     }
                 });
                 let socks = TcpListener::bind("127.0.0.1:0").unwrap();
-                let bind_ip: std::net::IpAddr = if family == "4" { "0.0.0.0" } else { "::" }
-                    .parse()
-                    .unwrap();
                 let reservation = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).unwrap();
                 let explicit_port = reservation.local_addr().unwrap().port();
                 drop(reservation);
@@ -1851,6 +1868,7 @@ fn udp_disconnect_releases_ports_during_stalled_dns_setup() {
                         binding,
                         if relayed { "1" } else { "0" },
                         &explicit_port.to_string(),
+                        &bind_ip.to_string(),
                     ])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -1881,10 +1899,12 @@ fn udp_disconnect_releases_ports_during_stalled_dns_setup() {
                 line.clear();
                 stdout.read_line(&mut line).unwrap();
                 let released = line == "released\n";
-                assert!(
-                    released,
-                    "disconnect did not finish while DNS setup was stalled"
-                );
+                if !released {
+                    drop(control);
+                    let output = child.wait_with_output().unwrap();
+                    assert_success(&output);
+                    panic!("disconnect did not report its released state: {line:?}");
+                }
                 // Check from outside the supervised process: a stable-mode
                 // close intentionally retains its reservation until reaping.
                 let collision = UdpSocket::bind(SocketAddr::new(bind_ip, old_port));

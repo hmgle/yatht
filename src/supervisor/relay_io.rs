@@ -221,6 +221,7 @@ pub(super) fn udp_relay_io(
         if let Some(direct) = &transports.direct {
             let bound = handle.local_bind.lock().unwrap();
             if bound
+                .reservation
                 .as_ref()
                 .and_then(|local| socket_cookie(local.socket.as_raw_fd()))
                 != Some(direct.cookie)

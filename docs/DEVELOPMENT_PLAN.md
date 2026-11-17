@@ -150,8 +150,12 @@ is `socks5://127.0.0.1:1080`.
   Port release follows relay reclamation and worker exit.
   Stable connect/send paths reserve an automatic port synchronously, preventing
   bind-after-send races with the writer. Disconnect clears automatic and
-  bind(0) reservations; nonzero explicit ports remain locked. Direct socket
-  caching checks the reservation's cookie to follow disconnect/rebind changes.
+  bind(0) reservations; nonzero explicit ports remain locked.
+  Explicitly bound IPs are stored separately from port reservations: disconnect
+  retains that IP at port zero, and send/connect reserve a new port on it.
+  A later successful bind replaces the retained IP.
+  Direct socket caching checks the reservation's cookie to follow
+  disconnect/rebind changes.
   Disconnect invokes AF_UNSPEC on the shared reservation before clearing it,
   releasing automatic ports synchronously even when a worker clone is stalled
   in proxy setup. The reservation lock also covers nonblocking direct sends
