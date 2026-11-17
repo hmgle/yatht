@@ -11,7 +11,7 @@ use crossbeam_channel as channel;
 use serde::Serialize;
 
 const METRIC_QUEUE_CAPACITY: usize = 4096;
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Default)]
 pub struct Observability {
@@ -80,6 +80,8 @@ struct ObservabilityInner {
     tcp_warm_sessions_expired: AtomicU64,
     tcp_warm_replenish_failures: AtomicU64,
     tcp_warm_pool_size_peak: AtomicU64,
+    udp_dropped_jobs: AtomicU64,
+    udp_dropped_pending_responses: AtomicU64,
     started: Instant,
 }
 
@@ -142,6 +144,8 @@ impl ObservabilityInner {
             tcp_warm_sessions_expired: AtomicU64::new(0),
             tcp_warm_replenish_failures: AtomicU64::new(0),
             tcp_warm_pool_size_peak: AtomicU64::new(0),
+            udp_dropped_jobs: AtomicU64::new(0),
+            udp_dropped_pending_responses: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -260,6 +264,8 @@ struct RunSummary {
     tcp_warm_sessions_expired: u64,
     tcp_warm_replenish_failures: u64,
     tcp_warm_pool_size_peak: u64,
+    udp_dropped_jobs: u64,
+    udp_dropped_pending_responses: u64,
     tcp_cpu_ns_per_byte: Option<f64>,
     dropped_metric_events: u64,
 }
@@ -410,6 +416,10 @@ impl ObservabilityRuntime {
             tcp_warm_sessions_expired: inner.tcp_warm_sessions_expired.load(Ordering::Relaxed),
             tcp_warm_replenish_failures: inner.tcp_warm_replenish_failures.load(Ordering::Relaxed),
             tcp_warm_pool_size_peak: inner.tcp_warm_pool_size_peak.load(Ordering::Relaxed),
+            udp_dropped_jobs: inner.udp_dropped_jobs.load(Ordering::Relaxed),
+            udp_dropped_pending_responses: inner
+                .udp_dropped_pending_responses
+                .load(Ordering::Relaxed),
             tcp_cpu_ns_per_byte: (total_bytes != 0)
                 .then_some(total_cpu_ns as f64 / total_bytes as f64),
             dropped_metric_events: inner.dropped_events.load(Ordering::Relaxed),
@@ -791,6 +801,25 @@ impl Observability {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Accepted sends that the worker could not forward, including incomplete
+    /// DNS frames discarded with a failed stream. This does not infer loss
+    /// from missing replies or count synchronous syscall rejections.
+    pub fn record_udp_job_dropped(&self) {
+        if let Some(inner) = &self.inner {
+            inner.udp_dropped_jobs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts relay responses dropped because the target stopped reading
+    /// and the pending-response queue was full.
+    pub fn record_udp_pending_response_dropped(&self) {
+        if let Some(inner) = &self.inner {
+            inner
+                .udp_dropped_pending_responses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_proxy_session_source(&self, warm: bool) {
         if let Some(inner) = &self.inner {
             inner
@@ -966,7 +995,7 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 fn update_peak(peak: &AtomicU64, value: u64) {
-    let _ = peak.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = peak.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         (value > current).then_some(value)
     });
 }
@@ -1016,6 +1045,8 @@ mod tests {
         setup.set_proxy_cookie(Some(12));
         setup.completed();
         metrics.tcp_flow_cancelled();
+        metrics.record_udp_job_dropped();
+        metrics.record_udp_job_dropped();
         metrics.record_proxy_session_source(true);
         metrics.record_warm_pool_stats(3, 2, 1, 1, 0, 4);
         runtime.finish().unwrap();
@@ -1027,7 +1058,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0]["event"], "run_start");
-        assert_eq!(events[0]["schema_version"], 6);
+        assert_eq!(events[0]["schema_version"], 7);
         assert_eq!(events[1]["event"], "tcp_setup");
         assert_eq!(events[1]["target_cookie"], 11);
         assert_eq!(events[1]["proxy_session"], "warm_hit");
@@ -1035,6 +1066,7 @@ mod tests {
         assert_eq!(events[2]["event"], "run_summary");
         assert_eq!(events[2]["tcp_setup_completed"], 1);
         assert_eq!(events[2]["tcp_flows_cancelled"], 1);
+        assert_eq!(events[2]["udp_dropped_jobs"], 2);
         assert_eq!(events[2]["tcp_proxy_session_source"], "warm-one-shot");
         assert_eq!(events[2]["tcp_warm_sessions_hit"], 3);
         assert_eq!(events[2]["tcp_warm_sessions_miss"], 2);

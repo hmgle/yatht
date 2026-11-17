@@ -18,7 +18,7 @@ using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 - Relays TCP flows through a bounded-budget epoll broker, with opt-in
   experimental splice and warm proxy-session data paths.
 - Redirects UDP/53 DNS queries as DNS-over-TCP when `--enable-dns` is set.
-- Redirects request/response UDP through SOCKS5 UDP ASSOCIATE when
+- Redirects UDP through SOCKS5 UDP ASSOCIATE when
   experimental `--enable-udp` is set.
 - Works without `LD_PRELOAD` or `ptrace`, including for static binaries that
   ignore preload-based tools.
@@ -29,7 +29,7 @@ using seccomp user notification and `SECCOMP_IOCTL_NOTIF_ADDFD`.
 
 - Linux x86_64
 - Linux kernel 6.9 or newer (`PIDFD_THREAD` is required)
-- Rust toolchain for building from source
+- Rust 1.95 or newer for building from source
 - A reachable SOCKS5 or HTTP CONNECT proxy
 
 ## Build
@@ -47,6 +47,10 @@ cargo build
 target/debug/yatht --proxy socks5://127.0.0.1:1080 -- curl https://example.com
 target/debug/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
 ```
+
+For experimental UDP with stable descriptor identity, add `--enable-udp
+--udp-socket-mode=stable` before `--` and the target command. Lazy mode remains
+the default. See [CHANGELOG.md](CHANGELOG.md) for release changes.
 
 Use `--` before the target command and its arguments. If `--proxy` is omitted,
 the default proxy is `socks5://127.0.0.1:1080`.
@@ -96,11 +100,16 @@ CLI CIDR options extend file CIDR lists. CLI booleans enable their matching
 features. `--proxy-local` disables the default `bypass_local = true` behavior.
 
 The metrics file is opt-in and must not already exist. It contains versioned
-run metadata (schema version 6), TCP broker limits, one setup record per
+run metadata (schema version 7), TCP broker limits, one setup record per
 proxied TCP connection with per-stage timings and its proxy session source
 (cold, warm hit, or warm miss), and a final summary with queue, flow,
 pending-byte, allocated-buffer, relay, syscall, CPU, warm-session-pool, and
-failure counters. Event delivery uses a bounded queue; the final
+failure counters. `udp_dropped_jobs` counts accepted datagrams that workers
+fail to forward (setup/send errors, expired writes, DNS stream capacity, or an
+incomplete DNS frame lost with its stream), independently of `--debug`.
+It excludes synchronous syscall errors, missing replies, and jobs abandoned at
+process teardown; the summary is a snapshot, since UDP workers are detached.
+Event delivery uses a bounded queue; the final
 `dropped_metric_events` counter reports any records discarded under pressure.
 
 The TCP broker admits at most 16,384 active flows and reduces that limit when
@@ -132,7 +141,7 @@ Unsupported values fail startup instead of being ignored.
 
 `SUP_UDP_SOCKET_MODE=lazy|stable` is a deprecated alias for
 `--udp-socket-mode`. It still works but prints a notice and will be removed in
-the next release; it also has the lowest precedence, so the CLI flag and the
+the release after 0.5.0; it also has the lowest precedence, so the CLI flag and the
 configuration key both override it. The mode changes observable socket
 semantics rather than gating an internal data-plane implementation, which is
 why it belongs on the CLI instead of alongside the selectors above.
@@ -152,18 +161,51 @@ local broker leg rather than the requested remote peer. Route-affecting options
 such as `SO_BINDTODEVICE` can also prevent the target socket from reaching the
 loopback broker.
 
-Generic UDP redirection is experimental and currently models one request with
-at most one response. It does not preserve unsolicited, delayed, reordered, or
-multiple responses, ancillary data, or pre-existing epoll registrations. The
-default lazy mode creates the relay on the first proxied send and does not
-preserve aliases created before that point. Pass `--udp-socket-mode=stable`
-with `--enable-udp` to inject an endpoint at `socket(2)` time; this mode keeps
+Generic UDP redirection is experimental. Direct and SOCKS5 relay sends do not
+wait for responses: silent peers do not throttle subsequent datagrams. Once a
+transport exists, its receive path runs independently, including delayed,
+reordered, and multiple responses. Different direct/proxy peers have no shared
+response ordering guarantee. Ancillary data, connected-peer receive filtering,
+and pre-existing epoll registrations are not preserved.
+SOCKS5 sends intercepted through `sendto`, `sendmsg`, or `sendmmsg` reject
+payloads above 65497 bytes for IPv4 destinations or 65485 bytes for IPv6
+(including IPv4-mapped IPv6) with `EMSGSIZE`. These conservative limits reserve
+the 10/22-byte SOCKS5 header within a 65507-byte outer UDP envelope, before the
+association reveals the relay address. They also apply to IPv6 relay transports;
+direct and DNS paths retain their native destination-family limits. Smaller
+path-MTU limits or other asynchronous send failures remain possible and are
+counted by `udp_dropped_jobs` when observed by the worker.
+Emulated receives report `msg_controllen = 0` when returning no ancillary data.
+The default lazy mode creates the relay on the first proxied send and does not
+preserve aliases created before that point. Aliases made after replacement
+share the relay, which survives until the last alias closes.
+Pass `--udp-socket-mode=stable` with `--enable-udp` to inject an endpoint at
+`socket(2)` time; this mode keeps
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
-using `SO_COOKIE` as the primary relay key. Stable mode also enables the
-virtualized `sendmmsg(2)`/`recvmmsg(2)` and socket-query paths described below.
-Active UDP relay creation is capped at 128, with a bounded 16-datagram input
-queue per relay. A dedicated low-priority supervisor thread reclaims relays
-whose AF_UNIX inode no longer has an open target-side alias, so its host-wide
+using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
+every mode, including the first proxied batch; receive-supervisor handling of
+`recvmmsg(2)` remains a stable-mode feature. Empty `sendmmsg(2)` batches retain
+kernel descriptor validation (`EBADF`/`ENOTSOCK`). Active UDP relay creation is
+capped at 128; exhausting this budget returns `ENOBUFS` from the operation
+creating the relay (`socket` in stable mode, or the first proxied send/connect
+in lazy mode). Each relay has separate bounded 16-datagram input queues for
+direct, SOCKS5, and DNS traffic. Each route has its own pending send;
+a stalled established transport does not block sends on other routes. Queues
+apply backpressure independently (or `EAGAIN` for nonblocking sends). A thread
+blocked sending to a full DNS queue must still return before it can issue its
+next call, and all DNS destinations share one route queue. Successful
+sends acknowledge queue admission, not remote delivery; queue overflow, network
+errors, and closing/exiting before queued work is forwarded can still lose data.
+`--connect-timeout` bounds proxy setup and stalled writes, not the time allowed
+for a UDP reply. Initial proxy setup remains blocking and can delay both
+forwarding and worker retirement until its deadline. After setup, reaping wakes
+the I/O worker immediately, without waiting for a silent peer. Dropping the
+last supervisor relay handle also shuts down both workers automatically. A
+`sendmmsg(2)` batch that outpaces the relay worker reports only the enqueued
+entries as its sent count — like a kernel socket whose send buffer has filled
+— so a large batch under `MSG_DONTWAIT` can partially commit. A dedicated
+low-priority supervisor thread reclaims relays whose AF_UNIX inode no longer
+has an open target-side alias, so its host-wide
 `/proc/net/unix` read never stalls the receive reactor. It sweeps every second
 and, after five consecutive sweeps that reclaim nothing, backs off up to 30
 seconds; reclaiming a relay or creating a new one restores the base cadence.
@@ -173,18 +215,34 @@ procfs, and an unavailable `/proc/net/unix` delays cleanup instead of breaking
 creation while capacity remains.
 
 UDP redirection covers `sendto(2)`, `sendmsg(2)`, `recvfrom(2)`, and
-`recvmsg(2)`. Stable mode also rewrites explicit destinations in `sendmmsg(2)`
-and serves `recvmmsg(2)` through the receive supervisor. Stable mode also
-virtualizes `getsockname(2)`, `getpeername(2)`, and the common
+`recvmsg(2)`. `sendmmsg(2)` entries are rewritten and virtualized in every
+mode, creating a lazy/DNS relay when the first batch needs proxy routing.
+Mixed direct/proxy batches retain per-entry routing and partial-error results.
+Stable mode serves `recvmmsg(2)` through the receive supervisor. Every relay
+mode virtualizes `getsockname(2)`, `getpeername(2)`, and the common
 `SOL_SOCKET` identity options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, and
 `SO_ERROR`) for AF_INET/AF_INET6 UDP sockets. The reported bind and peer
 addresses are logical relay state; an unbound socket reports its family's
-wildcard address with port zero, and an explicitly bound port zero is not
-replaced with a kernel-assigned ephemeral port. Logical operations reject
-invalid destination ports and unsupported families before creating a relay.
-AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
+wildcard address with port zero. Lazy/DNS queries preserve the local address
+observed before replacement until a direct worker allocates a local socket;
+that snapshot does not reserve the original port or describe the proxy's
+external source address. Stable `bind(2)` reserves a real local UDP
+socket immediately, so port zero becomes a kernel-assigned ephemeral port
+before `getsockname(2)` returns; direct sends reuse that reservation.
+Stable sends and connects also reserve an automatic local port before
+returning, so a subsequent `bind(2)` fails with `EINVAL`. This reservation is
+made even for proxy-only traffic, where it does not carry the outbound packets;
+a newly created socket without bind/connect/send does not reserve a port.
+The local port is released during relay cleanup after the last alias closes
+(and after its workers exit), rather than synchronously with `close(2)`.
+A proxy's external source port can still differ.
+Logical operations reject invalid destination ports and unsupported families
+before creating a relay.
+AF_INET sockets reject IPv6 destinations, while relayed AF_INET6 sockets model
 Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations;
-their logical addresses are reported in the socket's own family, so a
+their direct transport retains that family across destination changes in
+stable, lazy, and DNS-only modes.
+Their logical addresses are reported in the socket's own family, so a
 dual-stack peer or response source appears as a v4-mapped IPv6 address.
 Destination names are read the way the target socket reads them: a zero-length
 name fails `sendto(2)` and falls back to the connected peer in `sendmsg(2)`, an
@@ -192,9 +250,13 @@ name fails `sendto(2)` and falls back to the connected peer in `sendmsg(2)`, an
 AF_INET6 ones, and any other family is rejected with that socket's error.
 Bind remains strict-family, including Linux's IPv6 length checks and IPv4
 `AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
-`AF_UNSPEC` connect clears the peer, after which destination-free sends fail
-with `EDESTADDRREQ`. Virtualized integer socket options preserve Linux's
-short-buffer truncation and negative-length rejection rules. For
+`AF_UNSPEC` connect clears the peer and, in stable mode, releases local ports
+not locked by an explicit nonzero bind while retaining any explicitly bound
+local IP, including after `bind(address, 0)`. Subsequent sends and connects use
+that address when reserving a new port. Destination-free sends then fail
+with `EDESTADDRREQ`. Port release completes before disconnect returns, even
+while the worker is blocked in proxy setup. Virtualized integer socket options
+preserve Linux's short-buffer truncation and negative-length rejection rules. For
 unconnected request/response traffic, `recvfrom(2)`, `recvmsg(2)`, and each
 `recvmmsg(2)` entry report the numeric source from the SOCKS5 UDP response header
 or the direct worker's kernel peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`,
@@ -213,6 +275,19 @@ are armed, the earlier deadline keeps its own expiry result. Lazy replacement
 transfers a pre-existing `SO_RCVTIMEO` to the injected endpoint. SOCKS5
 domain-name response sources, `msg_control` data, error queues, and other
 IP-level option semantics remain limited.
+
+DNS-over-TCP pipelines queries without waiting for earlier answers and retains
+partial TCP frames across readiness events. Each relay keeps at most 16 streams,
+one per original DNS destination, so reordered replies retain the correct source
+even when destinations reuse transaction IDs. Each stream buffers at most one
+outgoing and one incoming frame; failed streams are discarded and later queries
+reconnect. In-flight queries are not automatically replayed after failure.
+Requests exceeding the stream limit are dropped and counted in
+`udp_dropped_jobs` (details with `--debug`). Streams are not evicted while
+healthy, so a long-lived relay that fills all slots rejects new destinations
+until a stream fails or the relay closes.
+SOCKS5 replies with domain-name sources are also dropped because no numeric
+source address can be reported reliably.
 
 HTTP CONNECT proxies are supported for TCP and DNS-over-TCP. Generic UDP
 redirection requires a SOCKS5 proxy because it uses SOCKS5 UDP ASSOCIATE.

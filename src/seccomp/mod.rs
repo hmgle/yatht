@@ -127,10 +127,10 @@ impl TrapSet {
             bind: false,
             sendto: true,
             sendmsg: true,
-            sendmmsg: false,
-            getsockname: false,
-            getpeername: false,
-            getsockopt: false,
+            sendmmsg: true,
+            getsockname: true,
+            getpeername: true,
+            getsockopt: true,
             recvfrom: true,
             recvmsg: true,
             recvmmsg: false,
@@ -595,13 +595,27 @@ mod tests {
     #[test]
     fn dns_filter_keeps_udp_socket_creation_in_kernel() {
         let filter = socket_filter(TrapSet::with_dns());
-        assert_eq!(filter.len(), 15);
+        assert_eq!(filter.len(), 19);
         assert!(!filter
             .iter()
             .any(|instruction| instruction.k == libc::SYS_socket as u32));
         assert!(!filter
             .iter()
             .any(|instruction| instruction.k == libc::SYS_recvmmsg as u32));
+        // A lazy or DNS relay replaces the fd, so batched named sends must be
+        // virtualized rather than continued into the AF_UNIX endpoint.
+        assert!(filter
+            .iter()
+            .any(|instruction| instruction.k == libc::SYS_sendmmsg as u32));
+        for syscall in [
+            libc::SYS_getsockname,
+            libc::SYS_getpeername,
+            libc::SYS_getsockopt,
+        ] {
+            assert!(filter
+                .iter()
+                .any(|instruction| instruction.k == syscall as u32));
+        }
     }
 
     #[test]

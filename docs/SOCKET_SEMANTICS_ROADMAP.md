@@ -78,8 +78,11 @@ regressions in the integration matrix, and bounded memory under a stalled peer.
 ## Milestone 2: Stable UDP Creation
 
 UDP now has an opt-in virtual-socket mode when generic UDP interception is
-enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
-`lazy` keeps the existing first-send replacement path.
+enabled. Select it with `--enable-udp --udp-socket-mode=stable` or the
+`udp_socket_mode = "stable"` configuration key with `enable_udp = true`.
+The default `lazy` mode keeps the first-send replacement path.
+`SUP_UDP_SOCKET_MODE` is a deprecated, lowest-precedence alias retained for
+0.5.0 and scheduled for removal in the following release.
 
 1. [x] Trap `socket(AF_INET/AF_INET6, SOCK_DGRAM, ...)` and inject the relay
    endpoint as the syscall result with `SECCOMP_ADDFD_FLAG_SEND`.
@@ -90,14 +93,21 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
    only as a lookup cache. This naturally follows dup and fork aliases. Stable
    cleanup confirms that an AF_UNIX inode has disappeared from
    `/proc/net/unix`, which happens only after the final target alias closes. A
-   low-frequency reactor sweep releases idle workers; capacity-bound admission
+   dedicated low-priority reaper releases idle workers, backing off from one
+   second to at most 30 seconds after unproductive sweeps; capacity-bound admission
    sweeps and retries briefly. Normal creation does not scan procfs, and
    procfs read failures defer cleanup rather than failing below-capacity calls.
 4. [x] Relay direct and proxied destinations through the same stable endpoint
    once virtualized; destination-based bypass is decided per datagram.
-5. [x] Stable mode rewrites `sendmmsg(2)` and virtualizes `getsockname(2)`,
+5. [x] All relay modes virtualize `sendmmsg(2)`, including the first lazy/DNS
+   batch and mixed direct/proxy routing, as well as `getsockname(2)`,
    `getpeername(2)`, and the common `SOL_SOCKET` identity options for the
-   logical AF_INET/AF_INET6 UDP socket. Logical operations preserve native
+   logical AF_INET/AF_INET6 UDP socket. Aliases created after lazy replacement
+   share relay ownership; pre-replacement aliases still require stable mode.
+   Stable bind/connect/send reserve a real local port synchronously, and
+   disconnect releases unlocked ports while retaining an explicitly bound IP.
+   Direct transports retain the logical socket family across destination
+   changes. Logical operations preserve native
    destination and bind family rules, default IPv6 dual-stack destinations,
    disconnected sends, `AF_UNSPEC` connect/bind cases, invalid port errors,
    and short or negative `getsockopt(2)` lengths. Destination names follow the
@@ -137,9 +147,12 @@ enabled. The mode is selected with `SUP_UDP_SOCKET_MODE=stable`; unset or
 9. [ ] Virtualize `IPV6_V6ONLY` so stable IPv6 sockets can opt out of the
    currently modeled default dual-stack destination policy.
 10. [~] SOCKS5 domain-name response sources, `msg_control` data, ancillary data,
-   unsolicited datagrams, error queues, and multi-response ordering remain open
+   unsolicited datagrams and error queues remain open
    compatibility work. These need explicit support or an unsupported policy;
-   the batch source-queue consistency issue is closed.
+   the batch source-queue consistency issue is closed. Established transports
+   receive delayed, reordered, and multiple replies independently of sends;
+   separate direct/SOCKS5/DNS queues isolate established-route backpressure.
+   No response ordering is guaranteed across different routes or peers.
 
 AF_UNIX cannot receive arbitrary IP error-queue entries or generate matching
 `EPOLLERR` state. `IP_RECVERR`, `MSG_ERRQUEUE`, packet-info control messages,

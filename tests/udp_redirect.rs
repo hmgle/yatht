@@ -576,6 +576,35 @@ fn stable_udp_matches_send_destination_semantics() {
 }
 
 #[test]
+fn empty_udp_sendmmsg_preserves_kernel_fd_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_empty_batch");
+    assert!(Command::new("cc")
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/probes/udp_empty_batch.c",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    assert_success(&Command::new(&probe).output().unwrap());
+    for mode in ["stable", "lazy", "dns"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+        command.args(["--proxy", "socks5://127.0.0.1:9"]);
+        if mode == "dns" {
+            command.arg("--enable-dns");
+        } else {
+            command.args(["--enable-udp", "--udp-socket-mode", mode]);
+        }
+        assert_success(&command.arg("--").arg(&probe).output().unwrap());
+    }
+}
+
+#[test]
 fn lazy_udp_matches_send_destination_semantics() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1363,6 +1392,89 @@ fn stable_udp_direct_receive_reports_actual_response_source() {
 }
 
 #[test]
+fn udp_relays_preserve_direct_dual_stack_family_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_direct_family");
+    assert!(Command::new("cc")
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/probes/udp_direct_family.c",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["native", "lazy", "dns", "stable"] {
+        let v4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let v6 = UdpSocket::bind("[::1]:0").unwrap();
+        let ports = [
+            v4.local_addr().unwrap().port(),
+            v6.local_addr().unwrap().port(),
+        ];
+        let echoes: Vec<_> = [v4, v6]
+            .into_iter()
+            .enumerate()
+            .map(|(index, socket)| {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                thread::spawn(move || {
+                    for _ in 0..if index == 0 { 2 } else { 1 } {
+                        let mut query = [0];
+                        let Ok((n, peer)) = socket.recv_from(&mut query) else {
+                            return;
+                        };
+                        socket.send_to(&query[..n], peer).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let dns = (mode != "native").then(|| {
+            thread::spawn(move || {
+                let (mut stream, _) = socks.accept().unwrap();
+                socks5_greet(&mut stream);
+                read_socks5_request(&mut stream);
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                let mut query = [0; 3];
+                stream.read_exact(&mut query).unwrap();
+                assert_eq!(query, [0, 1, b'p']);
+                stream.write_all(&query).unwrap();
+                let _ = stream.read(&mut [0]);
+            })
+        });
+        let mut command = if mode == "native" {
+            Command::new(&probe)
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+            command.args(["--enable-dns", "--proxy", &format!("socks5://{socks_addr}")]);
+            if mode != "dns" {
+                command.args(["--enable-udp", "--udp-socket-mode", mode]);
+            }
+            command.arg("--").arg(&probe);
+            command
+        };
+        let output = command
+            .arg(ports[0].to_string())
+            .arg(ports[1].to_string())
+            .arg(if mode == "native" { "0" } else { "1" })
+            .output()
+            .unwrap();
+        for echo in echoes {
+            echo.join().unwrap();
+        }
+        if let Some(dns) = dns {
+            dns.join().unwrap();
+        }
+        assert_success(&output);
+    }
+}
+
+#[test]
 fn stable_udp_proxy_receive_reports_socks5_response_source() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1480,6 +1592,128 @@ fn stable_udp_socket_survives_bind_dup_close_and_fork() {
 }
 
 #[test]
+fn lazy_udp_socket_survives_bind_dup_close_and_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_lazy_alias");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_lazy_alias.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = udp.local_addr().unwrap().port().to_be_bytes();
+    udp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let server = thread::spawn(move || {
+        let (mut client, _) = tcp.accept().unwrap();
+        socks5_greet(&mut client);
+        let _ = read_socks5_request(&mut client);
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
+            .unwrap();
+        for _ in 0..5 {
+            let mut packet = [0; 128];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            let (_, payload) = parse_udp_packet(&packet[..n]);
+            assert_eq!(payload, b"alias");
+            udp.send_to(&packet[..n], peer).unwrap();
+        }
+        let _ = client.read(&mut [0]);
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args([
+            "--udp-socket-mode",
+            "lazy",
+            "--enable-udp",
+            "--proxy",
+            &format!("socks5://{tcp_addr}"),
+            "--",
+        ])
+        .arg(probe)
+        .arg("198.51.100.11:4455")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    server.join().unwrap();
+}
+
+#[test]
+fn lazy_and_dns_udp_queries_report_internet_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_lazy_identity");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_lazy_identity.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for enable in ["--enable-udp", "--enable-dns"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                enable,
+                "--udp-socket-mode",
+                "lazy",
+                "--proxy",
+                "socks5://127.0.0.1:9",
+                "--",
+            ])
+            .arg(&probe)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+}
+
+#[test]
+fn udp_relay_limit_reports_enobufs() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_relay_limit");
+    assert!(Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg("tests/probes/udp_relay_limit.c")
+        .arg("-o")
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["stable", "lazy"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                "--udp-socket-mode",
+                mode,
+                "--proxy",
+                "socks5://127.0.0.1:9",
+                "--proxy-local",
+                "--enable-udp",
+                "--",
+            ])
+            .arg(&probe)
+            .arg(mode)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+}
+
+#[test]
 fn stable_udp_reclaims_closed_socket_capacity() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
@@ -1502,6 +1736,250 @@ fn stable_udp_reclaims_closed_socket_capacity() {
         String::from_utf8_lossy(&output.stdout),
         "stable-lifetime-ok"
     );
+}
+
+#[test]
+fn stable_udp_getsockname_reports_bound_port() {
+    udp_getsockname_reports_bound_port(true);
+}
+
+#[test]
+fn stable_udp_rejects_bind_after_send_or_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_autobind");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_autobind.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    assert_success(&Command::new(&probe).output().unwrap());
+    for proxy_local in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+        command.args([
+            "--enable-udp",
+            "--udp-socket-mode",
+            "stable",
+            "--proxy",
+            "socks5://127.0.0.1:9",
+        ]);
+        if proxy_local {
+            command.arg("--proxy-local");
+        }
+        let output = command.arg("--").arg(&probe).output().unwrap();
+        assert_success(&output);
+    }
+}
+
+#[test]
+fn direct_kernel_udp_getsockname_reports_bound_port() {
+    udp_getsockname_reports_bound_port(false);
+}
+
+#[test]
+fn udp_disconnect_releases_ports_during_stalled_dns_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_disconnect_port");
+    assert!(Command::new("cc")
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/probes/udp_disconnect_port.c",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for relayed in [false, true] {
+        for (family, bind_ip) in [
+            ("4", "0.0.0.0"),
+            ("4", "127.0.0.2"),
+            ("6", "::"),
+            ("6", "::1"),
+        ] {
+            let bind_ip: std::net::IpAddr = bind_ip.parse().unwrap();
+            for binding in ["0", "1", "2"] {
+                if binding == "0" && !bind_ip.is_unspecified() {
+                    continue;
+                }
+                let udp = UdpSocket::bind(if family == "4" {
+                    "127.0.0.1:0"
+                } else {
+                    "[::1]:0"
+                })
+                .unwrap();
+                udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let port = udp.local_addr().unwrap().port();
+                let loopback_ip = udp.local_addr().unwrap().ip();
+                let source_ip = if bind_ip.is_unspecified() {
+                    loopback_ip
+                } else {
+                    bind_ip
+                };
+                let echo = thread::spawn(move || {
+                    for round in 0..if binding == "1" { 4 } else { 2 } {
+                        let mut query = [0];
+                        let Ok((n, peer)) = udp.recv_from(&mut query) else {
+                            return;
+                        };
+                        assert_eq!(
+                            peer.ip(),
+                            if round == 3 { loopback_ip } else { source_ip },
+                            "direct source address changed"
+                        );
+                        udp.send_to(&query[..n], peer).unwrap();
+                    }
+                });
+                let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+                let reservation = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).unwrap();
+                let explicit_port = reservation.local_addr().unwrap().port();
+                drop(reservation);
+                let mut command = if relayed {
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+                    command
+                        .args([
+                            "--enable-udp",
+                            "--enable-dns",
+                            "--udp-socket-mode",
+                            "stable",
+                            "--proxy",
+                            &format!("socks5://{}", socks.local_addr().unwrap()),
+                            "--connect-timeout",
+                            "5s",
+                            "--",
+                        ])
+                        .arg(&probe);
+                    command
+                } else {
+                    Command::new(&probe)
+                };
+                let mut child = command
+                    .args([
+                        family,
+                        &port.to_string(),
+                        binding,
+                        if relayed { "1" } else { "0" },
+                        &explicit_port.to_string(),
+                        &bind_ip.to_string(),
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdout = BufReader::new(child.stdout.take().unwrap());
+                let mut line = String::new();
+                stdout.read_line(&mut line).unwrap();
+                let old_port: u16 = line
+                    .strip_prefix("ready ")
+                    .expect("probe did not bind")
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let control = relayed.then(|| {
+                    let (mut stream, _) = socks.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting).unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    // No reply yet: the I/O worker cannot process its wake fd.
+                    stream
+                });
+                child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+                line.clear();
+                stdout.read_line(&mut line).unwrap();
+                let released = line == "released\n";
+                if !released {
+                    drop(control);
+                    let output = child.wait_with_output().unwrap();
+                    assert_success(&output);
+                    panic!("disconnect did not report its released state: {line:?}");
+                }
+                // Check from outside the supervised process: a stable-mode
+                // close intentionally retains its reservation until reaping.
+                let collision = UdpSocket::bind(SocketAddr::new(bind_ip, old_port));
+                if binding == "2" {
+                    assert_eq!(
+                        collision.unwrap_err().raw_os_error(),
+                        Some(libc::EADDRINUSE)
+                    );
+                } else {
+                    drop(collision.expect("disconnect left the old port occupied"));
+                }
+                let dns = control.map(|mut stream| {
+                    thread::spawn(move || {
+                        stream.write_all(&[5, 0]).unwrap();
+                        read_socks5_request(&mut stream);
+                        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                        let mut query = [0; 3];
+                        let _ = stream.read_exact(&mut query);
+                        let _ = stream.read(&mut [0]);
+                    })
+                });
+                child.stdin.take().unwrap().write_all(b"x").unwrap();
+                let output = child.wait_with_output().unwrap();
+                echo.join().unwrap();
+                if let Some(dns) = dns {
+                    dns.join().unwrap();
+                }
+                assert_success(&output);
+            }
+        }
+    }
+}
+
+fn udp_getsockname_reports_bound_port(stable: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_bound_port");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_bound_port.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for (family, bind) in [("4", "127.0.0.1:0"), ("6", "[::1]:0")] {
+        let server = UdpSocket::bind(bind).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let echo = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut payload = [0; 2];
+                let (n, peer) = server.recv_from(&mut payload).unwrap();
+                assert_eq!(n, 2);
+                assert_eq!(u16::from_be_bytes(payload), peer.port());
+                server.send_to(&payload, peer).unwrap();
+            }
+        });
+        let mut command = if stable {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+            command.args(["--enable-udp", "--udp-socket-mode", "stable", "--"]);
+            command.arg(&probe);
+            command
+        } else {
+            Command::new(&probe)
+        };
+        let output = command.arg(family).arg(port.to_string()).output().unwrap();
+        assert_success(&output);
+        echo.join().unwrap();
+    }
 }
 
 #[test]
@@ -1658,6 +2136,22 @@ fn stable_udp_connected_socket_reports_logical_peer() {
 
 #[test]
 fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
+    udp_sendmmsg_routes_first_batch("stable", false, false);
+}
+
+#[test]
+fn lazy_udp_sendmmsg_creates_relay_on_first_batch() {
+    udp_sendmmsg_routes_first_batch("lazy", false, false);
+}
+
+#[test]
+fn lazy_udp_first_sendmmsg_preserves_mixed_routes_and_connected_peer() {
+    for connected in [false, true] {
+        udp_sendmmsg_routes_first_batch("lazy", true, connected);
+    }
+}
+
+fn udp_sendmmsg_routes_first_batch(mode: &str, mixed: bool, connected: bool) {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
@@ -1669,6 +2163,21 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
     let udp_addr = udp.local_addr().unwrap();
     let destination = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 12), 4466));
     let (payload_tx, payload_rx) = mpsc::channel();
+    let direct = mixed.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let direct_port = direct
+        .as_ref()
+        .map(|socket| socket.local_addr().unwrap().port());
+    let direct_thread = direct.map(|socket| {
+        thread::spawn(move || {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0; 64];
+            let (n, peer) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"batch-one");
+            socket.send_to(b"batch-one-ok", peer).unwrap();
+        })
+    });
 
     let socks_thread = thread::spawn(move || {
         let (mut client, _) = tcp.accept().unwrap();
@@ -1679,7 +2188,10 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
             .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
             .unwrap();
 
-        for response in [b"batch-one-ok".as_slice(), b"batch-two-ok".as_slice()] {
+        for response in [b"batch-one-ok".as_slice(), b"batch-two-ok".as_slice()]
+            .into_iter()
+            .skip(usize::from(mixed))
+        {
             let mut packet = vec![0_u8; 2048];
             let (n, peer) = udp.recv_from(&mut packet).unwrap();
             packet.truncate(n);
@@ -1693,9 +2205,16 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
         let _ = client.read(&mut keepalive);
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    if let Some(port) = direct_port {
+        command.env("YATHT_TEST_DIRECT_PORT", port.to_string());
+    }
+    if connected {
+        command.env("YATHT_TEST_CONNECTED", "1");
+    }
+    let output = command
         .arg("--udp-socket-mode")
-        .arg("stable")
+        .arg(mode)
         .arg("--proxy")
         .arg(format!("socks5://{tcp_addr}"))
         .arg("--enable-udp")
@@ -1706,19 +2225,71 @@ fn stable_udp_sendmmsg_routes_batch_and_recvmmsg_reads_responses() {
         .unwrap();
 
     assert_success(&output);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "batch-one-ok:batch-two-ok"
-    );
-    assert_eq!(
-        payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        (destination, b"batch-one".to_vec())
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut responses = stdout.split(':').collect::<Vec<_>>();
+    if mixed {
+        // Independent direct/proxy peers have no cross-transport reply order.
+        // Both requests and their route assertions below must still succeed.
+        responses.sort_unstable();
+    }
+    assert_eq!(responses, ["batch-one-ok", "batch-two-ok"]);
+    if !mixed {
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (destination, b"batch-one".to_vec())
+        );
+    }
     assert_eq!(
         payload_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         (destination, b"batch-two".to_vec())
     );
     socks_thread.join().unwrap();
+    if let Some(thread) = direct_thread {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+fn dns_sendmmsg_creates_relay_on_first_batch() {
+    let (_probe_dir, probe) = build_udp_mmsg_probe();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut client, _) = socks.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socks5_greet(&mut client);
+        let _ = read_socks5_request(&mut client);
+        client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        for query in [b"batch-one", b"batch-two"] {
+            let mut len = [0; 2];
+            client.read_exact(&mut len).unwrap();
+            let mut payload = vec![0; u16::from_be_bytes(len) as usize];
+            client.read_exact(&mut payload).unwrap();
+            assert_eq!(payload, query);
+            client.write_all(&12_u16.to_be_bytes()).unwrap();
+            client.write_all(query).unwrap();
+            client.write_all(b"-ok").unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args([
+            "--proxy",
+            &format!("socks5://{socks_addr}"),
+            "--enable-dns",
+            "--",
+        ])
+        .arg(probe)
+        .arg("198.51.100.12:53")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "batch-one-ok:batch-two-ok"
+    );
+    server.join().unwrap();
 }
 
 #[test]
@@ -2089,6 +2660,7 @@ fn build_udp_mmsg_probe() -> (TempDir, PathBuf) {
         &src,
         r#"
 #define _GNU_SOURCE
+#include <errno.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdlib.h>
@@ -2121,7 +2693,7 @@ int main(int argc, char **argv) {
         { .iov_base = first, .iov_len = sizeof(first) - 1 },
         { .iov_base = second, .iov_len = sizeof(second) - 1 },
     };
-    struct mmsghdr send_msgs[2];
+    struct mmsghdr send_msgs[3];
     memset(send_msgs, 0, sizeof(send_msgs));
     for (int i = 0; i < 2; ++i) {
         send_msgs[i].msg_hdr.msg_name = &dest;
@@ -2129,7 +2701,43 @@ int main(int argc, char **argv) {
         send_msgs[i].msg_hdr.msg_iov = &send_iov[i];
         send_msgs[i].msg_hdr.msg_iovlen = 1;
     }
-    if (sendmmsg(fd, send_msgs, 2, 0) != 2) return 7;
+    struct sockaddr_in direct = { .sin_family = AF_INET,
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    const char *direct_port = getenv("YATHT_TEST_DIRECT_PORT");
+    if (direct_port) {
+        direct.sin_port = htons(atoi(direct_port));
+        send_msgs[0].msg_hdr.msg_name = &direct;
+        if (getenv("YATHT_TEST_CONNECTED")) {
+            if (connect(fd, (struct sockaddr *)&direct, sizeof(direct))) return 17;
+            send_msgs[0].msg_hdr.msg_name = NULL;
+            send_msgs[0].msg_hdr.msg_namelen = 0;
+        }
+    }
+    /* A later unsupported family must neither bypass the proxy for the
+       entire fresh batch nor discard the successfully sent prefix. */
+    struct sockaddr bad_name = { .sa_family = AF_UNIX };
+    send_msgs[2].msg_hdr = send_msgs[0].msg_hdr;
+    send_msgs[2].msg_hdr.msg_name = &bad_name;
+    send_msgs[2].msg_hdr.msg_namelen = sizeof(bad_name);
+    send_msgs[2].msg_len = 12345;
+    if (sendmmsg(fd, send_msgs, 3, 0) != 2 || send_msgs[2].msg_len != 12345) return 7;
+
+    /* An oversized named entry reports the first message's error. */
+    static char big[65508];
+    memset(big, 'x', sizeof big);
+    struct iovec split[2] = {
+        { .iov_base = big, .iov_len = 60000 },
+        { .iov_base = big, .iov_len = 5508 },
+    };
+    struct mmsghdr oversized;
+    memset(&oversized, 0, sizeof(oversized));
+    oversized.msg_hdr.msg_name = &dest;
+    oversized.msg_hdr.msg_namelen = sizeof(dest);
+    oversized.msg_hdr.msg_iov = split;
+    oversized.msg_hdr.msg_iovlen = 2;
+    errno = 0;
+    if (sendmmsg(fd, &oversized, 1, 0) != -1 || errno != EMSGSIZE) return 16;
+
     if (send_msgs[0].msg_len != sizeof(first) - 1 ||
         send_msgs[1].msg_len != sizeof(second) - 1) return 8;
 
@@ -2469,7 +3077,12 @@ int main(int argc, char **argv) {
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
+    unsigned char control[64];
+    memset(control, 0xa5, sizeof(control));
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
     ssize_t n = recvmsg(fd, &msg, 0);
+    if (msg.msg_controllen != 0 || CMSG_FIRSTHDR(&msg) != NULL) return 12;
     if (n < 0) return 9;
     if (peer.sin_family != AF_INET ||
         peer.sin_port != dest.sin_port ||
@@ -2778,6 +3391,8 @@ int main(int argc, char **argv) {
     if (memcmp(peek, response, sizeof(peek)) != 0) return 9;
 
     char received[9];
+    unsigned char control[64];
+    memset(control, 0xa5, sizeof(control));
     struct iovec iov = { .iov_base = received, .iov_len = sizeof(received) };
     struct sockaddr_in msg_source;
     struct msghdr msg;
@@ -2787,8 +3402,11 @@ int main(int argc, char **argv) {
     msg.msg_namelen = sizeof(msg_source);
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
     ssize_t received_len = recvmsg(fd, &msg, 0);
     if (received_len != (ssize_t)sizeof(received)) return 10;
+    if (msg.msg_controllen != 0 || CMSG_FIRSTHDR(&msg) != NULL) return 15;
     if ((msg.msg_flags & MSG_TRUNC) == 0) return 11;
     if (msg.msg_namelen != sizeof(msg_source) ||
         !same_address(&msg_source, &expected_source)) return 12;
@@ -3337,6 +3955,168 @@ static int check_iovec_import_order(void) {
     return close(fd);
 }
 
+/* `udp_sendmsg` itself refuses only a datagram over the UDP length field;
+ * the tighter IP-layer ceiling (65507 on the IPv4 transmission path, 65527
+ * on IPv6) surfaces once a destination is known. The ceiling follows the
+ * destination's transmission family, not the socket family: a v4-mapped
+ * name on a dual-stack socket takes the IPv4 ceiling. */
+static int check_datagram_size_limits(void) {
+    static char payload[70000];
+    memset(payload, 'x', sizeof payload);
+
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "127.0.0.1", &ipv4.sin_addr) != 1) return -1;
+
+    struct sockaddr_in6 mapped;
+    memset(&mapped, 0, sizeof(mapped));
+    mapped.sin6_family = AF_INET6;
+    mapped.sin6_port = htons(9);
+    if (inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped.sin6_addr) != 1) return -1;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    /* Use direct loopback routing to test the native IP ceiling. Proxied
+     * envelope limits are covered separately by udp_payload_limit.c. */
+    /* 65507 sits at the IPv4 ceiling: it must not be answered EMSGSIZE. */
+    errno = 0;
+    if (sendto(fd, payload, 65507, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) == -1 &&
+        errno == EMSGSIZE) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, payload, 65508, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, payload, 65535, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+
+    /* An iovec split around the ceiling hits the same verdict. */
+    struct iovec split[2] = {
+        { .iov_base = payload, .iov_len = 60000 },
+        { .iov_base = payload, .iov_len = 5508 },
+    };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &ipv4;
+    msg.msg_namelen = sizeof(ipv4);
+    msg.msg_iov = split;
+    msg.msg_iovlen = 2;
+
+    errno = 0;
+    if (sendmsg(fd, &msg, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
+
+    /* The length verdict precedes the missing-destination one. */
+    errno = 0;
+    if (sendto(fd, payload, 70000, 0, NULL, 0) != -1 || errno != EMSGSIZE) {
+        close(fd); return -1;
+    }
+
+    /* A connected socket sending with no name still hits the family ceiling
+     * of its recorded peer once the datagram is over the UDP length field. */
+    if (close(fd) != 0) return -1;
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&ipv4, sizeof(ipv4)) != 0) { close(fd); return -1; }
+    errno = 0;
+    if (sendto(fd, payload, 65508, 0, NULL, 0) != -1 || errno != EMSGSIZE) {
+        close(fd); return -1;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &ipv4;
+    msg.msg_namelen = 0;
+    msg.msg_iov = split;
+    msg.msg_iovlen = 2;
+    errno = 0;
+    if (sendmsg(fd, &msg, 0) != -1 || errno != EMSGSIZE) { close(fd); return -1; }
+    if (close(fd) != 0) return -1;
+
+    /* A dual-stack socket sending a v4-mapped name keeps the IPv4 ceiling. */
+    fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    errno = 0;
+    if (sendto(fd, payload, 65508, 0, (struct sockaddr *)&mapped, sizeof(mapped)) != -1 ||
+        errno != EMSGSIZE) { close(fd); return -1; }
+    return close(fd);
+}
+
+/* sendmmsg clamps vlen to UIO_MAXIOV instead of rejecting it. The fresh
+ * socket has no relay yet, so lazy runs take the kernel's own clamp while
+ * stable runs exercise the virtualized one; through the dead proxy the
+ * virtualized batch fails fast in the relay worker and the syscall still
+ * reports every entry sent. */
+static int check_sendmmsg_vlen_clamp(void) {
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    static struct mmsghdr msgs[1200];
+    static struct iovec iovs[1200];
+    static char one = 'x';
+    for (int i = 0; i < 1200; ++i) {
+        iovs[i].iov_base = &one;
+        iovs[i].iov_len = 1;
+        msgs[i].msg_hdr.msg_name = &ipv4;
+        msgs[i].msg_hdr.msg_namelen = sizeof(ipv4);
+        msgs[i].msg_hdr.msg_iov = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    errno = 0;
+    if (sendmmsg(fd, msgs, 1200, 0) != 1024) { close(fd); return -1; }
+    return close(fd);
+}
+
+/* Once a proxied send has relay-ized the fd (lazily on first send or at
+ * socket creation in stable mode), a named sendmmsg entry must keep UDP
+ * semantics instead of reaching the injected AF_UNIX endpoint, which would
+ * reject the non-AF_UNIX name with EINVAL. */
+static int check_sendmmsg_on_relayed_socket(void) {
+    struct sockaddr_in ipv4;
+    memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    ipv4.sin_port = htons(9);
+    if (inet_pton(AF_INET, "203.0.113.1", &ipv4.sin_addr) != 1) return -1;
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (sendto(fd, "warm", 4, 0, (struct sockaddr *)&ipv4, sizeof(ipv4)) == -1 &&
+        (errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ENETDOWN)) {
+        close(fd);
+        return 0;
+    }
+    static char one = 'x';
+    struct iovec iov = { .iov_base = &one, .iov_len = 1 };
+    struct mmsghdr batch;
+    memset(&batch, 0, sizeof(batch));
+    batch.msg_hdr.msg_name = &ipv4;
+    batch.msg_hdr.msg_namelen = sizeof(ipv4);
+    batch.msg_hdr.msg_iov = &iov;
+    batch.msg_hdr.msg_iovlen = 1;
+    errno = 0;
+    if (sendmmsg(fd, &batch, 1, 0) != 1 &&
+        !(errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ENETDOWN)) {
+        close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+/* An empty sendmmsg batch reads no entry, so a null msgvec succeeds; a
+ * non-empty one still faults reading the array. */
+static int check_sendmmsg_empty_batch(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    errno = 0;
+    if (sendmmsg(fd, NULL, 0, 0) != 0) { close(fd); return -1; }
+    errno = 0;
+    if (sendmmsg(fd, NULL, 1, 0) != -1 || errno != EFAULT) { close(fd); return -1; }
+    return close(fd);
+}
+
 /* A dropped AF_UNSPEC name hands the datagram to the connected peer. Linux
  * only reaches a v4-mapped peer from the IPv4 fast path, which this call
  * bypasses, so the peer here is IPv6 to keep the check portable. */
@@ -3350,7 +4130,6 @@ static int check_connected_unspecified_name(const char *port) {
     int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) { close(fd); return -1; }
-
     struct sockaddr_in6 unspecified;
     memset(&unspecified, 0, sizeof(unspecified));
     unspecified.sin6_family = AF_UNSPEC;
@@ -3366,6 +4145,10 @@ int main(int argc, char **argv) {
     if (check_socket_relative_names() != 0) return 5;
     if (check_connected_unspecified_name(argv[1]) != 0) return 6;
     if (check_iovec_import_order() != 0) return 7;
+    if (check_datagram_size_limits() != 0) return 9;
+    if (check_sendmmsg_vlen_clamp() != 0) return 10;
+    if (check_sendmmsg_on_relayed_socket() != 0) return 11;
+    if (check_sendmmsg_empty_batch() != 0) return 12;
     if (write(STDOUT_FILENO, "send-destination-ok", 19) != 19) return 8;
     return 0;
 }
@@ -3706,6 +4489,8 @@ int main(int argc, char **argv) {
     };
     struct sockaddr_in sources[2];
     struct mmsghdr recv_msgs[2];
+    unsigned char controls[2][64];
+    memset(controls, 0xa5, sizeof(controls));
     memset(sources, 0, sizeof(sources));
     memset(recv_msgs, 0, sizeof(recv_msgs));
     for (int i = 0; i < 2; ++i) {
@@ -3713,9 +4498,15 @@ int main(int argc, char **argv) {
         recv_msgs[i].msg_hdr.msg_namelen = sizeof(sources[i]);
         recv_msgs[i].msg_hdr.msg_iov = &recv_iov[i];
         recv_msgs[i].msg_hdr.msg_iovlen = 1;
+        recv_msgs[i].msg_hdr.msg_control = controls[i];
+        recv_msgs[i].msg_hdr.msg_controllen = sizeof(controls[i]);
     }
     struct timespec batch_timeout = { .tv_sec = 5, .tv_nsec = 0 };
     if (recvmmsg(fd, recv_msgs, 2, MSG_TRUNC, &batch_timeout) != 2) return 8;
+    for (int i = 0; i < 2; ++i) {
+        if (recv_msgs[i].msg_hdr.msg_controllen != 0 ||
+            CMSG_FIRSTHDR(&recv_msgs[i].msg_hdr) != NULL) return 18;
+    }
     if (batch_timeout.tv_sec < 0 || batch_timeout.tv_sec >= 5 ||
         batch_timeout.tv_nsec < 0 || batch_timeout.tv_nsec >= 1000000000) return 17;
     if (recv_msgs[0].msg_len != strlen(responses[0]) ||
@@ -3820,6 +4611,20 @@ int main(void) {
 
     errno = 0;
     if (recvmmsg(fd, NULL, 0, MSG_DONTWAIT, NULL) != 0) return 3;
+
+    /* vlen above UIO_MAXIOV is clamped to 1024, not rejected. */
+    static struct mmsghdr clamp_msgs[1200];
+    static struct iovec clamp_iov[1200];
+    static char clamp_buf[1];
+    for (int i = 0; i < 1200; ++i) {
+        clamp_iov[i].iov_base = clamp_buf;
+        clamp_iov[i].iov_len = sizeof(clamp_buf);
+        clamp_msgs[i].msg_hdr.msg_iov = &clamp_iov[i];
+        clamp_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    errno = 0;
+    if (recvmmsg(fd, clamp_msgs, 1200, MSG_DONTWAIT, NULL) != -1 ||
+        errno != EAGAIN) return 15;
 
     errno = 0;
     if (recvmmsg(fd, NULL, 1, MSG_DONTWAIT, NULL) != -1 || errno != EFAULT) return 4;
@@ -3991,8 +4796,10 @@ int main(void) {
     if (recvmmsg(fd, &msg, 1, 0, &timeout) != 0) return 3;
     if (timeout.tv_sec != 0 || timeout.tv_nsec != 0) return 11;
     errno = 0;
+    /* vlen above UIO_MAXIOV is clamped, so the call proceeds to the usual
+       nonblocking empty-queue verdict instead of failing with EINVAL. */
     if (recvmmsg(fd, &msg, 1025, MSG_DONTWAIT, NULL) != -1 ||
-        errno != EINVAL) return 4;
+        errno != EAGAIN) return 4;
 
     /* A short explicit timespec still returns zero ahead of a longer armed
        SO_RCVTIMEO: the earlier deadline keeps its own expiry result. */
@@ -4868,4 +5675,523 @@ fn assert_success(output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn build_independent_udp_probe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_independent_io");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_independent_io.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    (dir, probe)
+}
+
+#[test]
+fn stable_direct_udp_sends_without_waiting_for_responses() {
+    independent_udp_io("stable", "direct");
+}
+
+#[test]
+fn stable_socks_udp_sends_without_waiting_for_responses() {
+    independent_udp_io("stable", "socks");
+}
+
+#[test]
+fn lazy_socks_udp_sends_without_waiting_for_responses() {
+    independent_udp_io("lazy", "socks");
+}
+
+#[test]
+fn dns_udp_pipelines_queries_and_preserves_partial_frames() {
+    independent_udp_io("lazy", "dns");
+}
+
+fn independent_udp_io(mode: &str, route: &str) {
+    let (_dir, probe) = build_independent_udp_probe();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let destination = if route == "dns" {
+        "198.51.100.12:53".parse().unwrap()
+    } else {
+        udp_addr
+    };
+    let route_owned = route.to_string();
+    let server = thread::spawn(move || {
+        let mut control = if route_owned == "direct" {
+            None
+        } else {
+            let (mut stream, _) = socks.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socks5_greet(&mut stream);
+            read_socks5_request(&mut stream);
+            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+            reply.extend_from_slice(&udp_addr.port().to_be_bytes());
+            stream.write_all(&reply).unwrap();
+            Some(stream)
+        };
+        let mut peer = None;
+        let started = Instant::now();
+        for i in 0..6 {
+            let query = if route_owned == "dns" {
+                let stream = control.as_mut().unwrap();
+                let mut frame = [0; 4];
+                stream.read_exact(&mut frame).unwrap();
+                assert_eq!(&frame[..2], &[0, 2]);
+                frame[2..].to_vec()
+            } else {
+                let mut buf = [0; 64];
+                let (n, source) = udp.recv_from(&mut buf).unwrap();
+                peer = Some(source);
+                if route_owned == "socks" {
+                    parse_udp_packet(&buf[..n]).1.to_vec()
+                } else {
+                    buf[..n].to_vec()
+                }
+            };
+            assert_eq!(query, [i, 0]);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "burst serialized on replies"
+        );
+        thread::sleep(Duration::from_millis(250));
+        for i in [5, 4, 3, 2, 1, 0, 6] {
+            let response = [i, 1];
+            match route_owned.as_str() {
+                "dns" => {
+                    let stream = control.as_mut().unwrap();
+                    // Split both the length prefix and payload across wakes.
+                    for byte in [0, 2, i, 1] {
+                        stream.write_all(&[byte]).unwrap();
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                "socks" => {
+                    udp.send_to(&encode_udp_packet(destination, &response), peer.unwrap())
+                        .unwrap();
+                }
+                _ => {
+                    udp.send_to(&response, peer.unwrap()).unwrap();
+                }
+            }
+        }
+        if let Some(mut control) = control {
+            let _ = control.read(&mut [0]);
+        }
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+    command.args([
+        "--proxy",
+        &format!("socks5://{socks_addr}"),
+        "--udp-socket-mode",
+        mode,
+    ]);
+    if route == "dns" {
+        command.arg("--enable-dns");
+    } else {
+        command.arg("--enable-udp");
+    }
+    if route == "socks" {
+        command.arg("--proxy-local");
+    }
+    let output = command
+        .arg("--")
+        .arg(probe)
+        .arg(destination.ip().to_string())
+        .arg(destination.port().to_string())
+        .arg("burst")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "independent-io-ok\n"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn stable_udp_silent_peer_churn_reaps_workers_without_response_timeout() {
+    let (_dir, probe) = build_independent_udp_probe();
+    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = sink.local_addr().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args(["--enable-udp", "--udp-socket-mode", "stable", "--"])
+        .arg(probe)
+        .arg(destination.ip().to_string())
+        .arg(destination.port().to_string())
+        .arg("churn")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let pid = child.id();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "ready\n");
+    let baseline = process_thread_count(pid);
+    child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let sampler = thread::spawn(move || {
+        let mut peak = 0;
+        while done_rx.try_recv().is_err() {
+            peak = peak.max(process_thread_count(pid));
+            thread::sleep(Duration::from_millis(5));
+        }
+        peak
+    });
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "closed\n");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let remaining = loop {
+        let count = process_udp_relay_thread_count(pid);
+        if count == 0 || Instant::now() >= deadline {
+            break count;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    done_tx.send(()).unwrap();
+    let peak = sampler.join().unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert!(child.wait().unwrap().success());
+    eprintln!("2000 silent UDP sockets: baseline={baseline}, peak={peak}, relay workers after reap={remaining}");
+    // Two workers per admitted relay plus supervisor threads and a small
+    // scheduling margin. The old path retained ~2000 blocked writers.
+    assert!(peak < 400, "retired UDP workers accumulated: {peak}");
+    assert!(
+        remaining == 0,
+        "closed UDP workers waited for the peer: {remaining}"
+    );
+}
+
+fn process_udp_relay_thread_count(pid: u32) -> usize {
+    fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path().join("comm")).ok())
+        .filter(|name| name.starts_with("yatht-udp-relay"))
+        .count()
+}
+
+#[test]
+fn pipelined_dns_replies_keep_original_destinations_with_reused_ids() {
+    let (_dir, probe) = build_independent_udp_probe();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handlers = Vec::new();
+        for first in 0..2 {
+            let (mut stream, _) = socks.accept().unwrap();
+            let barrier = Arc::clone(&barrier);
+            handlers.push(thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socks5_greet(&mut stream);
+                read_socks5_request(&mut stream);
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                for index in [first, first + 2] {
+                    let mut query = [0; 5];
+                    stream.read_exact(&mut query).unwrap();
+                    assert_eq!(query, [0, 3, 0x12, 0x34, index]);
+                }
+                barrier.wait();
+                for index in [first + 2, first] {
+                    stream.write_all(&[0, 3, 0x12, 0x34, index]).unwrap();
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+        .args([
+            "--enable-dns",
+            "--proxy",
+            &format!("socks5://{socks_addr}"),
+            "--",
+        ])
+        .arg(probe)
+        .args(["198.51.100.12", "53", "dns-sources"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    server.join().unwrap();
+}
+
+#[test]
+fn udp_payload_limits_include_socks_headers_without_reducing_direct_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_payload_limit");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_payload_limit.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["lazy", "stable"] {
+        for (ip, direct_limit, proxy_limit) in [
+            ("127.0.0.1", 65507, 65497),
+            ("::ffff:127.0.0.1", 65507, 65485),
+            ("::1", 65527, 65485),
+        ] {
+            for proxied in [false, true] {
+                for batch_first in [false, true] {
+                    let udp = UdpSocket::bind(if !proxied && ip == "::1" {
+                        "[::1]:0"
+                    } else {
+                        "127.0.0.1:0"
+                    })
+                    .unwrap();
+                    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let port = udp.local_addr().unwrap().port();
+                    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let socks_addr = socks.local_addr().unwrap();
+                    let server = thread::spawn(move || {
+                        let mut control = if proxied {
+                            let (mut stream, _) = socks.accept().unwrap();
+                            socks5_greet(&mut stream);
+                            read_socks5_request(&mut stream);
+                            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+                            reply.extend_from_slice(&port.to_be_bytes());
+                            stream.write_all(&reply).unwrap();
+                            Some(stream)
+                        } else {
+                            None
+                        };
+                        for _ in 0..2 {
+                            let mut buf = vec![0; 65535];
+                            let (n, peer) = udp.recv_from(&mut buf).unwrap();
+                            udp.send_to(&buf[..n], peer).unwrap();
+                        }
+                        if let Some(stream) = control.as_mut() {
+                            let _ = stream.read(&mut [0]);
+                        }
+                    });
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+                    command.args([
+                        "--enable-udp",
+                        "--udp-socket-mode",
+                        mode,
+                        "--proxy",
+                        &format!("socks5://{socks_addr}"),
+                    ]);
+                    if proxied {
+                        command.arg("--proxy-local");
+                    }
+                    let output = command
+                        .arg("--")
+                        .arg(&probe)
+                        .arg(ip)
+                        .arg(port.to_string())
+                        .arg(if proxied { proxy_limit } else { direct_limit }.to_string())
+                        .arg(if batch_first { "1" } else { "0" })
+                        .output()
+                        .unwrap();
+                    assert_success(&output);
+                    server.join().unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stalled_dns_writes_do_not_block_other_udp_routes() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_route_backpressure");
+    assert!(Command::new("cc")
+        .args([
+            "tests/probes/udp_route_backpressure.c",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["lazy", "stable"] {
+        let direct = UdpSocket::bind("127.0.0.1:0").unwrap();
+        direct
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let direct_port = direct.local_addr().unwrap().port();
+        let echo = thread::spawn(move || {
+            let mut buf = [0; 64];
+            let (n, peer) = direct.recv_from(&mut buf).unwrap();
+            direct.send_to(&buf[..n], peer).unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(6);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(err) => panic!("proxy accept failed: {err}"),
+                    }
+                }
+            };
+            let mut dns = accept();
+            let size = 4096_i32;
+            // SAFETY: size points to a live integer option value for this fd.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        dns.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        (&size as *const i32).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            socks5_greet(&mut dns);
+            read_socks5_request(&mut dns);
+            dns.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            let mut warmup = [0; 4];
+            dns.read_exact(&mut warmup).unwrap();
+            dns.write_all(&warmup).unwrap();
+            // Retain the stream but never drain further queries.
+            let mut socks = accept();
+            socks5_greet(&mut socks);
+            read_socks5_request(&mut socks);
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+            reply.extend_from_slice(&udp.local_addr().unwrap().port().to_be_bytes());
+            socks.write_all(&reply).unwrap();
+            let mut packet = [0; 64];
+            let (n, peer) = udp.recv_from(&mut packet).unwrap();
+            udp.send_to(&packet[..n], peer).unwrap();
+            let _ = socks.read(&mut [0]);
+            drop(dns);
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                "--enable-dns",
+                "--enable-udp",
+                "--udp-socket-mode",
+                mode,
+                "--proxy",
+                &format!("socks5://{proxy_addr}"),
+                "--",
+            ])
+            .arg(&probe)
+            .arg(direct_port.to_string())
+            .output()
+            .unwrap();
+        assert_success(&output);
+        eprintln!("{mode}: {}", String::from_utf8_lossy(&output.stdout));
+        echo.join().unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn dns_stream_limit_counts_drops_without_evicting_healthy_streams() {
+    let (dir, probe) = build_independent_udp_probe();
+    for mode in ["lazy", "stable"] {
+        let metrics = dir.path().join(format!("{mode}.jsonl"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..16 {
+                let (mut stream, _) = listener.accept().unwrap();
+                handlers.push(thread::spawn(move || {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    socks5_greet(&mut stream);
+                    read_socks5_request(&mut stream);
+                    stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                    loop {
+                        let mut frame = [0; 5];
+                        match stream.read_exact(&mut frame) {
+                            Ok(()) => stream.write_all(&frame).unwrap(),
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionReset
+                                ) =>
+                            {
+                                break
+                            }
+                            Err(err) => panic!("DNS stream failed: {err}"),
+                        }
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_yatht"))
+            .args([
+                "--enable-dns",
+                "--enable-udp",
+                "--udp-socket-mode",
+                mode,
+                "--proxy",
+                &format!("socks5://{address}"),
+                "--metrics-file",
+            ])
+            .arg(&metrics)
+            .arg("--")
+            .arg(&probe)
+            .args(["198.51.100.1", "53", "dns-cap"])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        server.join().unwrap();
+        let events = fs::read_to_string(metrics).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(summary["event"], "run_summary");
+        assert_eq!(summary["udp_dropped_jobs"], 2);
+        assert_eq!(summary["udp_dropped_pending_responses"], 0);
+    }
 }
