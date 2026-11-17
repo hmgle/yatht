@@ -201,7 +201,7 @@ fn relay_reaping_waits_for_the_last_target_alias(stable: bool) {
     let target_identity = fd_identity(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
-        state: UdpRelayState::new(relay).unwrap(),
+        state: UdpRelayState::new(relay, libc::AF_INET).unwrap(),
         original_local: None,
         target_identity,
         target_cookie: socket_cookie(target.as_raw_fd()).unwrap(),
@@ -263,7 +263,7 @@ fn stable_relay_reaping_spares_relays_published_during_a_sweep() {
             let key = relay_key(1, (batch * 32 + index) as RawFd);
             let handle = UdpRelayHandle {
                 tx,
-                state: UdpRelayState::new(relay).unwrap(),
+                state: UdpRelayState::new(relay, libc::AF_INET).unwrap(),
                 original_local: None,
                 target_identity: fd_identity(target.as_raw_fd()).unwrap(),
                 target_cookie,
@@ -461,7 +461,7 @@ fn close_removes_matching_relay() {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
-        state: UdpRelayState::new(relay).unwrap(),
+        state: UdpRelayState::new(relay, libc::AF_INET).unwrap(),
         original_local: None,
         target_identity: fd_identity(target.as_raw_fd()).unwrap(),
         target_cookie,
@@ -581,7 +581,7 @@ fn nonblocking_udp_send_reports_full_job_queue() {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     let handle = UdpRelayHandle {
         tx,
-        state: UdpRelayState::new(relay).unwrap(),
+        state: UdpRelayState::new(relay, libc::AF_INET).unwrap(),
         original_local: None,
         target_identity: fd_identity(target.as_raw_fd()).unwrap(),
         target_cookie,
@@ -940,7 +940,7 @@ fn test_relay_handle() -> UdpRelayHandle {
     let target_cookie = socket_cookie(target.as_raw_fd()).unwrap();
     UdpRelayHandle {
         tx,
-        state: UdpRelayState::new(relay).unwrap(),
+        state: UdpRelayState::new(relay, libc::AF_INET).unwrap(),
         original_local: None,
         target_identity: fd_identity(target.as_raw_fd()).unwrap(),
         target_cookie,
@@ -1074,7 +1074,7 @@ fn udp_worker_counts_failed_jobs_without_debug_logging() {
     let (relay, target) = make_relay_pair().unwrap();
     set_socket_recv_timeout(target.as_raw_fd(), Duration::from_secs(3)).unwrap();
     let mut handle = test_relay_handle();
-    handle.state = UdpRelayState::new(relay).unwrap();
+    handle.state = UdpRelayState::new(relay, libc::AF_INET).unwrap();
     let (tx, rx) = udp_job_queues(16);
     handle.tx = tx;
     let worker_handle = handle.state.io.clone();

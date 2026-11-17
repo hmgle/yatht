@@ -233,9 +233,11 @@ The local port is released during relay cleanup after the last alias closes
 A proxy's external source port can still differ.
 Logical operations reject invalid destination ports and unsupported families
 before creating a relay.
-AF_INET sockets reject IPv6 destinations, while stable AF_INET6 sockets model
+AF_INET sockets reject IPv6 destinations, while relayed AF_INET6 sockets model
 Linux's default dual-stack behavior and accept IPv4 and IPv6 destinations;
-their logical addresses are reported in the socket's own family, so a
+their direct transport retains that family across destination changes in
+stable, lazy, and DNS-only modes.
+Their logical addresses are reported in the socket's own family, so a
 dual-stack peer or response source appears as a v4-mapped IPv6 address.
 Destination names are read the way the target socket reads them: a zero-length
 name fails `sendto(2)` and falls back to the connected peer in `sendmsg(2)`, an

@@ -154,9 +154,10 @@ pub(super) struct UdpRelayState {
 }
 
 impl UdpRelayState {
-    pub(super) fn new(relay_socket: OwnedFd) -> io::Result<Arc<Self>> {
+    pub(super) fn new(relay_socket: OwnedFd, domain: i32) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             io: UdpRelayIo {
+                domain,
                 wake: Arc::new(create_eventfd()?),
                 default_dest: Arc::new(Mutex::new(None)),
                 local_bind: Arc::new(Mutex::new(None)),
@@ -187,6 +188,7 @@ impl std::ops::Deref for UdpRelayHandle {
 /// Workers share I/O resources without keeping the owning handle alive.
 #[derive(Clone)]
 pub(super) struct UdpRelayIo {
+    pub(super) domain: i32,
     pub(super) wake: Arc<OwnedFd>,
     pub(super) default_dest: Arc<Mutex<Option<(Destination, UdpRouteKind)>>>,
     /// Retains the actual local port reservation, including bind(port=0).
@@ -1177,7 +1179,7 @@ pub(super) fn start_udp_relay(
         protocol,
     } = target;
     let (tx, rx) = udp_job_queues(UDP_JOB_QUEUE_CAPACITY);
-    let state = UdpRelayState::new(relay_socket)?;
+    let state = UdpRelayState::new(relay_socket, domain)?;
     *state.io.default_dest.lock().unwrap() = default_dest;
     let handle = UdpRelayHandle {
         tx,
@@ -1279,14 +1281,15 @@ pub(super) fn send_relay_response(fd: RawFd, response: &[u8]) -> bool {
 pub(super) fn send_direct_udp(
     direct_udp: &mut Option<DirectUdpSocket>,
     local_bind: &Mutex<Option<UdpLocalSocket>>,
+    domain: i32,
     dest: Destination,
     payload: &[u8],
 ) -> Result<()> {
     let default_bind = Destination {
-        ip: if dest.ip.is_ipv4() {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-        } else {
+        ip: if domain == libc::AF_INET6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         },
         port: 0,
     };

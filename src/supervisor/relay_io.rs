@@ -25,7 +25,13 @@ impl Transports {
         let deadline = proxy::Deadline::after(cfg.timeout);
         match job.route {
             UdpRouteKind::Direct => {
-                send_direct_udp(&mut self.direct, &handle.local_bind, job.dest, &job.payload)?;
+                send_direct_udp(
+                    &mut self.direct,
+                    &handle.local_bind,
+                    handle.domain,
+                    job.dest,
+                    &job.payload,
+                )?;
             }
             UdpRouteKind::Generic => {
                 if self.socks.is_none() {

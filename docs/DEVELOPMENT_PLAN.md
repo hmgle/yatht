@@ -150,6 +150,8 @@ is `socks5://127.0.0.1:1080`.
   bind-after-send races with the writer. Disconnect clears automatic and
   bind(0) reservations; nonzero explicit ports remain locked. Direct socket
   caching checks the reservation's cookie to follow disconnect/rebind changes.
+  Direct transports use the original socket's logical domain, including lazy
+  and DNS-only relays, so a first IPv4 send cannot disable later IPv6 sends.
   `getsockname(2)` and `getpeername(2)` return the logical local/connected
   destination, while `getsockopt(2)` reports the AF_INET/AF_INET6 UDP domain,
   type, protocol, and a zero socket error.

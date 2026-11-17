@@ -1363,6 +1363,89 @@ fn stable_udp_direct_receive_reports_actual_response_source() {
 }
 
 #[test]
+fn udp_relays_preserve_direct_dual_stack_family_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_direct_family");
+    assert!(Command::new("cc")
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/probes/udp_direct_family.c",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for mode in ["native", "lazy", "dns", "stable"] {
+        let v4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let v6 = UdpSocket::bind("[::1]:0").unwrap();
+        let ports = [
+            v4.local_addr().unwrap().port(),
+            v6.local_addr().unwrap().port(),
+        ];
+        let echoes: Vec<_> = [v4, v6]
+            .into_iter()
+            .enumerate()
+            .map(|(index, socket)| {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                thread::spawn(move || {
+                    for _ in 0..if index == 0 { 2 } else { 1 } {
+                        let mut query = [0];
+                        let Ok((n, peer)) = socket.recv_from(&mut query) else {
+                            return;
+                        };
+                        socket.send_to(&query[..n], peer).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let dns = (mode != "native").then(|| {
+            thread::spawn(move || {
+                let (mut stream, _) = socks.accept().unwrap();
+                socks5_greet(&mut stream);
+                read_socks5_request(&mut stream);
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                let mut query = [0; 3];
+                stream.read_exact(&mut query).unwrap();
+                assert_eq!(query, [0, 1, b'p']);
+                stream.write_all(&query).unwrap();
+                let _ = stream.read(&mut [0]);
+            })
+        });
+        let mut command = if mode == "native" {
+            Command::new(&probe)
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+            command.args(["--enable-dns", "--proxy", &format!("socks5://{socks_addr}")]);
+            if mode != "dns" {
+                command.args(["--enable-udp", "--udp-socket-mode", mode]);
+            }
+            command.arg("--").arg(&probe);
+            command
+        };
+        let output = command
+            .arg(ports[0].to_string())
+            .arg(ports[1].to_string())
+            .arg(if mode == "native" { "0" } else { "1" })
+            .output()
+            .unwrap();
+        for echo in echoes {
+            echo.join().unwrap();
+        }
+        if let Some(dns) = dns {
+            dns.join().unwrap();
+        }
+        assert_success(&output);
+    }
+}
+
+#[test]
 fn stable_udp_proxy_receive_reports_socks5_response_source() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
