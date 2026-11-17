@@ -249,7 +249,7 @@ impl WarmSessionPool {
         let stats = &self.inner.stats;
         let _ = stats
             .hits
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hits| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |hits| {
                 hits.checked_sub(1)
             });
         stats.misses.fetch_add(1, Ordering::Relaxed);

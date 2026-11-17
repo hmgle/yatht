@@ -995,7 +995,7 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 fn update_peak(peak: &AtomicU64, value: u64) {
-    let _ = peak.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = peak.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         (value > current).then_some(value)
     });
 }

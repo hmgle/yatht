@@ -417,7 +417,7 @@ impl UdpRelayRegistry {
     pub(super) fn reserve_relay_slot(&self) -> Result<RelaySlotGuard<'_>> {
         let reserved = self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_UDP_RELAYS).then_some(active + 1)
             });
         if reserved.is_err() {
@@ -508,7 +508,7 @@ impl UdpRelayRegistry {
     pub(super) fn release_relay_slot(&self) {
         let _ = self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 active.checked_sub(1)
             });
     }

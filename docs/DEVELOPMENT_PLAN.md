@@ -11,11 +11,13 @@ Generic UDP is experimental and limited to a request/response workload. The
 seccomp backend is a compatibility tool, not a complete emulation of Linux
 socket semantics or a security boundary.
 
-The implementation is from-scratch Rust and targets Linux x86_64 with kernel
-6.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
+The implementation requires Rust 1.95 or newer and targets Linux x86_64 with
+kernel 6.9 or newer. The key kernel features are `SECCOMP_RET_USER_NOTIF`,
 `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, `SECCOMP_IOCTL_NOTIF_ADDFD`, and
 `PIDFD_THREAD`. Startup fails before launching the target when thread-scoped
 pidfds are unavailable.
+Atomic conditional updates use `try_update`, available from Rust 1.95, to keep
+strict Clippy checks clean after `fetch_update` was deprecated in Rust 1.99.
 
 ## Public Interface
 

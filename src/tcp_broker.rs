@@ -503,7 +503,7 @@ impl BrokerResources {
         }
         let acquired =
             self.active_flows
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current < self.limits.max_active_flows).then_some(current.saturating_add(1))
                 });
         if acquired.is_err() {
@@ -565,15 +565,13 @@ impl BrokerResources {
     }
 
     fn reserve_buffer_capacity_bytes(&self, requested: usize) -> bool {
-        let reserved = self.buffer_capacity_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| {
-                current
-                    .checked_add(requested)
-                    .filter(|next| *next <= self.limits.max_buffer_capacity_bytes)
-            },
-        );
+        let reserved =
+            self.buffer_capacity_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(requested)
+                        .filter(|next| *next <= self.limits.max_buffer_capacity_bytes)
+                });
         if reserved.is_err() {
             self.observability.tcp_resource_rejection("buffer_capacity");
             return false;
@@ -594,7 +592,7 @@ impl BrokerResources {
     }
 
     fn reserve_registration_slot(&self) -> bool {
-        let reserved = self.registration_queue_depth.fetch_update(
+        let reserved = self.registration_queue_depth.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |current| (current < REGISTRATION_QUEUE_CAPACITY).then_some(current.saturating_add(1)),
