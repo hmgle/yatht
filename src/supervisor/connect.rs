@@ -36,8 +36,14 @@ pub(super) fn handle_connect(
     let family = u16::from_ne_bytes(raw[0..2].try_into().unwrap()) as i32;
     if family == libc::AF_UNSPEC {
         if let Some(handle) = existing {
-            handle.clear_default_dest();
-            seccomp::send_success(listener_fd, notif.id);
+            match handle.clear_default_dest() {
+                Ok(()) => seccomp::send_success(listener_fd, notif.id),
+                Err(err) => seccomp::send_errno(
+                    listener_fd,
+                    notif.id,
+                    err.raw_os_error().unwrap_or(libc::EIO),
+                ),
+            }
         } else {
             seccomp::send_continue(listener_fd, notif.id);
         }

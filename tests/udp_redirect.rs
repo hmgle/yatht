@@ -1753,6 +1753,142 @@ fn direct_kernel_udp_getsockname_reports_bound_port() {
     udp_getsockname_reports_bound_port(false);
 }
 
+#[test]
+fn udp_disconnect_releases_ports_during_stalled_dns_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_disconnect_port");
+    assert!(Command::new("cc")
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/probes/udp_disconnect_port.c",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    for relayed in [false, true] {
+        for family in ["4", "6"] {
+            for binding in ["0", "1", "2"] {
+                let udp = UdpSocket::bind(if family == "4" {
+                    "127.0.0.1:0"
+                } else {
+                    "[::1]:0"
+                })
+                .unwrap();
+                udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let port = udp.local_addr().unwrap().port();
+                let echo = thread::spawn(move || {
+                    for _ in 0..2 {
+                        let mut query = [0];
+                        let Ok((n, peer)) = udp.recv_from(&mut query) else {
+                            return;
+                        };
+                        udp.send_to(&query[..n], peer).unwrap();
+                    }
+                });
+                let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+                let bind_ip: std::net::IpAddr = if family == "4" { "0.0.0.0" } else { "::" }
+                    .parse()
+                    .unwrap();
+                let reservation = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).unwrap();
+                let explicit_port = reservation.local_addr().unwrap().port();
+                drop(reservation);
+                let mut command = if relayed {
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+                    command
+                        .args([
+                            "--enable-udp",
+                            "--enable-dns",
+                            "--udp-socket-mode",
+                            "stable",
+                            "--proxy",
+                            &format!("socks5://{}", socks.local_addr().unwrap()),
+                            "--connect-timeout",
+                            "5s",
+                            "--",
+                        ])
+                        .arg(&probe);
+                    command
+                } else {
+                    Command::new(&probe)
+                };
+                let mut child = command
+                    .args([
+                        family,
+                        &port.to_string(),
+                        binding,
+                        if relayed { "1" } else { "0" },
+                        &explicit_port.to_string(),
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdout = BufReader::new(child.stdout.take().unwrap());
+                let mut line = String::new();
+                stdout.read_line(&mut line).unwrap();
+                let old_port: u16 = line
+                    .strip_prefix("ready ")
+                    .expect("probe did not bind")
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let control = relayed.then(|| {
+                    let (mut stream, _) = socks.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting).unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    // No reply yet: the I/O worker cannot process its wake fd.
+                    stream
+                });
+                child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+                line.clear();
+                stdout.read_line(&mut line).unwrap();
+                let released = line == "released\n";
+                assert!(
+                    released,
+                    "disconnect did not finish while DNS setup was stalled"
+                );
+                // Check from outside the supervised process: a stable-mode
+                // close intentionally retains its reservation until reaping.
+                let collision = UdpSocket::bind(SocketAddr::new(bind_ip, old_port));
+                if binding == "2" {
+                    assert_eq!(
+                        collision.unwrap_err().raw_os_error(),
+                        Some(libc::EADDRINUSE)
+                    );
+                } else {
+                    drop(collision.expect("disconnect left the old port occupied"));
+                }
+                let dns = control.map(|mut stream| {
+                    thread::spawn(move || {
+                        stream.write_all(&[5, 0]).unwrap();
+                        read_socks5_request(&mut stream);
+                        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                        let mut query = [0; 3];
+                        let _ = stream.read_exact(&mut query);
+                        let _ = stream.read(&mut [0]);
+                    })
+                });
+                child.stdin.take().unwrap().write_all(b"x").unwrap();
+                let output = child.wait_with_output().unwrap();
+                echo.join().unwrap();
+                if let Some(dns) = dns {
+                    dns.join().unwrap();
+                }
+                assert_success(&output);
+            }
+        }
+    }
+}
+
 fn udp_getsockname_reports_bound_port(stable: bool) {
     let dir = tempfile::tempdir().unwrap();
     let probe = dir.path().join("udp_bound_port");

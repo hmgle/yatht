@@ -247,8 +247,9 @@ Bind remains strict-family, including Linux's IPv6 length checks and IPv4
 `AF_UNSPEC` wildcard compatibility. `IPV6_V6ONLY` is not yet virtualized. An
 `AF_UNSPEC` connect clears the peer and, in stable mode, releases local ports
 not locked by an explicit nonzero bind. Destination-free sends then fail
-with `EDESTADDRREQ`. Virtualized integer socket options preserve Linux's
-short-buffer truncation and negative-length rejection rules. For
+with `EDESTADDRREQ`. Port release completes before disconnect returns, even
+while the worker is blocked in proxy setup. Virtualized integer socket options
+preserve Linux's short-buffer truncation and negative-length rejection rules. For
 unconnected request/response traffic, `recvfrom(2)`, `recvmsg(2)`, and each
 `recvmmsg(2)` entry report the numeric source from the SOCKS5 UDP response header
 or the direct worker's kernel peer. `MSG_PEEK`, `MSG_TRUNC`, `MSG_WAITFORONE`,

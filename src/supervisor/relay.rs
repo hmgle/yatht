@@ -1030,16 +1030,37 @@ impl UdpRelayHandle {
         Ok(())
     }
 
-    pub(super) fn clear_default_dest(&self) {
-        *self.default_dest.lock().unwrap() = None;
+    pub(super) fn clear_default_dest(&self) -> io::Result<()> {
         // Linux disconnect releases an automatically selected local port, but
         // retains one explicitly locked by bind(nonzero_port). bind(0) does
         // not set SOCK_BINDPORT_LOCK, even though it reserves a port eagerly.
         let mut local = self.local_bind.lock().unwrap();
-        if local.as_ref().is_some_and(|bound| !bound.port_locked) {
+        if let Some(bound) = local.as_ref().filter(|bound| !bound.port_locked) {
+            // Dropping our reservation alone cannot release the port while
+            // the I/O worker owns a clone, possibly during blocking setup.
+            // Disconnect the shared kernel socket before acknowledging, and
+            // serialize with direct sends so no detached clone can autobind.
+            let address = libc::sockaddr {
+                sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+                sa_data: [0; 14],
+            };
+            // SAFETY: address is initialized and valid for the supplied size;
+            // the reservation owns the socket throughout this call.
+            if unsafe {
+                libc::connect(
+                    bound.socket.as_raw_fd(),
+                    &address,
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             *local = None;
         }
+        *self.default_dest.lock().unwrap() = None;
         wake_eventfd(self.wake.as_raw_fd());
+        Ok(())
     }
 
     pub(super) fn accepts_destination(&self, dest: Destination) -> bool {
@@ -1293,29 +1314,24 @@ pub(super) fn send_direct_udp(
         },
         port: 0,
     };
-    let (cookie, socket) = {
-        let mut bound = local_bind.lock().unwrap();
-        if bound.is_none() {
-            *bound = Some(UdpLocalSocket {
-                socket: UdpSocket::bind(SocketAddr::new(default_bind.ip, 0))?,
-                port_locked: false,
-            });
-        }
-        let sock = &bound.as_ref().expect("local port reserved above").socket;
-        let cookie = socket_cookie(sock.as_raw_fd()).context("read bound UDP socket cookie")?;
-        let socket = if direct_udp
-            .as_ref()
-            .is_some_and(|state| state.cookie == cookie)
-        {
-            None
-        } else {
-            Some(sock.try_clone()?)
-        };
-        (cookie, socket)
-    };
-    if let Some(sock) = socket {
+    // Hold the reservation lock through the nonblocking send: disconnect
+    // must not release a port while a detached clone can still send on it.
+    let mut bound = local_bind.lock().unwrap();
+    if bound.is_none() {
+        *bound = Some(UdpLocalSocket {
+            socket: UdpSocket::bind(SocketAddr::new(default_bind.ip, 0))?,
+            port_locked: false,
+        });
+    }
+    let sock = &bound.as_ref().expect("local port reserved above").socket;
+    let cookie = socket_cookie(sock.as_raw_fd()).context("read bound UDP socket cookie")?;
+    if !direct_udp
+        .as_ref()
+        .is_some_and(|state| state.cookie == cookie)
+    {
         // Clone the reserved socket rather than binding again: it must retain
         // the port reported immediately after bind(0), including dual stack.
+        let sock = sock.try_clone()?;
         sock.set_nonblocking(true)?;
         *direct_udp = Some(DirectUdpSocket {
             sock,
