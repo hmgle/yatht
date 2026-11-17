@@ -337,10 +337,10 @@ pub(super) fn handle_sendmmsg(
     let vlen = notif.data.args[2] as usize;
     let flags = notif.data.args[3] as i32;
 
-    // The kernel clamps vlen and reads no entry when it is zero, so a null
-    // msgvec with an empty batch still succeeds.
+    // An empty batch reads no entries, but the kernel must still validate
+    // the descriptor and socket type before returning success.
     if vlen == 0 {
-        seccomp::send_success(listener_fd, notif.id);
+        seccomp::send_continue(listener_fd, notif.id);
         return;
     }
     if msgvec == 0 {

@@ -273,6 +273,8 @@ is `socks5://127.0.0.1:1080`.
   bypass that would weaken identity or mixed-routing correctness.
 - All UDP modes rewrite explicit destinations in `sendmmsg(2)` and write each
   successful message length back, including a lazy/DNS socket's first batch.
+  Empty batches continue to the kernel so fd and socket-type validation still
+  precede success, without reading the message vector.
   A read-only routing scan decides whether the batch needs a relay before any
   entry is sent; mixed batches then resolve names against the known UDP domain
   and preserve partial completion without continuing a proxied prefix.

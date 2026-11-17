@@ -576,6 +576,35 @@ fn stable_udp_matches_send_destination_semantics() {
 }
 
 #[test]
+fn empty_udp_sendmmsg_preserves_kernel_fd_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("udp_empty_batch");
+    assert!(Command::new("cc")
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/probes/udp_empty_batch.c",
+            "-o"
+        ])
+        .arg(&probe)
+        .status()
+        .unwrap()
+        .success());
+    assert_success(&Command::new(&probe).output().unwrap());
+    for mode in ["stable", "lazy", "dns"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yatht"));
+        command.args(["--proxy", "socks5://127.0.0.1:9"]);
+        if mode == "dns" {
+            command.arg("--enable-dns");
+        } else {
+            command.args(["--enable-udp", "--udp-socket-mode", mode]);
+        }
+        assert_success(&command.arg("--").arg(&probe).output().unwrap());
+    }
+}
+
+#[test]
 fn lazy_udp_matches_send_destination_semantics() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;

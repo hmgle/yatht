@@ -180,7 +180,8 @@ Pass `--udp-socket-mode=stable` with `--enable-udp` to inject an endpoint at
 the open-file identity stable across `dup(2)`, `fork(2)`, and close races by
 using `SO_COOKIE` as the primary relay key. Virtualized `sendmmsg(2)` runs in
 every mode, including the first proxied batch; receive-supervisor handling of
-`recvmmsg(2)` remains a stable-mode feature. Active UDP relay creation is
+`recvmmsg(2)` remains a stable-mode feature. Empty `sendmmsg(2)` batches retain
+kernel descriptor validation (`EBADF`/`ENOTSOCK`). Active UDP relay creation is
 capped at 128; exhausting this budget returns `ENOBUFS` from the operation
 creating the relay (`socket` in stable mode, or the first proxied send/connect
 in lazy mode). Each relay has separate bounded 16-datagram input queues for
