@@ -138,19 +138,18 @@ Defaults are the supported configuration; unsupported values fail startup.
   options (`SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, `SO_ERROR`), and `recvmmsg(2)`
   in `stable` mode.
 - **`lazy` vs `stable` mode**: `lazy` (default) injects the relay on the first
-  proxied send/connect (aliases made *before* replacement are not preserved).
-  `stable` (`--udp-socket-mode=stable`) injects at `socket(2)` time, preserving
-  aliases across `dup(2)`/`fork(2)` and reserving real local ports on
-  bind/connect/send.
+  proxied send/connect. Earlier aliases and `epoll` registrations stay on the
+  original socket. `stable` (`--udp-socket-mode=stable`) injects at `socket(2)`
+  time, so aliases and `epoll` registrations refer to the same endpoint. It
+  also reserves real local ports on bind/connect/send.
 - **Async I/O & limits**: Sends and receives are decoupled across independent
   16-datagram per-route queues (direct, SOCKS5, DNS) and up to 128 active UDP
   relays (`ENOBUFS` when exhausted). Successful sends indicate queue admission,
   not delivery; SOCKS5 payloads above 65,497 B (IPv4) / 65,485 B (IPv6) fail
   with `EMSGSIZE`.
 - **Not preserved**: Ancillary data (`msg_control`), error queues,
-  connected-peer receive filtering, pre-existing `epoll` registrations,
-  `IPV6_V6ONLY` virtualization, and SOCKS5 replies with domain-name source
-  addresses.
+  connected-peer receive filtering, `IPV6_V6ONLY` virtualization, and SOCKS5
+  replies with domain-name source addresses.
 
 ### DNS-over-TCP
 

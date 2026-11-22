@@ -48,8 +48,14 @@ Generic UDP requires `--enable-udp` and a SOCKS5 proxy supporting UDP ASSOCIATE.
 | --- | --- | --- |
 | Relay injection point | First proxied send/connect (or first `sendmmsg(2)` batch needing proxy routing) | At `socket(2)` time |
 | Pre-existing `dup(2)`/`fork(2)` aliases | Not preserved; aliases created *after* replacement share the relay | Preserved across `dup(2)`, `fork(2)`, and close races (`SO_COOKIE` relay key) |
+| `epoll` registrations | Registrations made before replacement stay on the original socket | Registrations refer to the injected endpoint from creation |
 | Local port reservation | Preserves pre-replacement local address snapshot until a direct worker allocates a local socket (does not reserve the original port) | `bind(2)` reserves a real local UDP socket immediately (port 0 resolves to a kernel ephemeral port before `getsockname(2)` returns); sends/connects also reserve an automatic local port |
 | `recvmmsg(2)` support | Not handled by receive supervisor | Handled by receive supervisor |
+
+DNS-only relays also replace the original socket, leaving earlier `epoll`
+registrations on that socket. Readiness on an injected endpoint reflects
+its `AF_UNIX` socket. IP error queues and their `EPOLLERR` notifications are
+unavailable.
 
 Notes on port reservation in `stable` mode:
 
@@ -154,9 +160,9 @@ Notes on port reservation in `stable` mode:
   both `SO_RCVTIMEO` and an explicit timespec are armed, the earlier deadline
   keeps its own expiry result.
 - **Not preserved / unsupported**: Ancillary data (`msg_control`), error queues,
-  connected-peer receive filtering, pre-existing `epoll` registrations, other
-  IP-level socket options, and SOCKS5 replies with domain-name source addresses
-  (dropped because no numeric source address can be reported reliably).
+  connected-peer receive filtering, other IP-level socket options, and SOCKS5
+  replies with domain-name source addresses (dropped because no numeric source
+  address can be reported reliably).
 
 ### Capacity and relay reclamation
 
