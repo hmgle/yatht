@@ -19,8 +19,8 @@ notification (`SECCOMP_IOCTL_NOTIF_ADDFD`), with no `LD_PRELOAD` or `ptrace`.
   ASSOCIATE, with optional stable socket identity (`--udp-socket-mode=stable`).
 - **Static-binary friendly**: Operates at the syscall layer, working even for
   statically linked binaries that ignore `LD_PRELOAD`.
-- **Flexible routing**: Bypasses local/private destinations by default, with
-  repeatable CIDR bypass and allow-list controls.
+- **Flexible routing**: TCP and generic UDP bypass local/private destinations
+  by default and support repeatable CIDR bypass and allow-list controls.
 - **Bounded epoll broker**: Relays TCP flows with strict fd/memory caps and
   opt-in experimental `splice` and warm proxy-session data paths.
 
@@ -86,7 +86,7 @@ debug = false
 | `--proxy-cidr <CIDR>` | Proxy only matching destinations (repeatable). |
 | `--proxy-local` | Also proxy loopback, private, and link-local destinations. |
 | `--connect-timeout <duration>` | Absolute proxy setup deadline per flow and for startup proxy DNS resolution (default `10s`). |
-| `--enable-dns` | Redirect UDP/53 queries as DNS-over-TCP. |
+| `--enable-dns` | Redirect UDP/53 as DNS-over-TCP, taking precedence over local and CIDR routing rules. |
 | `--dns-server <addr>` | Upstream DNS server for `--enable-dns` (default `1.1.1.1:53`). |
 | `--enable-udp` | Redirect generic UDP via SOCKS5 UDP ASSOCIATE (experimental). |
 | `--udp-socket-mode <lazy\|stable>` | UDP socket identity model (default `lazy`; `stable` requires `--enable-udp`). |

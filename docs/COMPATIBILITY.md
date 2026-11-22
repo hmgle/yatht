@@ -178,7 +178,8 @@ Notes on port reservation in `stable` mode:
 ## DNS-over-TCP (`--enable-dns`)
 
 - Redirects UDP/53 queries over TCP through either a SOCKS5 or HTTP CONNECT
-  proxy.
+  proxy to `--dns-server`. This route takes precedence over generic UDP
+  redirection, the default local bypass, `--bypass-cidr`, and `--proxy-cidr`.
 - Pipelines queries without waiting for earlier answers and retains partial TCP
   frames across readiness events.
 - Keeps at most **16 streams per relay** (one per original DNS destination), so
