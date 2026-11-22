@@ -32,24 +32,28 @@ notification (`SECCOMP_IOCTL_NOTIF_ADDFD`), with no `LD_PRELOAD` or `ptrace`.
 
 ## Quick Start
 
-Build from source:
+Build the release binary from the repository root.
 
 ```sh
 cargo build --release
 ```
 
-Run a command through a proxy (place `--` before the target command; defaults to
-`socks5://127.0.0.1:1080` if `--proxy` is omitted):
+Replace `127.0.0.1:7890` with your proxy address and put `--` before the target
+command. Without a proxy setting on the CLI or in the config file, `yatht`
+uses `socks5://127.0.0.1:1080`. The last two examples use `dig` to send UDP
+queries without falling back to TCP.
 
 ```sh
 # Basic TCP proxying
-target/release/yatht --proxy socks5://127.0.0.1:1080 -- curl https://example.com
+target/release/yatht --proxy socks5://127.0.0.1:7890 -- curl https://example.com
 
-# Proxy TCP + tunnel UDP/53 DNS over TCP
-target/release/yatht --proxy socks5://127.0.0.1:1080 --enable-dns -- curl https://example.com
+# Tunnel a UDP DNS query over TCP
+target/release/yatht --proxy socks5://127.0.0.1:7890 --enable-dns -- \
+  dig +notcp +ignore @1.1.1.1 example.com
 
-# Experimental generic UDP with stable socket identity (SOCKS5 only)
-target/release/yatht --proxy socks5://127.0.0.1:1080 --enable-udp --udp-socket-mode=stable -- <command>
+# Relay a UDP query via SOCKS5 UDP ASSOCIATE
+target/release/yatht --proxy socks5://127.0.0.1:7890 --enable-udp -- \
+  dig +notcp +ignore @1.1.1.1 example.com
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
