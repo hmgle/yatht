@@ -87,9 +87,10 @@ Notes on port reservation in `stable` mode:
 - **Delivery semantics**: Successful sends acknowledge queue admission, not
   remote delivery. Queue overflow, network errors, and closing/exiting before
   queued work is forwarded can still lose data.
-- **Batch sends**: `sendmmsg(2)` entries are rewritten and virtualized in every
-  mode, including the first proxied batch. Mixed direct/proxy batches retain
-  per-entry routing and partial-error results. A batch that outpaces the relay
+- **Send syscalls**: Relays cover `sendto(2)`, `sendmsg(2)`, and `sendmmsg(2)`.
+  `sendmmsg(2)` entries are rewritten in every mode, including the first
+  proxied batch. Mixed direct/proxy batches retain per-entry routing and
+  partial-error results. A batch that outpaces the relay
   worker reports only the enqueued entries as its sent count (so a large batch
   under `MSG_DONTWAIT` can partially commit). Empty `sendmmsg(2)` batches retain
   kernel descriptor validation (`EBADF`/`ENOTSOCK`).
